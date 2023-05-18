@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "AircraftCombat",
+	"Description": "Isolated plugin that contain combat systems for aircrafts.",
+	"Category": "Other",
+	"CreatedBy": "AldertLake",
+	"CreatedByURL": "https://github.com/AldertLake",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "AircraftCombat",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
