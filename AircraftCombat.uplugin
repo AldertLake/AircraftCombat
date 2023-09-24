@@ -19,6 +19,17 @@
 			"Name": "AircraftCombat",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "AvionicsSystems",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "AircraftFlight",
+			"Enabled": true
 		}
 	]
 }

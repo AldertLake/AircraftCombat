@@ -8,7 +8,7 @@
 
 #include "Modules/ModuleManager.h"
 
-class FAircraftCombatModule : public IModuleInterface
+class FAvionicsSystemsModule : public IModuleInterface
 {
 public:
 
