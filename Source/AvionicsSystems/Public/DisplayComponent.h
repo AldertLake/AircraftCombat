@@ -26,21 +26,29 @@ class AVIONICSSYSTEMS_API UAircraftDisplayComponent : public UWidgetComponent
 public:
 	UAircraftDisplayComponent();
 
+	/** Whether this component projects its display onto an external mesh component (e.g. cockpit MFD/HUD glass). If false, uses the built-in widget component surface */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Mesh", meta = (DisplayName = "Has External Display Mesh"))
+	bool bHasExternalDisplayMesh = true;
+
 	/** Primitive mesh component reference selectable from pawn components in the details panel before play */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Mesh", meta = (DisplayName = "Display Mesh", UseComponentPicker, AllowedClasses = "/Script/Engine.PrimitiveComponent"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Mesh", meta = (DisplayName = "Display Mesh", UseComponentPicker, AllowedClasses = "/Script/Engine.PrimitiveComponent", EditCondition = "bHasExternalDisplayMesh", EditConditionHides))
 	FComponentReference DisplayMeshReference;
 
 	/** Material slot index on the display mesh */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Mesh", meta = (DisplayName = "Slot Index", ClampMin = "0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Mesh", meta = (DisplayName = "Slot Index", ClampMin = "0", EditCondition = "bHasExternalDisplayMesh", EditConditionHides))
 	int32 SlotIndex = 0;
 
 	/** Material applied to the display surface */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Material", meta = (DisplayName = "Display Material"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Material", meta = (DisplayName = "Display Material", EditCondition = "bHasExternalDisplayMesh", EditConditionHides))
 	TObjectPtr<UMaterialInterface> DisplayMaterial;
 
 	/** Texture parameter name in the display material to bind the render target */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Material", meta = (DisplayName = "Display Parameter"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Display Material", meta = (DisplayName = "Display Parameter", EditCondition = "bHasExternalDisplayMesh", EditConditionHides))
 	FName DisplayParameter = FName(TEXT("Display"));
+
+	/** Returns whether this component projects onto an external display mesh */
+	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
+	FORCEINLINE bool HasExternalDisplayMesh() const { return bHasExternalDisplayMesh; }
 
 	/** Returns the target display mesh primitive component */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display")

@@ -5,15 +5,27 @@
 // -----------------------------------------------------
 
 #include "AircraftDisplay.h"
-#include "DisplayComponent.h"
 #include "AircraftComponent.h"
-#include "Components/Widget.h"
 #include "GameFramework/Pawn.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "DisplayComponent.h"
+#include "ModularMissionManagement.h"
+#include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 
-void UAircraftDisplay::InitializeDisplay(APawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent)
+void UAircraftDisplay::NativeConstruct()
+{
+	Super::NativeConstruct();
+
+	if (bIndependentMode && !bIsDisplayInitialized && PlayerAircraft)
+	{
+		NativeInitialization();
+	}
+}
+
+void UAircraftDisplay::InitializeDisplay(AAircraftPawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent)
 {
 	PlayerAircraft = InPlayerAircraft;
 	DisplayComponent = InDisplayComponent;
@@ -29,10 +41,23 @@ void UAircraftDisplay::NativeInitialization()
 		return;
 	}
 
-	if (!DisplayComponent)
+	if (!bIndependentMode && !DisplayComponent)
 	{
 		UE_LOG(LogTemp, Error, TEXT("UAircraftDisplay: DisplayComponent is invalid / nullptr on %s!"), *GetNameSafe(GetTypedOuter<AActor>()));
 		return;
+	}
+
+	if (bSupportMissionManagement)
+	{
+		if (!ModularMissionManagement)
+		{
+			ModularMissionManagement = PlayerAircraft->FindComponentByClass<UModularMissionManagement>();
+		}
+
+		if (!ModularMissionManagement)
+		{
+			UE_LOG(LogTemp, Error, TEXT("UAircraftDisplay: bSupportMissionManagement is true, but no UModularMissionManagement component was found on PlayerAircraft '%s'!"), *GetNameSafe(PlayerAircraft));
+		}
 	}
 
 	bIsDisplayInitialized = true;
@@ -44,25 +69,27 @@ void UAircraftDisplay::AssignLockedTarget(AActor* InLockedTarget)
 	LockedTarget = InLockedTarget;
 }
 
+bool UAircraftDisplay::IsSymbolInDisplayBoundarie(UWidget* SymbolWidget, FVector2D XLimits, FVector2D YLimits) const
+{
+	if (!SymbolWidget)
+	{
+		return false;
+	}
+
+	const FVector2D Translation = SymbolWidget->GetRenderTransform().Translation;
+
+	const float MinX = FMath::Min(XLimits.X, XLimits.Y);
+	const float MaxX = FMath::Max(XLimits.X, XLimits.Y);
+	const float MinY = FMath::Min(YLimits.X, YLimits.Y);
+	const float MaxY = FMath::Max(YLimits.X, YLimits.Y);
+
+	return (Translation.X >= MinX && Translation.X <= MaxX &&
+	        Translation.Y >= MinY && Translation.Y <= MaxY);
+}
+
 bool UAircraftDisplay::IsSymbolInHUD(UWidget* SymbolWidget) const
 {
-	if (!SymbolWidget || !SymbolWidget->GetCachedWidget().IsValid())
-	{
-		return false;
-	}
-
-	if (!GEngine || !GEngine->GameViewport)
-	{
-		return false;
-	}
-
-	const FVector2D AbsolutePos = SymbolWidget->GetCachedGeometry().GetAbsolutePosition();
-
-	FVector2D ViewportSize = FVector2D::ZeroVector;
-	GEngine->GameViewport->GetViewportSize(ViewportSize);
-
-	return AbsolutePos.X >= 0.0f && AbsolutePos.X <= ViewportSize.X &&
-	       AbsolutePos.Y >= 0.0f && AbsolutePos.Y <= ViewportSize.Y;
+	return IsSymbolInDisplayBoundarie(SymbolWidget, FVector2D(-100.0f, 100.0f), FVector2D(-100.0f, 100.0f));
 }
 
 bool UAircraftDisplay::CheckGroundCollision() const

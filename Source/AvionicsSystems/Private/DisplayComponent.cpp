@@ -6,6 +6,7 @@
 
 #include "DisplayComponent.h"
 #include "AircraftDisplay.h"
+#include "AircraftComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -83,8 +84,13 @@ void UAircraftDisplayComponent::InitializeDisplayMaterial()
 
 	if (AircraftDisplayWidget)
 	{
-		APawn* OwningAircraft = Cast<APawn>(GetOwner());
+		AAircraftPawn* OwningAircraft = Cast<AAircraftPawn>(GetOwner());
 		AircraftDisplayWidget->InitializeDisplay(OwningAircraft, this);
+	}
+
+	if (!bHasExternalDisplayMesh)
+	{
+		return;
 	}
 
 	UPrimitiveComponent* TargetMesh = GetDisplayMesh();
@@ -112,6 +118,11 @@ void UAircraftDisplayComponent::InitializeDisplayMaterial()
 
 UPrimitiveComponent* UAircraftDisplayComponent::GetDisplayMesh() const
 {
+	if (!bHasExternalDisplayMesh)
+	{
+		return nullptr;
+	}
+
 	if (DisplayMesh)
 	{
 		return DisplayMesh;

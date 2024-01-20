@@ -6,9 +6,9 @@
 
 using UnrealBuildTool;
 
-public class AvionicsSystems : ModuleRules
+public class WeaponSystems : ModuleRules
 {
-	public AvionicsSystems(ReadOnlyTargetRules Target) : base(Target)
+	public WeaponSystems(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
 		
@@ -32,11 +32,9 @@ public class AvionicsSystems : ModuleRules
 				"Core",
 				"CoreUObject",
 				"Engine",
-				"UMG",
 				"Slate",
 				"SlateCore",
-				"AircraftFlightRuntime",
-				"WeaponSystems"
+				"NetCore"
 			}
 			);
 			

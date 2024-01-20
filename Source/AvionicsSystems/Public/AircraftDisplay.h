@@ -11,9 +11,10 @@
 #include "AircraftDisplay.generated.h"
 
 class AActor;
-class APawn;
+class AAircraftPawn;
 class UWidget;
 class UAircraftDisplayComponent;
+class UModularMissionManagement;
 
 /**
  * Base UserWidget class for aircraft avionics and cockpit displays
@@ -31,20 +32,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Collision Detection")
 	float BreakXTraceDistance = 1000000.0f;
 
+	/** Enables automatic search and binding of the Modular Mission Management component on the player aircraft */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|Mission Management", meta = (DisplayName = "Support Mission Management"))
+	bool bSupportMissionManagement = false;
+
+	/** Enables independent mode where the display operates without requiring a UAircraftDisplayComponent (e.g. standalone 2D screen HUDs) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration", meta = (ExposeOnSpawn = "true", DisplayName = "Independent Mode"))
+	bool bIndependentMode = false;
+
 	/** Returns the locked target actor */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
 	FORCEINLINE AActor* GetLockedTarget() const { return LockedTarget; }
 
 	/** Returns the player aircraft pawn */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
-	FORCEINLINE APawn* GetPlayerAircraft() const { return PlayerAircraft; }
+	FORCEINLINE AAircraftPawn* GetPlayerAircraft() const { return PlayerAircraft; }
 
-	/** Returns the aircraft display component */
+	/** Returns the aircraft display component (returns nullptr if in Independent Mode) */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
-	FORCEINLINE UAircraftDisplayComponent* GetDisplayComponent() const { return DisplayComponent; }
+	FORCEINLINE UAircraftDisplayComponent* GetDisplayComponent() const { return bIndependentMode ? nullptr : DisplayComponent; }
+
+	/** Returns the modular mission management component */
+	UFUNCTION(BlueprintPure, Category = "Aircraft Display|Mission Management")
+	FORCEINLINE UModularMissionManagement* GetModularMissionManagement() const { return ModularMissionManagement; }
 
 	/** Initializes the display with essential references (Internal C++) */
-	void InitializeDisplay(APawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent);
+	void InitializeDisplay(AAircraftPawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent);
 
 	/** Event called when the display has been initialized */
 	UFUNCTION(BlueprintImplementableEvent, Category = "Aircraft Display", meta = (DisplayName = "On Display Initialized"))
@@ -58,8 +71,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aircraft Display")
 	void AssignLockedTarget(AActor* InLockedTarget);
 
-	/** Verifies if a UWidget is currently within the screen viewport bounds */
-	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
+	/** Checks if a symbol widget's render translation is within the specified boundary box */
+	UFUNCTION(BlueprintPure, Category = "Aircraft Display", meta = (DisplayName = "Is Symbol In Display Boundary"))
+	bool IsSymbolInDisplayBoundarie(UWidget* SymbolWidget, FVector2D XLimits = FVector2D(-100.0f, 100.0f), FVector2D YLimits = FVector2D(-100.0f, 100.0f)) const;
+
+	/** Verifies if a UWidget is within display boundaries (Deprecated: Use IsSymbolInDisplayBoundarie instead) */
+	UFUNCTION(BlueprintPure, Category = "Aircraft Display", meta = (DeprecatedFunction, DeprecationMessage = "Use IsSymbolInDisplayBoundarie instead."))
 	bool IsSymbolInHUD(UWidget* SymbolWidget) const;
 
 	/** Evaluates altitude, sink rate, and terrain to trigger the ground collision warning */
@@ -67,12 +84,18 @@ public:
 	bool CheckGroundCollision() const;
 
 protected:
+	virtual void NativeConstruct() override;
+
 	/** Native C++ initialization event called when the display has valid references */
 	virtual void NativeInitialization();
 
+	/** Modular mission management component reference */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft Display|Mission Management", meta = (ExposeOnSpawn = "true"))
+	TObjectPtr<UModularMissionManagement> ModularMissionManagement;
+
 	/** Player aircraft pawn reference */
-	UPROPERTY(BlueprintReadOnly, Category = "Aircraft Display")
-	TObjectPtr<APawn> PlayerAircraft;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Aircraft Display", meta = (ExposeOnSpawn = "true"))
+	TObjectPtr<AAircraftPawn> PlayerAircraft;
 
 	/** Locked target actor reference */
 	UPROPERTY(BlueprintReadOnly, Category = "Aircraft Display")

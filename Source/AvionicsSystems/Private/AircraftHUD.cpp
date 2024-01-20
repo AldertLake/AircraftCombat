@@ -5,17 +5,19 @@
 // -----------------------------------------------------
 
 #include "AircraftHUD.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/Actor.h"
+#include "Components/MeshComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "AircraftDisplay.h"
 #include "DisplayComponent.h"
 #include "AircraftComponent.h"
 #include "Camera/CameraComponent.h"
-#include "GameFramework/Pawn.h"
-#include "GameFramework/Actor.h"
 #include "Kismet/KismetMathLibrary.h"
-#include "Components/MeshComponent.h"
-#include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
 #include "Rendering/DrawElements.h"
+
 
 void UAircraftHUD::NativeConstruct()
 {
@@ -24,6 +26,9 @@ void UAircraftHUD::NativeConstruct()
 	CachedFunnelPoints.Reserve(32);
 	CachedLeftRailPoints.Reserve(32);
 	CachedRightRailPoints.Reserve(32);
+	CachedFunnelCanvasPoints.Reserve(32);
+	CachedLeftRailCanvasPoints.Reserve(32);
+	CachedRightRailCanvasPoints.Reserve(32);
 }
 
 void UAircraftHUD::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
@@ -33,7 +38,20 @@ void UAircraftHUD::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 	if (PlayerAircraft)
 	{
 		UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(PlayerAircraft->GetRootComponent());
-		const FVector RawAngularVel = PrimComp ? PrimComp->GetPhysicsAngularVelocityInRadians() : FVector::ZeroVector;
+		FVector RawAngularVel = PrimComp ? PrimComp->GetPhysicsAngularVelocityInRadians() : FVector::ZeroVector;
+
+		const float DeadZoneRad = FunnelConfig.GetDeadZoneInRadians();
+		const float RawSpeed = RawAngularVel.Size();
+
+		if (RawSpeed <= DeadZoneRad)
+		{
+			RawAngularVel = FVector::ZeroVector;
+		}
+		else if (DeadZoneRad > 0.0f)
+		{
+			RawAngularVel = RawAngularVel * ((RawSpeed - DeadZoneRad) / RawSpeed);
+		}
+
 		FilteredAngularVelocity = FMath::VInterpTo(FilteredAngularVelocity, RawAngularVel, InDeltaTime, FunnelConfig.AngularInterpSpeed);
 	}
 
@@ -52,13 +70,13 @@ int32 UAircraftHUD::NativePaint(
 {
 	int32 MaxLayerId = Super::NativePaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
 
-	if (FunnelConfig.bIsEnabled && CachedLeftRailPoints.Num() >= 2 && CachedRightRailPoints.Num() >= 2)
+	if (FunnelConfig.bIsEnabled && CachedLeftRailCanvasPoints.Num() >= 2 && CachedRightRailCanvasPoints.Num() >= 2)
 	{
 		FSlateDrawElement::MakeLines(
 			OutDrawElements,
 			MaxLayerId,
 			AllottedGeometry.ToPaintGeometry(),
-			CachedLeftRailPoints,
+			CachedLeftRailCanvasPoints,
 			ESlateDrawEffect::None,
 			FunnelConfig.Color,
 			FunnelConfig.bAntialias,
@@ -69,7 +87,7 @@ int32 UAircraftHUD::NativePaint(
 			OutDrawElements,
 			MaxLayerId,
 			AllottedGeometry.ToPaintGeometry(),
-			CachedRightRailPoints,
+			CachedRightRailCanvasPoints,
 			ESlateDrawEffect::None,
 			FunnelConfig.Color,
 			FunnelConfig.bAntialias,
@@ -89,12 +107,18 @@ void UAircraftHUD::CalculateGunFunnel(const FGeometry& MyGeometry)
 		CachedFunnelPoints.Reset();
 		CachedLeftRailPoints.Reset();
 		CachedRightRailPoints.Reset();
+		CachedFunnelCanvasPoints.Reset();
+		CachedLeftRailCanvasPoints.Reset();
+		CachedRightRailCanvasPoints.Reset();
 		return;
 	}
 
 	CachedFunnelPoints.Reset();
 	CachedLeftRailPoints.Reset();
 	CachedRightRailPoints.Reset();
+	CachedFunnelCanvasPoints.Reset();
+	CachedLeftRailCanvasPoints.Reset();
+	CachedRightRailCanvasPoints.Reset();
 
 	const FVector AircraftVelocity = PlayerAircraft->GetVelocity();
 	FVector MuzzleLocation = PlayerAircraft->GetActorLocation();
@@ -106,21 +130,32 @@ void UAircraftHUD::CalculateGunFunnel(const FGeometry& MyGeometry)
 		{
 			CachedMuzzleComponent = nullptr;
 
-			USceneComponent* RootComp = PlayerAircraft->GetRootComponent();
-			if (RootComp && RootComp->DoesSocketExist(MuzzleSocketName))
+			if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->GetMesh())
 			{
-				CachedMuzzleComponent = RootComp;
-			}
-			else
-			{
-				TArray<UMeshComponent*> MeshComponents;
-				PlayerAircraft->GetComponents<UMeshComponent>(MeshComponents);
-				for (UMeshComponent* MeshComp : MeshComponents)
+				if (AircraftMesh->DoesSocketExist(MuzzleSocketName))
 				{
-					if (MeshComp && MeshComp->DoesSocketExist(MuzzleSocketName))
+					CachedMuzzleComponent = AircraftMesh;
+				}
+			}
+
+			if (!CachedMuzzleComponent.IsValid())
+			{
+				USceneComponent* RootComp = PlayerAircraft->GetRootComponent();
+				if (RootComp && RootComp->DoesSocketExist(MuzzleSocketName))
+				{
+					CachedMuzzleComponent = RootComp;
+				}
+				else
+				{
+					TArray<UMeshComponent*> MeshComponents;
+					PlayerAircraft->GetComponents<UMeshComponent>(MeshComponents);
+					for (UMeshComponent* MeshComp : MeshComponents)
 					{
-						CachedMuzzleComponent = MeshComp;
-						break;
+						if (MeshComp && MeshComp->DoesSocketExist(MuzzleSocketName))
+						{
+							CachedMuzzleComponent = MeshComp;
+							break;
+						}
 					}
 				}
 			}
@@ -148,8 +183,12 @@ void UAircraftHUD::CalculateGunFunnel(const FGeometry& MyGeometry)
 	const FVector2D CanvasCenter = MyGeometry.GetLocalSize() * 0.5;
 	const FVector AircraftRight = PlayerAircraft->GetActorRightVector();
 
-	const FVector RotationAxis = FilteredAngularVelocity.GetSafeNormal();
-	const float AngularSpeed = FilteredAngularVelocity.Size() * FunnelConfig.SweepMultiplier;
+	const float DeadZoneRad = FunnelConfig.GetDeadZoneInRadians();
+	const float FilteredSpeed = FilteredAngularVelocity.Size();
+	const float EffectiveAngularSpeed = (FilteredSpeed > DeadZoneRad) ? (FilteredSpeed - DeadZoneRad) : 0.0f;
+	const float AngularSpeed = EffectiveAngularSpeed * FunnelConfig.SweepMultiplier;
+
+	const FVector RotationAxis = (FilteredSpeed > KINDA_SMALL_NUMBER) ? (FilteredAngularVelocity / FilteredSpeed) : FVector::UpVector;
 	const FVector CameraForward = PlayerCamera->GetForwardVector();
 
 	for (int32 i = 0; i < SampleCount; ++i)
@@ -189,9 +228,15 @@ void UAircraftHUD::CalculateGunFunnel(const FGeometry& MyGeometry)
 			const FVector2D LeftCanvas = CanvasCenter + LeftOffset;
 			const FVector2D RightCanvas = CanvasCenter + RightOffset;
 
-			CachedLeftRailPoints.Add(LeftCanvas);
-			CachedRightRailPoints.Add(RightCanvas);
-			CachedFunnelPoints.Add((LeftCanvas + RightCanvas) * 0.5f);
+			// Center-anchored points (0,0 is center of display) for Blueprint getters and UI element placement
+			CachedLeftRailPoints.Add(LeftOffset);
+			CachedRightRailPoints.Add(RightOffset);
+			CachedFunnelPoints.Add((LeftOffset + RightOffset) * 0.5f);
+
+			// Top-left canvas points for Slate MakeLines rendering
+			CachedLeftRailCanvasPoints.Add(LeftCanvas);
+			CachedRightRailCanvasPoints.Add(RightCanvas);
+			CachedFunnelCanvasPoints.Add((LeftCanvas + RightCanvas) * 0.5f);
 		}
 	}
 }
@@ -292,10 +337,19 @@ bool UAircraftHUD::CalculateBoresightCrossLocation(FVector& Result) const
 
 	if (MuzzleSocketName != NAME_None)
 	{
-		USceneComponent* RootComp = PlayerAircraft->GetRootComponent();
-		if (RootComp && RootComp->DoesSocketExist(MuzzleSocketName))
+		if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->GetMesh())
 		{
-			MuzzleForward = RootComp->GetSocketRotation(MuzzleSocketName).Vector();
+			if (AircraftMesh->DoesSocketExist(MuzzleSocketName))
+			{
+				MuzzleForward = AircraftMesh->GetSocketRotation(MuzzleSocketName).Vector();
+			}
+		}
+		else if (USceneComponent* RootComp = PlayerAircraft->GetRootComponent())
+		{
+			if (RootComp->DoesSocketExist(MuzzleSocketName))
+			{
+				MuzzleForward = RootComp->GetSocketRotation(MuzzleSocketName).Vector();
+			}
 		}
 		else
 		{

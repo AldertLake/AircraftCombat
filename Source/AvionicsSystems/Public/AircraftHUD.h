@@ -10,7 +10,7 @@
 #include "AircraftDisplay.h"
 #include "AircraftHUD.generated.h"
 
-class APawn;
+class AAircraftPawn;
 class UCameraComponent;
 class USceneComponent;
 
@@ -37,6 +37,10 @@ struct FGunFunnelConfig
 	/** Interpolation speed for smoothing physics angular velocity to eliminate HUD jitter */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "State & Control")
 	float AngularInterpSpeed = 15.0f;
+
+	/** Dead zone threshold (in degrees/sec) below which minor aircraft angular jitter is ignored to prevent funnel jitter */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "State & Control", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "10.0"))
+	float DeadZone = 0.5f;
 
 	/** Minimum dot product against camera forward to cull points outside the forward field of view (prevents peripheral/behind-camera artifacts) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "State & Control", meta = (ClampMin = "0.0", ClampMax = "1.0"))
@@ -73,6 +77,16 @@ struct FGunFunnelConfig
 	/** Enables anti-aliasing on the Slate line draw calls for smooth geometry */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Visuals & Rendering")
 	bool bAntialias = true;
+
+	/** Returns the dead zone converted to radians per second */
+	FORCEINLINE float GetDeadZoneInRadians() const
+	{
+		return FMath::DegreesToRadians(FMath::Max(0.0f, DeadZone));
+	}
+
+	/** Backward-compatible helper for angular dead zone */
+	FORCEINLINE float GetAngularDeadZone() const { return DeadZone; }
+	FORCEINLINE void SetAngularDeadZone(float InValue) { DeadZone = InValue; }
 };
 
 // Typedef alias for backward-compatibility if referenced as FEEGSFunnel
@@ -121,6 +135,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Aircraft HUD|Gunsight")
 	void CalculateGunFunnel(const FGeometry& MyGeometry);
 
+	/** Sets the dead zone threshold (in degrees/sec) for the gun funnel */
+	UFUNCTION(BlueprintCallable, Category = "Aircraft HUD|Gunsight")
+	FORCEINLINE void SetFunnelDeadZone(float InDeadZone) { FunnelConfig.DeadZone = InDeadZone; }
+
+	/** Gets the dead zone threshold (in degrees/sec) for the gun funnel */
+	UFUNCTION(BlueprintPure, Category = "Aircraft HUD|Gunsight")
+	FORCEINLINE float GetFunnelDeadZone() const { return FunnelConfig.DeadZone; }
+
 	/** Calculates the 3D world location at optical infinity for the Gun Boresight Cross */
 	UFUNCTION(BlueprintPure, Category = "Aircraft HUD|Gunsight")
 	bool CalculateBoresightCrossLocation(FVector& Result) const;
@@ -145,17 +167,29 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Aircraft HUD")
 	FORCEINLINE UCameraComponent* GetPlayerCamera() const { return PlayerCamera; }
 
-	/** Returns the cached 2D canvas points along the center spine of the gun funnel */
+	/** Returns the cached 2D points along the center spine of the gun funnel. By default (bRelativeToCenter = true), points are relative to (0,0) at the center of the display */
 	UFUNCTION(BlueprintPure, Category = "Aircraft HUD|Gunsight")
-	FORCEINLINE TArray<FVector2D> GetCachedFunnelPoints() const { return CachedFunnelPoints; }
+	FORCEINLINE TArray<FVector2D> GetCachedFunnelPoints(bool bRelativeToCenter = true) const
+	{
+		return bRelativeToCenter ? CachedFunnelPoints : CachedFunnelCanvasPoints;
+	}
 
-	/** Returns the cached 2D canvas points along the left rail of the gun funnel */
+	/** Returns the cached 2D points along the left rail of the gun funnel. By default (bRelativeToCenter = true), points are relative to (0,0) at the center of the display */
 	UFUNCTION(BlueprintPure, Category = "Aircraft HUD|Gunsight")
-	FORCEINLINE TArray<FVector2D> GetCachedLeftRailPoints() const { return CachedLeftRailPoints; }
+	FORCEINLINE TArray<FVector2D> GetCachedLeftRailPoints(bool bRelativeToCenter = true) const
+	{
+		return bRelativeToCenter ? CachedLeftRailPoints : CachedLeftRailCanvasPoints;
+	}
 
-	/** Returns the cached 2D canvas points along the right rail of the gun funnel */
+	/** Returns the cached 2D points along the right rail of the gun funnel. By default (bRelativeToCenter = true), points are relative to (0,0) at the center of the display */
 	UFUNCTION(BlueprintPure, Category = "Aircraft HUD|Gunsight")
-	FORCEINLINE TArray<FVector2D> GetCachedRightRailPoints() const { return CachedRightRailPoints; }
+	FORCEINLINE TArray<FVector2D> GetCachedRightRailPoints(bool bRelativeToCenter = true) const
+	{
+		return bRelativeToCenter ? CachedRightRailPoints : CachedRightRailCanvasPoints;
+	}
+
+	UPROPERTY(BlueprintReadWrite, Category = "Stadiametric Target Settings")
+	bool bHasLockedTarget = false;
 
 protected:
 	virtual void NativeConstruct() override;
@@ -172,14 +206,23 @@ protected:
 	) const override;
 
 private:
-	/** Pre-allocated cached line buffer for gun funnel center spine */
+	/** Pre-allocated cached line buffer for gun funnel center spine (relative to center 0,0) */
 	TArray<FVector2D> CachedFunnelPoints;
 
-	/** Pre-allocated cached line buffer for left gun funnel rail */
+	/** Pre-allocated cached line buffer for left gun funnel rail (relative to center 0,0) */
 	TArray<FVector2D> CachedLeftRailPoints;
 
-	/** Pre-allocated cached line buffer for right gun funnel rail */
+	/** Pre-allocated cached line buffer for right gun funnel rail (relative to center 0,0) */
 	TArray<FVector2D> CachedRightRailPoints;
+
+	/** Pre-allocated cached line buffer for Slate line rendering of center spine (top-left canvas space) */
+	TArray<FVector2D> CachedFunnelCanvasPoints;
+
+	/** Pre-allocated cached line buffer for Slate line rendering of left rail (top-left canvas space) */
+	TArray<FVector2D> CachedLeftRailCanvasPoints;
+
+	/** Pre-allocated cached line buffer for Slate line rendering of right rail (top-left canvas space) */
+	TArray<FVector2D> CachedRightRailCanvasPoints;
 
 	/** Cached scene component containing the muzzle socket to avoid per-frame lookups */
 	mutable TWeakObjectPtr<USceneComponent> CachedMuzzleComponent;
@@ -190,4 +233,6 @@ private:
 	/** Player camera component reference */
 	UPROPERTY()
 	TObjectPtr<UCameraComponent> PlayerCamera;
+
+
 };
