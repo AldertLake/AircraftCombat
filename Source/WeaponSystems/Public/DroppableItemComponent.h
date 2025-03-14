@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -97,8 +97,11 @@ public:
 
 protected:
 	/** Indicates whether this store has been detached from its mount */
-	UPROPERTY(BlueprintReadOnly, Transient, Replicated, Category = "Droppable|Lifecycle")
+	UPROPERTY(BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_IsDetached, Category = "Droppable|Lifecycle")
 	bool bIsDetached = false;
+
+	UFUNCTION()
+	virtual void OnRep_IsDetached();
 
 	/** Resolves the carrier aircraft reference if PlayerAircraft was not explicitly initialized */
 	virtual APawn* ResolveAircraft() const;

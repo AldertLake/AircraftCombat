@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -28,7 +28,20 @@ void UMasterWeaponComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty
 
 void UMasterWeaponComponent::ServerFireWeapon_Implementation()
 {
-	FireWeapon();
+	ClientFireWeaponResult(FireWeapon());
+}
+
+void UMasterWeaponComponent::ClientFireWeaponResult_Implementation(bool bSucceeded)
+{
+	OnWeaponFireResult.Broadcast(bSucceeded);
+}
+
+bool UMasterWeaponComponent::RequestFireWeapon()
+{
+	if (!IsValid(GetOwner())) return false;
+	if (GetOwner()->HasAuthority()) return FireWeapon();
+	ServerFireWeapon();
+	return true;
 }
 
 void UMasterWeaponComponent::InitializeWeapon(APawn* InPlayerAircraft)
@@ -126,5 +139,29 @@ void UMasterWeaponComponent::ApplyEjectionImpulse(const FVector& Impulse)
 	{
 		Velocity += Impulse;
 		UpdateComponentVelocity();
+	}
+}
+
+void UMasterWeaponComponent::OnRep_WeaponFired()
+{
+	if (bWeaponFired)
+	{
+		OnWeaponFired.Broadcast(nullptr);
+	}
+}
+
+void UMasterWeaponComponent::OnRep_IsWeaponActivated()
+{
+	if (bIsWeaponActivated)
+	{
+		SetActive(true);
+		SetComponentTickEnabled(true);
+	}
+	else
+	{
+		SetActive(false);
+		SetComponentTickEnabled(false);
+		bWeaponFired = false;
+		TimeSinceFired = 0.0f;
 	}
 }

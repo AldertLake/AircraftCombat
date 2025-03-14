@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -9,25 +9,14 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Net/UnrealNetwork.h"
+#include "CombatTeamUtility.h"
+#include "AircraftCombatCommonTypes.h"
+#include "AircraftCombatSettings.h"
 #include "RadarWarningReceiverComponent.generated.h"
 
 class UAircraftRadarComponent;
 class URadarMissileGuidanceComponent;
 
-/**
- * Threat classification level detected by the RWR
- */
-UENUM(BlueprintType)
-enum class ERWRThreatType : uint8
-{
-	None UMETA(DisplayName = "No Threat"),
-	FriendlyRadar UMETA(DisplayName = "Friendly Radar (IFF Cleared)"),
-	SearchRadar UMETA(DisplayName = "Search Radar"),
-	TrackingRadar UMETA(DisplayName = "Tracking Radar (TWS)"),
-	LockOnRadar UMETA(DisplayName = "Lock-On Radar (STT)"),
-	MissileSeeker UMETA(DisplayName = "Missile Seeker (Active Radar)"),
-	MissileLaunch UMETA(DisplayName = "Missile Launch Detected")
-};
 
 /**
  * Individual threat entry detected by the Radar Warning Receiver
@@ -69,17 +58,50 @@ struct WEAPONSYSTEMS_API FRWRThreatEntry
 	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
 	float TimeLastUpdated = 0.0f;
 
+	/** World time when RF signal (sweep or lock) was last received from this emitter */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	float LastSignalTime = 0.0f;
+
+	/** World time when high-threat illumination (STT Lock or CW Launch) was last received from this emitter */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	float LastLockTime = 0.0f;
+
+	/** Operational domain / vehicle type of the threat (Air, Ground, Sea, Missile) for HUD/MFD surrounding symbology */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	ERadarTargetDomain VehicleType = ERadarTargetDomain::Air;
+
+	/** True if this entry represents an autonomous active radar missile seeker (Pitbull / Maddog) */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	bool bIsActiveMissile = false;
+
 	/** True if this threat was just detected this scan cycle */
 	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
 	bool bIsNewThreat = false;
 
-	/** True if this is a high-priority threat (lock-on or missile launch) */
+	/** True for ONLY the single highest-priority threat across the entire detected list (the Diamond Threat) */
 	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
-	bool bIsCritical = false;
+	bool bHighestThreatAvailable = false;
 
-	/** Emitter type tag for symbology (e.g. "SA-10", "F-16", "AIM-120") */
+	/** True only during the update cycle in which this threat escalated in severity; returns to false on next update */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	bool bIsEscalated = false;
+
+	/** True only during the update cycle in which this threat de-escalated in severity; returns to false on next update */
+	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
+	bool bIsDeescalated = false;
+
+	/** Emitter type tag for symbology (e.g. "SA-10", "F-16", "AIM-120", "M") */
 	UPROPERTY(BlueprintReadOnly, Category = "RWR|Threat")
 	FName EmitterType = NAME_None;
+
+	/** Returns true if this threat entry is an active radar missile */
+	FORCEINLINE bool IsMissile() const { return bIsActiveMissile || ThreatType == ERWRThreatType::MissileSeeker; }
+
+	/** Returns true if this threat is in launch warning status (CW or active seeker) */
+	FORCEINLINE bool IsLaunchWarning() const { return ThreatType == ERWRThreatType::MissileLaunch || ThreatType == ERWRThreatType::MissileSeeker; }
+
+	/** Returns true if this threat is in lock-on or launch status */
+	FORCEINLINE bool IsLock() const { return ThreatType >= ERWRThreatType::LockOnRadar; }
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRWRThreatDetectedSignature, const FRWRThreatEntry&, Threat);
@@ -146,9 +168,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration", meta = (ClampMin = "0.1"))
 	float RWRUpdateInterval = 0.5f;
 
-	/** How long a threat persists after last signal before being dropped (seconds) */
+	/** How long a threat persists after last signal before being dropped (legacy fallback, see SearchThreatTimeoutSeconds) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration", meta = (ClampMin = "1.0"))
 	float ThreatTimeoutSeconds = 5.0f;
+
+	/** How long a sweeping Search radar persists without receiving hits before being dropped (seconds, real-world ~6-8s) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration|Decay", meta = (ClampMin = "1.0", ClampMax = "20.0"))
+	float SearchThreatTimeoutSeconds = 7.0f;
+
+	/** Grace period in seconds before a lost Lock or Launch illumination de-escalates back to Search state (real-world ~1-2s) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration|Decay", meta = (ClampMin = "0.5", ClampMax = "5.0"))
+	float LockLossGracePeriod = 1.5f;
+
+	/** How long an autonomous active missile seeker track persists after signal loss before being dropped (seconds) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration|Decay", meta = (ClampMin = "0.5", ClampMax = "10.0"))
+	float MissileSeekerTimeoutSeconds = 2.0f;
+
+	/** If true, checks terrain line-of-sight raycasts to determine if static terrain masks/blocks the incoming RF signal */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration")
+	bool bEnableTerrainMasking = true;
+
+	/** Collision channel used for terrain masking line-of-sight raycasts */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration", meta = (EditCondition = "bEnableTerrainMasking"))
+	TEnumAsByte<ECollisionChannel> LineOfSightChannel = ECC_Visibility;
 
 	/** Maximum detection range for incoming radar signals in cm */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration", meta = (ClampMin = "100000.0"))
@@ -162,20 +204,32 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration")
 	TArray<FName> RWRIgnoreTags;
 
-	/** Actor tags that identify missile actors for seeker detection */
+	/** If true, uses IGenericTeamAgentInterface to identify friendly radar emitters.
+	 *  Enable for arcade gameplay where players should see IFF-tagged contacts.
+	 *  Disable for realism where the RWR treats all emitters as potential threats. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|IFF")
+	bool bEnableIFF = true;
+
+	/** If true, friendly radar emissions are completely hidden from the RWR (not displayed at all).
+	 *  If false, they appear as FriendlyRadar threat type so the pilot knows they're being painted by wingman/AWACS. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|IFF", meta = (EditCondition = "bEnableIFF"))
+	bool bHideFriendlyEmitters = false;
+
+	/** If true, evaluates all threats against Project Settings priority rankings and designates the single most dangerous threat as the Diamond Threat (bHighestThreatAvailable).
+	 *  If false, bHighestThreatAvailable remains false for all threats. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Configuration")
-	TArray<FName> MissileActorTags;
+	bool bFindHighestThreatAvailable = true;
 
 	/** Master switch for debug visualization and HUD telemetry */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Debug")
 	bool bEnableDebugTraces = false;
 
 	/** If true, renders 3D threat strobes and bearing lines */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Debug")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Debug", meta = (EditCondition = "bEnableDebugTraces"))
 	bool bDrawThreatStrobes = true;
 
 	/** If true, renders on-screen RWR telemetry diagnostics */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Debug")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RWR|Debug", meta = (EditCondition = "bEnableDebugTraces"))
 	bool bEnableDiagnosticHUD = true;
 
 	/** Returns all active RWR threat entries */
@@ -210,6 +264,28 @@ public:
 	UFUNCTION(BlueprintPure, Category = "RWR|Threats")
 	ERWRThreatType GetHighestThreatLevel() const;
 
+	/**
+	 * Calculates normalized signal strength (0.0 to 1.0) with quadratic distance attenuation.
+	 * Returns 1.0 at point-blank range, smoothly falling off to 0.0 at MaxRange.
+	 */
+	UFUNCTION(BlueprintPure, Category = "RWR|Signal")
+	static float CalculateSignalStrength(float Range, float MaxRange);
+
+	/**
+	 * Resolves the emitter type identifier (e.g. "F-16", "SA-10", "AIM-120") from a source actor's tags.
+	 * Looks for tags matching 'EmitterType=X' or 'EmitterType:X' (or 'Emitter=X').
+	 * Falls back to DefaultFallback if no matching tag is found.
+	 */
+	FName ResolveEmitterType(const AActor* SourceActor, FName DefaultFallback = NAME_None) const;
+
+	/**
+	 * Checks if the radio-frequency line of sight is clear between emitter location and RWR receiver (unblocked by terrain geometry).
+	 * Returns true if clear, false if blocked by terrain.
+	 */
+	UFUNCTION(BlueprintPure, Category = "RWR|Signal")
+	bool IsSignalLineOfSightClear(const FVector& EmitterLocation, const AActor* EmitterActor = nullptr) const;
+
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
@@ -217,8 +293,14 @@ protected:
 
 private:
 	/** All active threat entries */
-	UPROPERTY(Transient, Replicated)
+	UPROPERTY(Transient, ReplicatedUsing = OnRep_ThreatEntries)
 	TArray<FRWRThreatEntry> ThreatEntries;
+
+	UFUNCTION()
+	void OnRep_ThreatEntries();
+
+	UPROPERTY(Transient)
+	TArray<FRWRThreatEntry> PreviousThreatEntries;
 
 	/** Time accumulator for scan interval throttling */
 	UPROPERTY(Transient)
@@ -245,6 +327,9 @@ private:
 
 	/** Prunes threats that have timed out */
 	void PruneStaleThreats();
+
+	/** Evaluates active threats against project settings priority rankings and designates the single highest threat */
+	void EvaluateHighestThreat();
 
 	/** Computes the relative bearing from this aircraft to a world position */
 	float ComputeRelativeBearing(const FVector& SourcePosition) const;

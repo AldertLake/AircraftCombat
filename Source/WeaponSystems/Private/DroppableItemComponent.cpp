@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -67,6 +67,27 @@ void UDroppableItemComponent::GetLifetimeReplicatedProps(TArray<FLifetimePropert
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(UDroppableItemComponent, bIsDetached);
+}
+
+void UDroppableItemComponent::OnRep_IsDetached()
+{
+	if (bIsDetached)
+	{
+		if (AActor* OwnerActor = GetOwner())
+		{
+			if (OwnerActor->GetAttachParentActor())
+			{
+				OwnerActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+			}
+
+			if (AWeapon* Weapon = Cast<AWeapon>(OwnerActor))
+			{
+				Weapon->SetMounted(false, PlayerAircraft ? PlayerAircraft.Get() : ResolveAircraft());
+			}
+		}
+
+		OnWeaponDetached.Broadcast(GetOwner());
+	}
 }
 
 bool UDroppableItemComponent::CanFireWeapon() const

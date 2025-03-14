@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -14,6 +14,7 @@ class AActor;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponFiredSignature, AActor*, TargetActor);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponDetachedSignature, AActor*, DetachedWeapon);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponFireResultSignature, bool, bSucceeded);
 
 /**
  * Abstract base class for weapon components handling common functionality
@@ -33,6 +34,10 @@ public:
 	/** Event dispatcher broadcast when the weapon is detached from the aircraft */
 	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
 	FOnWeaponDetachedSignature OnWeaponDetached;
+
+	/** Authoritative result of a client RequestFireWeapon call. */
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
+	FOnWeaponFireResultSignature OnWeaponFireResult;
 
 	/** Initializes the weapon component with the owning player aircraft */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
@@ -57,6 +62,10 @@ public:
 	/** Attempts to fire/launch the weapon */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
 	virtual bool FireWeapon();
+
+	/** Server callers receive the launch result; owning clients submit a server request. */
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
+	bool RequestFireWeapon();
 
 	/** Applies an ejection impulse to the weapon upon launch/drop from a pylon */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
@@ -109,6 +118,9 @@ protected:
 	UFUNCTION(Server, Reliable, Category = "Weapon|Core")
 	void ServerFireWeapon();
 
+	UFUNCTION(Client, Reliable, Category = "Weapon|Core")
+	void ClientFireWeaponResult(bool bSucceeded);
+
 	/** Enables debug visualization such as line traces and sensor cones */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon|Debug")
 	bool bEnableDebugTraces = false;
@@ -119,14 +131,20 @@ protected:
 	TObjectPtr<APawn> PlayerAircraft;
 
 	/** Indicates whether the weapon systems are powered/activated */
-	UPROPERTY(BlueprintReadOnly, Transient, Replicated, Category = "Weapon|Core")
+	UPROPERTY(BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_IsWeaponActivated, Category = "Weapon|Core")
 	bool bIsWeaponActivated = false;
 
 	/** Indicates whether the weapon has been fired */
-	UPROPERTY(BlueprintReadOnly, Transient, Replicated, Category = "Weapon|Core")
+	UPROPERTY(BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_WeaponFired, Category = "Weapon|Core")
 	bool bWeaponFired = false;
 
 	/** Elapsed time in seconds since the weapon was fired */
 	UPROPERTY(BlueprintReadOnly, Transient, Category = "Weapon|Core")
 	float TimeSinceFired = 0.0f;
+
+	UFUNCTION()
+	virtual void OnRep_WeaponFired();
+
+	UFUNCTION()
+	virtual void OnRep_IsWeaponActivated();
 };

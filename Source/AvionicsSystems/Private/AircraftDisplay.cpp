@@ -1,15 +1,16 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftDisplay.h"
-#include "AircraftComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "DisplayComponent.h"
 #include "ModularMissionManagement.h"
+#include "AircraftRadarComponent.h"
+#include "RadarWarningReceiverComponent.h"
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
@@ -25,7 +26,7 @@ void UAircraftDisplay::NativeConstruct()
 	}
 }
 
-void UAircraftDisplay::InitializeDisplay(AAircraftPawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent)
+void UAircraftDisplay::InitializeDisplay(APawn* InPlayerAircraft, UAircraftDisplayComponent* InDisplayComponent)
 {
 	PlayerAircraft = InPlayerAircraft;
 	DisplayComponent = InDisplayComponent;
@@ -47,21 +48,29 @@ void UAircraftDisplay::NativeInitialization()
 		return;
 	}
 
-	if (bSupportMissionManagement)
+	// Auto-discover avionics and weapon components on the player aircraft all at once (skip if not present)
+	if (!ModularMissionManagement)
 	{
-		if (!ModularMissionManagement)
-		{
-			ModularMissionManagement = PlayerAircraft->FindComponentByClass<UModularMissionManagement>();
-		}
+		ModularMissionManagement = PlayerAircraft->FindComponentByClass<UModularMissionManagement>();
+	}
 
-		if (!ModularMissionManagement)
-		{
-			UE_LOG(LogTemp, Error, TEXT("UAircraftDisplay: bSupportMissionManagement is true, but no UModularMissionManagement component was found on PlayerAircraft '%s'!"), *GetNameSafe(PlayerAircraft));
-		}
+	if (!AircraftRadar)
+	{
+		AircraftRadar = PlayerAircraft->FindComponentByClass<UAircraftRadarComponent>();
+	}
+
+	if (!RadarWarningReceiver)
+	{
+		RadarWarningReceiver = PlayerAircraft->FindComponentByClass<URadarWarningReceiverComponent>();
 	}
 
 	bIsDisplayInitialized = true;
 	OnDisplayInitialized();
+
+	if (bIndependentMode)
+	{
+		OnSOIStateChanged(bLocalSensorOfInterest);
+	}
 }
 
 void UAircraftDisplay::AssignLockedTarget(AActor* InLockedTarget)
@@ -125,3 +134,41 @@ bool UAircraftDisplay::CheckGroundCollision() const
 
 	return false;
 }
+
+bool UAircraftDisplay::GetWorldWidgetPosition(const FVector& TargetLocation,
+	const FRadarDisplayProjection& Projection, FVector2D& OutWidgetPosition)
+{
+	return FRadarDisplayGeometryMath::Project(TargetLocation, Projection, OutWidgetPosition);
+}
+
+void UAircraftDisplay::SetSensorOfInterest(bool bEnable)
+{
+	if (DisplayComponent)
+	{
+		DisplayComponent->SetSensorOfInterest(bEnable);
+	}
+	else
+	{
+		if (bLocalSensorOfInterest != bEnable)
+		{
+			bLocalSensorOfInterest = bEnable;
+			OnSOIStateChanged(bEnable);
+		}
+	}
+}
+
+bool UAircraftDisplay::IsSensorOfInterest() const
+{
+	if (DisplayComponent)
+	{
+		return DisplayComponent->IsSensorOfInterest();
+	}
+	return bLocalSensorOfInterest;
+}
+
+void UAircraftDisplay::NotifySOIStateChanged(bool bNewState)
+{
+	bLocalSensorOfInterest = bNewState;
+	OnSOIStateChanged(bNewState);
+}
+

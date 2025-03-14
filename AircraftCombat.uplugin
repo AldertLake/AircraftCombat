@@ -31,10 +31,5 @@
 			"LoadingPhase": "Default"
 		}
 	],
-	"Plugins": [
-		{
-			"Name": "AircraftFlight",
-			"Enabled": true
-		}
-	]
-}
+	"Plugins": []
+}

@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -83,13 +83,15 @@ void UAircraftCombatSubsystem::GetRadarsInRange(const FVector& Location, float M
 	{
 		if (UAircraftRadarComponent* Radar = WeakRadar.Get())
 		{
-			if (const AActor* Owner = Radar->GetOwner())
+			if (!Radar->IsRadarEmitting())
 			{
-				const float DistSq = FVector::DistSquared(Location, Owner->GetActorLocation());
-				if (DistSq <= MaxRangeSq)
-				{
-					OutRadars.Add(Radar);
-				}
+				continue;
+			}
+
+			const float DistSq = FVector::DistSquared(Location, Radar->GetRadarLocation());
+			if (DistSq <= MaxRangeSq)
+			{
+				OutRadars.Add(Radar);
 			}
 		}
 	}
@@ -137,6 +139,12 @@ void UAircraftCombatSubsystem::GetActiveMissileSeekersInRange(const FVector& Loc
 	{
 		if (URadarMissileGuidanceComponent* Missile = WeakMissile.Get())
 		{
+			// Only return missiles whose onboard radar seeker is actively radiating RF energy into space (Pitbull / Maddog)
+			if (!Missile->IsSeekerEmittingRF())
+			{
+				continue;
+			}
+
 			if (const AActor* Owner = Missile->GetOwner())
 			{
 				const float DistSq = FVector::DistSquared(Location, Owner->GetActorLocation());

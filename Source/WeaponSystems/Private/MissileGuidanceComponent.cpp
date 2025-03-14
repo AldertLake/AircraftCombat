@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -49,6 +49,22 @@ void UMissileGuidanceComponent::GetLifetimeReplicatedProps(TArray<FLifetimePrope
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME_CONDITION(UMissileGuidanceComponent, LockedTarget, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UMissileGuidanceComponent, TargetSolution, COND_OwnerOnly);
+}
+
+bool UMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfiguration& Configuration)
+{
+	if (bWeaponFired || (GetOwner() && !GetOwner()->HasAuthority())) return false;
+	if (IsValid(Configuration.Carrier)) InitializeWeapon(Configuration.Carrier);
+	TargetSolution = Configuration.Target;
+	if (IsValid(Configuration.Target.TargetActor)) LockMissile(Configuration.Target.TargetActor);
+	return true;
+}
+
+void UMissileGuidanceComponent::ClearTargetSolution()
+{
+	if (bWeaponFired || (GetOwner() && !GetOwner()->HasAuthority())) return;
+	TargetSolution = FMissileTargetSolution();
 }
 
 void UMissileGuidanceComponent::ActivateWeapon(bool bActivate)
@@ -185,9 +201,9 @@ TArray<AActor*> UMissileGuidanceComponent::GetIgnoredActors() const
 
 bool UMissileGuidanceComponent::CanFireWeapon() const
 {
-	if (!bIsWeaponActivated) return false;
+	if (!bIsWeaponActivated || bWeaponFired) return false;
 	if (!bRequireLockToFire) return true;
-	return IsValid(LockedTarget);
+	return IsValid(LockedTarget) || TargetSolution.bValid;
 }
 
 bool UMissileGuidanceComponent::CanDetachWeapon() const
@@ -197,6 +213,7 @@ bool UMissileGuidanceComponent::CanDetachWeapon() const
 
 bool UMissileGuidanceComponent::FireWeapon()
 {
+	if (GetOwner() && !GetOwner()->HasAuthority()) return false;
 	// Launch requires the weapon system to be activated and holding a valid target lock
 	if (!CanFireWeapon())
 	{
@@ -204,6 +221,12 @@ bool UMissileGuidanceComponent::FireWeapon()
 	}
 
 	// Detach weapon physically from aircraft and configure collision ignores
+	if (!UpdatedComponent && GetOwner()) SetUpdatedComponent(GetOwner()->GetRootComponent());
+	if (AActor* MissileActor = GetOwner())
+	{
+		if (MissileActor->GetAttachParentActor())
+			MissileActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+	}
 	if (Weapon)
 	{
 		Weapon->SetMounted(false, PlayerAircraft);
@@ -318,7 +341,16 @@ void UMissileGuidanceComponent::UpdateGuidanceVelocity(float DeltaTime)
 	// 1. Longitudinal dynamics (motor acceleration profile)
 	if (TimeSinceFired >= MotorIgnitionDelay)
 	{
-		if (CurrentSpeed < MaxCruiseSpeed)
+		if (bUseStagedMotorProfile)
+		{
+			const float BurnTime = TimeSinceFired - MotorIgnitionDelay;
+			const float ThrustAcceleration = BurnTime <= BoostDurationSeconds ? MotorAcceleration :
+				(BurnTime <= BoostDurationSeconds + SustainDurationSeconds ? SustainAcceleration : 0.0f);
+			const float DragAcceleration = FMath::Max(0.0f, QuadraticDragCoefficient) * FMath::Square(CurrentSpeed);
+			CurrentSpeed = FMath::Clamp(CurrentSpeed +
+				(ThrustAcceleration - DragAcceleration) * DeltaTime, 0.0f, MaxCruiseSpeed);
+		}
+		else if (CurrentSpeed < MaxCruiseSpeed)
 		{
 			CurrentSpeed = FMath::Min(CurrentSpeed + (MotorAcceleration * DeltaTime), MaxCruiseSpeed);
 		}
@@ -327,16 +359,16 @@ void UMissileGuidanceComponent::UpdateGuidanceVelocity(float DeltaTime)
 	// 2. Lateral guidance (Proportional Navigation)
 	FVector LateralAcceleration = FVector::ZeroVector;
 
-	// Only steer after clearing parent aircraft, moving fast enough, and if holding valid target lock
-	if (TimeSinceFired >= GuidanceActivationDelay && IsValid(LockedTarget) && CurrentSpeed > 100.0f)
+	// The validity flag, rather than a nonzero position or actor pointer, permits coordinate-only shots.
+	FMissileTargetSolution GuidanceTarget;
+	if (TimeSinceFired >= GuidanceActivationDelay && CurrentSpeed > 100.0f &&
+		GetGuidanceTargetSolution(GuidanceTarget))
 	{
 		const FVector MissileLocation = UpdatedComponent
 			? UpdatedComponent->GetComponentLocation()
 			: (GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector);
-		const FVector TargetLocation = GetTargetTrackingLocation(LockedTarget);
-		const FVector TargetVelocity = LockedTarget->GetVelocity();
 
-		const FVector R = TargetLocation - MissileLocation;
+		const FVector R = GuidanceTarget.Position - MissileLocation;
 		const float RangeSq = R.SizeSquared();
 		const float Range = FMath::Sqrt(RangeSq);
 
@@ -344,23 +376,31 @@ void UMissileGuidanceComponent::UpdateGuidanceVelocity(float DeltaTime)
 		if (Range > TerminalDeadbandRange && RangeSq > KINDA_SMALL_NUMBER)
 		{
 			const FVector R_Hat = R / Range;
-			const FVector V_Rel = TargetVelocity - CurrentVelocity;
-
-			// Closing velocity (Vc = -dR/dt)
-			const float Vc = -FVector::DotProduct(R_Hat, V_Rel);
-
-			if (Vc > 0.0f)
+			const FVector V_Rel = GuidanceTarget.Velocity - CurrentVelocity;
+			const float SpeedScale = FMath::Clamp(CurrentSpeed / FMath::Max(MaxCruiseSpeed, 1.0f), 0.0f, 1.0f);
+			const float MaxAccelCm = MaxLateralG * 980.665f * SpeedScale;
+			if (!GuidanceTarget.bMeasured)
 			{
-				// Line of Sight (LOS) angular rate: Omega = (R x V_Rel) / |R|^2
-				const FVector Omega = FVector::CrossProduct(R, V_Rel) / RangeSq;
+				// Pure PN cannot turn toward a static waypoint when LOS rate is zero.
+				const FVector DesiredVelocity = R_Hat * CurrentSpeed;
+				const FVector Requested = (DesiredVelocity - CurrentVelocity) / FMath::Max(DeltaTime, 0.001f);
+				LateralAcceleration = FVector::VectorPlaneProject(Requested, ForwardDir).GetClampedToMaxSize(MaxAccelCm);
+			}
+			else
+			{
+				// Closing velocity (Vc = -dR/dt)
+				const float Vc = -FVector::DotProduct(R_Hat, V_Rel);
+				if (Vc > 0.0f)
+				{
+					// Line of Sight (LOS) angular rate: Omega = (R x V_Rel) / |R|^2
+					const FVector Omega = FVector::CrossProduct(R, V_Rel) / RangeSq;
 
-				// True Proportional Navigation (TPN): am = N * Vc * (Omega x R_Hat)
-				LateralAcceleration = NavigationGain * Vc * FVector::CrossProduct(Omega, R_Hat);
+					// True Proportional Navigation (TPN): am = N * Vc * (Omega x R_Hat)
+					LateralAcceleration = NavigationGain * Vc * FVector::CrossProduct(Omega, R_Hat);
 
-				// Dynamic authority scaling by airspeed
-				const float SpeedScale = FMath::Clamp(CurrentSpeed / MaxCruiseSpeed, 0.0f, 1.0f);
-				const float MaxAccelCm = MaxLateralG * 980.665f * SpeedScale;
-				LateralAcceleration = LateralAcceleration.GetClampedToMaxSize(MaxAccelCm);
+					// Dynamic authority scaling by airspeed
+					LateralAcceleration = LateralAcceleration.GetClampedToMaxSize(MaxAccelCm);
+				}
 			}
 		}
 	}
@@ -394,6 +434,25 @@ void UMissileGuidanceComponent::UpdateGuidanceVelocity(float DeltaTime)
 			UpdatedComponent->SetWorldRotation(Velocity.Rotation());
 		}
 	}
+}
+
+bool UMissileGuidanceComponent::GetGuidanceTargetSolution(FMissileTargetSolution& OutSolution) const
+{
+	if (IsValid(LockedTarget))
+	{
+		OutSolution = FMissileTargetSolution();
+		OutSolution.bValid = true;
+		OutSolution.bMeasured = true;
+		OutSolution.TargetActor = LockedTarget;
+		OutSolution.Position = GetTargetTrackingLocation(LockedTarget);
+		OutSolution.Velocity = LockedTarget->GetVelocity();
+		return true;
+	}
+	OutSolution = TargetSolution;
+	if (!OutSolution.bValid) return false;
+	if (OutSolution.bMeasured && GetWorld())
+		OutSolution.Position += OutSolution.Velocity * FMath::Clamp(GetWorld()->GetTimeSeconds() - OutSolution.MeasurementTimeSeconds, 0.0f, 30.0f);
+	return true;
 }
 
 void UMissileGuidanceComponent::GetSeekerTransform(FVector& OutLocation, FRotator& OutRotation) const
@@ -563,6 +622,22 @@ bool UMissileGuidanceComponent::IsCandidateTargetEligible(const AActor* Candidat
 		}
 	}
 
+	// IFF team-based friendly exclusion (IGenericTeamAgentInterface)
+	if (bEnableIFF)
+	{
+		// Resolve the firing platform: prefer PlayerAircraft (the launching pawn), fall back to the weapon's owner actor
+		const AActor* FiringPlatform = IsValid(PlayerAircraft) ? static_cast<const AActor*>(PlayerAircraft) : GetOwner();
+		if (FiringPlatform)
+		{
+			const ETeamAttitude::Type FallbackAttitude = FCombatTeamUtility::UnknownAttitudeToTeamAttitude(UnknownTargetAttitude);
+			const ETeamAttitude::Type Attitude = FCombatTeamUtility::GetAttitude(FiringPlatform, Candidate, FallbackAttitude);
+			if (Attitude == ETeamAttitude::Friendly)
+			{
+				return false;
+			}
+		}
+	}
+
 	// Target filter tag filtering
 	if (TargetFilterTags.Num() > 0)
 	{
@@ -678,7 +753,7 @@ bool UMissileGuidanceComponent::CheckProximityFuze()
 		}
 		ProcessedActors.Add(Candidate);
 
-		if (!IsCandidateTargetEligible(Candidate))
+		if (!IsFuzeTargetEligible(Candidate))
 		{
 			continue;
 		}
@@ -729,8 +804,10 @@ void UMissileGuidanceComponent::TickComponent(float DeltaTime, ELevelTick TickTy
 		return;
 	}
 
-	// 1. Proximity fuze detection
-	if (bWeaponFired && !bFuzeTriggered && (IsValid(LockedTarget) || !bFuzeOnlyTriggersOnLockedTarget))
+	const bool bHasAuthority = GetOwner() ? GetOwner()->HasAuthority() : true;
+
+	// 1. Proximity fuze detection (Server Authoritative)
+	if (bHasAuthority && bWeaponFired && !bFuzeTriggered && (IsValid(LockedTarget) || !bFuzeOnlyTriggersOnLockedTarget))
 	{
 		const bool bFuzeFired = CheckProximityFuze();
 		if (bFuzeFired && (!IsValid(this) || !bIsWeaponActivated))
@@ -810,15 +887,18 @@ void UMissileGuidanceComponent::TickComponent(float DeltaTime, ELevelTick TickTy
 	}
 
 	// 2. Subclass-specific seeker logic (IR homing, Radar homing, etc.)
-	TickSeekerLogic(DeltaTime);
+	if (bHasAuthority || !bWeaponFired)
+	{
+		TickSeekerLogic(DeltaTime);
+	}
 
 	if (!IsValid(this) || !bIsWeaponActivated)
 	{
 		return;
 	}
 
-	// 3. Proportional navigation guidance flight
-	if (bWeaponFired && IsValid(this) && bIsWeaponActivated)
+	// 3. Proportional navigation guidance flight (Server Authoritative)
+	if (bHasAuthority && bWeaponFired && IsValid(this) && bIsWeaponActivated)
 	{
 		UpdateGuidanceVelocity(DeltaTime);
 	}

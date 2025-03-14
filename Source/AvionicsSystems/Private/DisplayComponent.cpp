@@ -1,12 +1,11 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "DisplayComponent.h"
 #include "AircraftDisplay.h"
-#include "AircraftComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -84,8 +83,9 @@ void UAircraftDisplayComponent::InitializeDisplayMaterial()
 
 	if (AircraftDisplayWidget)
 	{
-		AAircraftPawn* OwningAircraft = Cast<AAircraftPawn>(GetOwner());
-		AircraftDisplayWidget->InitializeDisplay(OwningAircraft, this);
+		APawn* OwningPawn = Cast<APawn>(GetOwner());
+		AircraftDisplayWidget->InitializeDisplay(OwningPawn, this);
+		AircraftDisplayWidget->NotifySOIStateChanged(bSensorOfInterest);
 	}
 
 	if (!bHasExternalDisplayMesh)
@@ -139,3 +139,73 @@ UPrimitiveComponent* UAircraftDisplayComponent::GetDisplayMesh() const
 
 	return nullptr;
 }
+
+bool UAircraftDisplayComponent::RegisterAxisInput(FVector2D PositionXY)
+{
+	if (!bSensorOfInterest)
+	{
+		return false;
+	}
+
+	if (!AircraftDisplayWidget)
+	{
+		if (UUserWidget* UserWidget = GetUserWidgetObject())
+		{
+			AircraftDisplayWidget = Cast<UAircraftDisplay>(UserWidget);
+		}
+	}
+
+	if (AircraftDisplayWidget)
+	{
+		AircraftDisplayWidget->ForwardAxisInput(PositionXY);
+		return true;
+	}
+
+	return false;
+}
+
+bool UAircraftDisplayComponent::RegisterActionInput(FKey Key, bool bPressed)
+{
+	if (!bSensorOfInterest)
+	{
+		return false;
+	}
+
+	if (!AircraftDisplayWidget)
+	{
+		if (UUserWidget* UserWidget = GetUserWidgetObject())
+		{
+			AircraftDisplayWidget = Cast<UAircraftDisplay>(UserWidget);
+		}
+	}
+
+	if (AircraftDisplayWidget)
+	{
+		AircraftDisplayWidget->ForwardActionInput(Key, bPressed);
+		return true;
+	}
+
+	return false;
+}
+
+void UAircraftDisplayComponent::SetSensorOfInterest(bool bEnable)
+{
+	if (bSensorOfInterest != bEnable)
+	{
+		bSensorOfInterest = bEnable;
+
+		if (!AircraftDisplayWidget)
+		{
+			if (UUserWidget* UserWidget = GetUserWidgetObject())
+			{
+				AircraftDisplayWidget = Cast<UAircraftDisplay>(UserWidget);
+			}
+		}
+
+		if (AircraftDisplayWidget)
+		{
+			AircraftDisplayWidget->NotifySOIStateChanged(bEnable);
+		}
+	}
+}
+

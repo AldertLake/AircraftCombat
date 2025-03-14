@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -24,6 +24,10 @@ struct FRWRThreatEntry;
 class WEAPONSYSTEMS_API FAircraftCombatDebug
 {
 public:
+	/** Radar diagnostics refresh at 10 Hz; each sample remains visible until the next one. */
+	static constexpr float RadarDebugRefreshSeconds = 0.1f;
+	static constexpr float RadarDebugDrawLifetimeSeconds = 0.15f;
+
 	// Telemetry key partitions (ensures non-colliding message IDs)
 	static constexpr int32 KeyBase_Radar   = 2100; // 2100 - 2119
 	static constexpr int32 KeyBase_RWR     = 2120; // 2120 - 2139
@@ -37,6 +41,8 @@ public:
 
 	// On-screen HUD telemetry helpers
 	static void PrintRadarTelemetry(int32 LineOffset, const FString& Text, const FColor& Color = FColor::Cyan, float TimeToDisplay = 0.0f);
+	static void PrintRadarTelemetry(const UObject* RadarInstance, int32 LineOffset, const FString& Text,
+		const FColor& Color = FColor::Cyan, float TimeToDisplay = RadarDebugDrawLifetimeSeconds);
 	static void PrintRWRTelemetry(int32 LineOffset, const FString& Text, const FColor& Color = FColor::Yellow, float TimeToDisplay = 0.0f);
 	static void PrintRWRTelemetry(int32 ThreatCount, bool bHasLockOn, bool bHasMissileLaunch);
 	static void PrintMissileTelemetry(int32 LineOffset, const FString& Text, const FColor& Color = FColor::Magenta, float TimeToDisplay = 0.0f);
@@ -71,8 +77,47 @@ public:
 		const FColor& BeamColor = FColor(255, 220, 40)
 	);
 
+	/** Priority levels for actor 3D debug text (higher priority replaces lower, enforcing One-Text Rule) */
+	enum class EActorDebugTextPriority : uint8
+	{
+		None = 0,
+		Lost = 1,          // [LOST] (Grey)
+		SearchHit = 2,     // [HIT] (White)
+		Jammed = 3,        // [JAMMED] (Yellow)
+		Tracked = 4,       // [TWS] (Green)
+		Bugged = 5,        // [PDT BUG] (Magenta)
+		RWRThreat = 6,     // [RWR] (Yellow / Orange)
+		Locked = 7,        // [STT LOCK] (Red)
+		MissileThreat = 8  // [MISSILE WARNING] (Flashing Red)
+	};
+
+	/**
+	 * Draws a prioritized 3D debug string attached to an actor.
+	 * Keeps one attached label per actor across radar and RWR refresh rates.
+	 * A higher-priority source takes ownership until it stops refreshing.
+	 */
+	static void DrawPrioritizedActorDebugText(
+		const UWorld* World,
+		const UObject* DebugSource,
+		AActor* TargetActor,
+		EActorDebugTextPriority Priority,
+		const FString& Text,
+		const FColor& Color,
+		const FVector& LocalOffset = FVector(0, 0, 140.0f),
+		float FontScale = 1.0f
+	);
+
+	/** Flushes/resets all active actor debug text cache */
+	static void ResetActorDebugTextCache();
+
+#if WITH_DEV_AUTOMATION_TESTS
+	static bool GetActorDebugTextSelectionForTest(const AActor* TargetActor,
+		const UObject*& OutSource, EActorDebugTextPriority& OutPriority);
+#endif
+
 	static void DrawTrackSymbology(
 		const UWorld* World,
+		const UObject* DebugSource,
 		const FVector& RadarLocation,
 		const FRadarTrack& Track,
 		bool bDrawVelocityVector = true
@@ -81,6 +126,7 @@ public:
 	// 3D RWR visualization
 	static void DrawRWRThreatStrobes(
 		const UWorld* World,
+		const UObject* DebugSource,
 		const FVector& AircraftLocation,
 		const TArray<FRWRThreatEntry>& Threats,
 		bool bDrawThreatStrobes = true

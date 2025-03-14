@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -8,6 +8,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/WidgetComponent.h"
+#include "InputCoreTypes.h"
 #include "DisplayComponent.generated.h"
 
 class UAircraftDisplay;
@@ -61,6 +62,26 @@ public:
 	/** Returns the aircraft display user widget instance created by this component */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display")
 	FORCEINLINE UAircraftDisplay* GetAircraftDisplayWidget() const { return AircraftDisplayWidget; }
+
+	/** Whether this display is currently the active Sensor of Interest (SOI) and receives forwarded stick/button inputs */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Configuration|SOI", meta = (DisplayName = "Sensor Of Interest"))
+	bool bSensorOfInterest = false;
+
+	/** Forwards 2D axis input to the display widget if this component is the active Sensor of Interest (SOI). Returns true if consumed. */
+	UFUNCTION(BlueprintCallable, Category = "Aircraft Display|Input", meta = (DisplayName = "Register Axis Input"))
+	bool RegisterAxisInput(FVector2D PositionXY);
+
+	/** Forwards button/action input to the display widget if this component is the active Sensor of Interest (SOI). Returns true if consumed. */
+	UFUNCTION(BlueprintCallable, Category = "Aircraft Display|Input", meta = (DisplayName = "Register Action Input"))
+	bool RegisterActionInput(FKey Key, bool bPressed = true);
+
+	/** Enables or disables Sensor of Interest (SOI) status on this display component and notifies the widget */
+	UFUNCTION(BlueprintCallable, Category = "Aircraft Display|SOI", meta = (DisplayName = "Set Sensor Of Interest"))
+	void SetSensorOfInterest(bool bEnable);
+
+	/** Returns true if this display component is currently the active Sensor of Interest (SOI) */
+	UFUNCTION(BlueprintPure, Category = "Aircraft Display|SOI", meta = (DisplayName = "Is Sensor Of Interest"))
+	FORCEINLINE bool IsSensorOfInterest() const { return bSensorOfInterest; }
 
 protected:
 	virtual void BeginPlay() override;

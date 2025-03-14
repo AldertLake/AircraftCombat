@@ -1,0 +1,125 @@
+// -----------------------------------------------------
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
+// GitHub:     https://github.com/AldertLake/
+// Discord:    https://discord.gg/QpPPfh6WVn
+// -----------------------------------------------------
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "RadarDisplayGeometry.generated.h"
+
+/** A B-scope plots local azimuth against slant range; a PPI plots horizontal position. */
+UENUM(BlueprintType)
+enum class ERadarDisplayGeometry : uint8
+{
+	BScope UMETA(DisplayName = "B-Scope (Azimuth / Slant Range)"),
+	PPI UMETA(DisplayName = "PPI (Plan Position)")
+};
+
+/** MFD window over the full radar map. PPI offset is kilometers (right, forward);
+ * B-scope offset is azimuth degrees and range kilometers. */
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FRadarDisplayWindow
+{
+	GENERATED_BODY()
+
+	/** 1 shows the full map; 2 shows half its width and height. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection", meta = (ClampMin = "1.0", ClampMax = "16.0"))
+	float ZoomFactor = 1.0f;
+
+	/** Signed map displacement. +X moves the viewed area right, +Y forward/farther.
+	 * PPI: X/Y in km. B-scope: X in degrees, Y in km. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FVector2D ViewCenterOffset = FVector2D::ZeroVector;
+};
+
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FRadarDisplayView
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	ERadarDisplayGeometry ActiveGeometry = ERadarDisplayGeometry::BScope;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FRadarDisplayWindow BScope;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FRadarDisplayWindow PPI;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	bool bHeadingUp = true;
+};
+
+/** All distances are centimeters and all widget coordinates are local pixels, X right and Y down. */
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FRadarDisplayProjection
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	ERadarDisplayGeometry Geometry = ERadarDisplayGeometry::BScope;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FVector RadarOrigin = FVector::ZeroVector;
+
+	/** Stable platform orientation. A rotating antenna socket does not change this frame. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FRotator ReferenceRotation = FRotator::ZeroRotator;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FVector2D WidgetTopLeft = FVector2D::ZeroVector;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FVector2D WidgetSize = FVector2D(512.0f, 512.0f);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection", meta = (ClampMin = "1.0"))
+	float DisplayRangeCm = 7408000.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	float ScanCenterAzimuth = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection", meta = (ClampMin = "1.0", ClampMax = "360.0"))
+	float AzimuthWidth = 120.0f;
+
+	/** Only used by the inverse B-scope projection, which has no elevation axis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	float CursorElevation = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection", meta = (EditCondition = "Geometry == ERadarDisplayGeometry::PPI"))
+	bool bHeadingUp = true;
+
+	/** Advanced API: use the radar's display view for ordinary widgets. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
+	FRadarDisplayWindow Window;
+};
+
+/** Shared physical TDC position. It is independent of widget size and resolution. */
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FRadarCursorState
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Display Projection|Target Cursor")
+	float AzimuthDegrees = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Display Projection|Target Cursor")
+	float ElevationDegrees = 0.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Display Projection|Target Cursor")
+	float SlantRangeCm = 0.0f;
+
+	/** Current physical cursor location; use this with ProjectWorldToDisplay for the image. */
+	UPROPERTY(BlueprintReadOnly, Category = "Display Projection|Target Cursor")
+	FVector WorldLocation = FVector::ZeroVector;
+};
+
+/** Pure projection math, shared by the radar component and AircraftDisplay. */
+struct WEAPONSYSTEMS_API FRadarDisplayGeometryMath
+{
+	static FRadarDisplayWindow ClampWindow(const FRadarDisplayWindow& Window);
+	static bool Project(const FVector& WorldLocation, const FRadarDisplayProjection& Projection, FVector2D& OutWidgetPosition);
+	static bool Unproject(const FVector2D& WidgetPosition, const FRadarDisplayProjection& Projection, FVector& OutWorldLocation);
+	static FVector CursorToWorld(const FRadarCursorState& Cursor, const FRadarDisplayProjection& Projection);
+};

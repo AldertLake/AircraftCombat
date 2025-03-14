@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -12,7 +12,6 @@
 #include "Components/PrimitiveComponent.h"
 #include "AircraftDisplay.h"
 #include "DisplayComponent.h"
-#include "AircraftComponent.h"
 #include "Camera/CameraComponent.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Engine/World.h"
@@ -130,7 +129,7 @@ void UAircraftHUD::CalculateGunFunnel(const FGeometry& MyGeometry)
 		{
 			CachedMuzzleComponent = nullptr;
 
-			if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->GetMesh())
+			if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->FindComponentByClass<USkeletalMeshComponent>())
 			{
 				if (AircraftMesh->DoesSocketExist(MuzzleSocketName))
 				{
@@ -337,7 +336,7 @@ bool UAircraftHUD::CalculateBoresightCrossLocation(FVector& Result) const
 
 	if (MuzzleSocketName != NAME_None)
 	{
-		if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->GetMesh())
+		if (USkeletalMeshComponent* AircraftMesh = PlayerAircraft->FindComponentByClass<USkeletalMeshComponent>())
 		{
 			if (AircraftMesh->DoesSocketExist(MuzzleSocketName))
 			{

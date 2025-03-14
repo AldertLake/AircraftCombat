@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -107,12 +107,18 @@ protected:
 	TObjectPtr<UStaticMeshComponent> WeaponMesh;
 
 	/** Internal flag indicating if currently mounted */
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Weapon|Mounting")
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, ReplicatedUsing = OnRep_IsMounted, Category = "Weapon|Mounting")
 	bool bIsMounted = false;
 
 	/** Reference to the carrier aircraft */
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Weapon|Mounting")
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, ReplicatedUsing = OnRep_CarrierAircraft, Category = "Weapon|Mounting")
 	TWeakObjectPtr<AActor> CarrierAircraft;
+
+	UFUNCTION()
+	virtual void OnRep_IsMounted();
+
+	UFUNCTION()
+	virtual void OnRep_CarrierAircraft();
 
 	/** Timer handle for delayed separation arming */
 	FTimerHandle SeparationSafetyTimerHandle;
@@ -121,6 +127,8 @@ protected:
 	UFUNCTION(BlueprintNativeEvent, Category = "Weapon|Events")
 	void OnMountedStateChanged(bool bNewMounted, AActor* Carrier);
 	virtual void OnMountedStateChanged_Implementation(bool bNewMounted, AActor* Carrier);
+
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 public:	
 	virtual void Tick(float DeltaTime) override;

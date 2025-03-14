@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -8,10 +8,14 @@
 #include "Components/StaticMeshComponent.h"
 #include "TimerManager.h"
 #include "Engine/World.h"
+#include "Net/UnrealNetwork.h"
 
 AWeapon::AWeapon()
 {
 	PrimaryActorTick.bCanEverTick = true;
+
+	bReplicates = true;
+	SetReplicateMovement(true);
 
 	WeaponMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WeaponMesh"));
 	SetRootComponent(WeaponMesh);
@@ -177,5 +181,36 @@ void AWeapon::ClearMutualCollisionIgnore(AActor* OtherActor)
 void AWeapon::OnMountedStateChanged_Implementation(bool bNewMounted, AActor* Carrier)
 {
 	// Base implementation hook for Blueprint overrides
+}
+
+void AWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	DOREPLIFETIME(AWeapon, bIsMounted);
+	DOREPLIFETIME(AWeapon, CarrierAircraft);
+}
+
+void AWeapon::OnRep_IsMounted()
+{
+	if (bIsMounted)
+	{
+		ApplyMountedCollisionState();
+	}
+	else
+	{
+		ApplyReleasedCollisionState();
+	}
+
+	OnWeaponMountedStateChanged.Broadcast(bIsMounted, CarrierAircraft.Get());
+	OnMountedStateChanged(bIsMounted, CarrierAircraft.Get());
+}
+
+void AWeapon::OnRep_CarrierAircraft()
+{
+	if (bPermanentlyIgnoreCarrier && CarrierAircraft.IsValid())
+	{
+		SetupMutualCollisionIgnore(CarrierAircraft.Get(), true);
+	}
 }
 

@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -10,11 +10,65 @@
 #include "MasterWeaponComponent.h"
 #include "Engine/EngineTypes.h"
 #include "Net/UnrealNetwork.h"
+#include "CombatTeamUtility.h"
 #include "MissileGuidanceComponent.generated.h"
 
 class AWeapon;
 class APawn;
 class AActor;
+class UAircraftRadarComponent;
+
+/** A measured track or an explicitly valid world-space waypoint. Zero is a valid position. */
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FMissileTargetSolution
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	bool bValid = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	bool bMeasured = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	TObjectPtr<AActor> TargetActor = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	FVector Position = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	FVector Velocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	float MeasurementTimeSeconds = 0.0f;
+	/** Receiver-assigned engagement identity. Source IDs below describe provenance only. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	int32 TargetContactID = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	int32 SourceParticipantID = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Target")
+	int32 SourceTrackID = INDEX_NONE;
+};
+
+/** Supplied by an aircraft SMS or by a standalone missile caller before launch. */
+USTRUCT(BlueprintType)
+struct WEAPONSYSTEMS_API FMissileLaunchConfiguration
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	TObjectPtr<APawn> Carrier = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	FMissileTargetSolution Target;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	TObjectPtr<UAircraftRadarComponent> Illuminator = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	TObjectPtr<UAircraftRadarComponent> Uplink = nullptr;
+	/** Radar that owns the launch record, even if another radar illuminates or donates tracks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	TObjectPtr<UAircraftRadarComponent> LaunchRadar = nullptr;
+	/** Track ID in the launching radar's files; -1 when no track was selected. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	int32 LaunchTrackID = -1;
+	/** Autonomous seeker launch with no designated track or coordinate. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Launch")
+	bool bMadDog = false;
+};
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTargetLockedSignature, AActor*, LockedTarget);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTargetLockLostSignature, AActor*, LostTarget);
@@ -62,35 +116,48 @@ public:
 	FOnProximityFuzeTriggeredSignature OnProximityFuzeTriggered;
 
 	/** Time delay in seconds after launch before the rocket motor ignites */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "5.0"))
 	float MotorIgnitionDelay = 0.3f;
 
 	/** Thrust acceleration rate in cm/s^2 while the rocket motor is burning */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float MotorAcceleration = 6000.0f;
 
+	/** Optional boost, sustain, then unpowered coast. Existing missiles retain the legacy motor by default. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Motor Profile")
+	bool bUseStagedMotorProfile = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Motor Profile", meta = (EditCondition = "bUseStagedMotorProfile", ClampMin = "0.0"))
+	float BoostDurationSeconds = 5.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Motor Profile", meta = (EditCondition = "bUseStagedMotorProfile", ClampMin = "0.0"))
+	float SustainAcceleration = 1500.0f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Motor Profile", meta = (EditCondition = "bUseStagedMotorProfile", ClampMin = "0.0"))
+	float SustainDurationSeconds = 10.0f;
+	/** Axial drag acceleration = coefficient * speed squared, in cm/s^2. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Motor Profile", meta = (EditCondition = "bUseStagedMotorProfile", ClampMin = "0.0"))
+	float QuadraticDragCoefficient = 0.0000001f;
+
 	/** Maximum cruise velocity of the missile in cm/s */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "100.0", UIMin = "1000.0"))
 	float MaxCruiseSpeed = 35000.0f;
 
 	/** Time delay in seconds after launch before PN guidance steering begins (clears parent aircraft) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "5.0"))
 	float GuidanceActivationDelay = 0.5f;
 
 	/** Proportional Navigation navigation constant / gain N (typically 3.0 to 5.0) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "1.0", ClampMax = "10.0", UIMin = "2.0", UIMax = "6.0"))
 	float NavigationGain = 4.0f;
 
 	/** Maximum lateral steering acceleration in Gs (1 G = 980.665 cm/s^2) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "1.0", ClampMax = "100.0", UIMin = "5.0", UIMax = "60.0"))
 	float MaxLateralG = 25.0f;
 
 	/** Maximum turning rate of the missile heading in degrees per second (smooths aerodynamic steering and prevents violent angular snapping) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "1.0", ClampMax = "720.0", UIMin = "10.0", UIMax = "180.0"))
 	float MaxTurnRate = 60.0f;
 
 	/** Distance cutoff in cm where steering freezes near impact to avoid mathematical singularities */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "1000.0"))
 	float TerminalDeadbandRange = 100.0f;
 
 	/** If true, the missile will inherit speed/velocity from the launching aircraft. If false, it starts purely with InitialSpeed. */
@@ -102,7 +169,7 @@ public:
 	EVelocityInheritanceDirection InheritanceDirection = EVelocityInheritanceDirection::MissileForward;
 
 	/** Multiplier for the inherited speed (e.g. 1.0 = full speed, 0.5 = half speed) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Velocity Inheritance", meta = (EditCondition = "bInheritAircraftVelocity", ClampMin = "0.01", UIMin = "0.01"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Velocity Inheritance", meta = (EditCondition = "bInheritAircraftVelocity", ClampMin = "0.0", UIMin = "0.0", UIMax = "2.0"))
 	float InheritedSpeedMultiplier = 1.0f;
 
 	/** If true, smoothly stabilizes missile attitude along the launch rail during MotorIgnitionDelay instead of snapping to composite velocity */
@@ -113,20 +180,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Separation", meta = (EditCondition = "bSmoothEjectionAttitude", ClampMin = "0.5", UIMin = "0.5"))
 	float EjectionAlignmentRate = 4.0f;
 
-	/** Proximity fuze detonation radius in centimeters around the seeker socket */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze")
-	float ProximityFuzeRadius = 500.0f;
-
 	/** If true, proximity fuze automatically checks for nearby targets during active lock flight */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze")
 	bool bEnableProximityFuze = true;
+
+	/** Proximity fuze detonation radius in centimeters around the seeker socket */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze", meta = (EditCondition = "bEnableProximityFuze", ClampMin = "10.0", UIMin = "50.0", UIMax = "5000.0"))
+	float ProximityFuzeRadius = 500.0f;
 
 	/** If true, the proximity fuze will only detonate on the currently locked target. If false, it detonates on any valid target. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze", meta = (EditCondition = "bEnableProximityFuze"))
 	bool bFuzeOnlyTriggersOnLockedTarget = false;
 
 	/** Delay in seconds after launch before proximity fuze arms (prevents detonation near launching aircraft or sibling weapons) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze", meta = (ClampMin = "0.0"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Proximity Fuze", meta = (EditCondition = "bEnableProximityFuze", ClampMin = "0.0", UIMin = "0.0", UIMax = "5.0"))
 	float FuzeArmingDelay = 0.5f;
 
 	/** Socket name located on THIS MISSILE mesh representing the seeker origin and forward orientation */
@@ -152,6 +219,16 @@ public:
 	/** If true, queries all dynamic object types (WorldDynamic, Pawn, PhysicsBody, Vehicle) instead of just DetectionChannel */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Seeker|Filter")
 	bool bQueryAllDynamicObjects = true;
+
+	/** If true, the seeker uses IGenericTeamAgentInterface to exclude friendly targets from acquisition.
+	 *  Disable for older/dumber missiles (e.g. AIM-9M) that track any heat source regardless of allegiance.
+	 *  Enable for modern missiles (e.g. AIM-9X) with IFF interrogation capability. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Seeker|IFF")
+	bool bEnableIFF = false;
+
+	/** How targets without IGenericTeamAgentInterface are treated when IFF is enabled (e.g. decoys, debris, unregistered actors) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Seeker|IFF", meta = (EditCondition = "bEnableIFF"))
+	EIFFUnknownAttitude UnknownTargetAttitude = EIFFUnknownAttitude::Hostile;
 
 	/** Collision channel used for seeker target detection overlaps */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Seeker|Filter")
@@ -188,6 +265,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Missile|Guidance")
 	virtual void LockMissile(AActor* InTargetActor);
 
+	/** Configure a missile before launch; the caller may be an SMS or standalone actor. */
+	UFUNCTION(BlueprintCallable, Category = "Missile|Launch")
+	virtual bool PrepareLaunch(const FMissileLaunchConfiguration& Configuration);
+
+	UFUNCTION(BlueprintPure, Category = "Missile|Guidance")
+	FMissileTargetSolution GetTargetSolution() const { return TargetSolution; }
+	UFUNCTION(BlueprintCallable, Category = "Missile|Guidance")
+	void ClearTargetSolution();
+
 	/**
 	 * Returns true if the missile guidance system is activated and holding a valid target lock
 	 */
@@ -212,7 +298,7 @@ public:
 	 * @param DeltaTime Frame delta time in seconds
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Missile|Guidance")
-	void UpdateGuidanceVelocity(float DeltaTime);
+	virtual void UpdateGuidanceVelocity(float DeltaTime);
 
 	/**
 	 * Performs a spherical proximity fuze trace around the seeker socket.
@@ -265,6 +351,8 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	/** Position and velocity used by PN. Sensor-specific missiles may supply measured state. */
+	virtual bool GetGuidanceTargetSolution(FMissileTargetSolution& OutSolution) const;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/**
@@ -288,6 +376,9 @@ protected:
 	UPROPERTY(Transient, Replicated)
 	TObjectPtr<AActor> LockedTarget;
 
+	UPROPERTY(Transient, Replicated)
+	FMissileTargetSolution TargetSolution;
+
 	/** Indicates whether the proximity fuze has detonated (prevents repeated trigger callbacks) */
 	UPROPERTY(Transient)
 	bool bFuzeTriggered = false;
@@ -297,6 +388,7 @@ protected:
 
 	/** Evaluates whether a candidate actor passes basic filtering (validity, friendly exclusion, and target tags) */
 	bool IsCandidateTargetEligible(const AActor* Candidate) const;
+	virtual bool IsFuzeTargetEligible(const AActor* Candidate) const { return IsCandidateTargetEligible(Candidate); }
 
 	/** Calculates the normalized rotated forward vector of the seeker head based on 2D pitch/yaw input */
 	FVector ComputeRotatedSeekerForward(const FRotator& SeekerRotation, const FVector2D& ConeRotation) const;

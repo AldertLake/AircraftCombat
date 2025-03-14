@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -10,7 +10,7 @@
 #include "AircraftDisplay.h"
 #include "AircraftHUD.generated.h"
 
-class AAircraftPawn;
+class APawn;
 class UCameraComponent;
 class USceneComponent;
 

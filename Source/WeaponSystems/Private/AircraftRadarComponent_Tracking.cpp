@@ -1,5 +1,5 @@
 // -----------------------------------------------------
-// Copyright   (c) 2023 AldertLake. All Rights Reserved.
+// Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
 // Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
@@ -15,6 +15,7 @@
 #include "CollisionQueryParams.h"
 #include "DrawDebugHelpers.h"
 #include "GameFramework/Pawn.h"
+#include "EngineUtils.h"
 
 int32 UAircraftRadarComponent::CreateTrack(AActor* DetectedActor, const FRadarTrack& RawDetection)
 {
@@ -31,8 +32,10 @@ int32 UAircraftRadarComponent::CreateTrack(AActor* DetectedActor, const FRadarTr
 
 	FRadarTrack NewTrack = RawDetection;
 	NewTrack.TrackID = NextTrackID++;
+	NewTrack.ContactID = AssignContactID(DetectedActor);
 	NewTrack.TrackedActor = DetectedActor;
 	NewTrack.TrackAge = 0.0f;
+	NewTrack.EstimatedVelocity = FVector::ZeroVector; // Estimated from successive returns, never actor truth.
 
 	// In TWS mode, new contacts start as Tracked
 	if (RadarMode == ERadarOperatingMode::TrackWhileScan)
@@ -44,6 +47,10 @@ int32 UAircraftRadarComponent::CreateTrack(AActor* DetectedActor, const FRadarTr
 		NewTrack.Status = ERadarTrackStatus::Search;
 	}
 
+	if (Tracks.Num() >= FMath::Max(1, MaxTrackFiles))
+	{
+		return INDEX_NONE;
+	}
 	Tracks.Add(NewTrack);
 	OnRadarContactNew.Broadcast(NewTrack);
 
@@ -58,34 +65,54 @@ void UAircraftRadarComponent::UpdateTrack(int32 TrackIndex, const FRadarTrack& N
 	}
 
 	FRadarTrack& Track = Tracks[TrackIndex];
+	const FVector PreviousPosition = Track.LastKnownPosition;
+	const float TimeSinceReturn = Track.TrackAge;
+	const bool bWasNotching = Track.bIsNotching;
 
 	// Preserve track ID, status, and beam target flags
 	const int32 SavedTrackID = Track.TrackID;
 	const ERadarTrackStatus SavedStatus = Track.Status;
-	const ERadarIFFResult SavedIFF = Track.IFFResult;
 	const bool bSavedBeamTarget = Track.bIsBeamTarget;
 
 	// Update measurement data
 	Track.LastKnownPosition = NewDetection.LastKnownPosition;
-	Track.EstimatedVelocity = SmoothVelocity(Track.EstimatedVelocity, NewDetection.EstimatedVelocity, 0.3f);
+	if (TimeSinceReturn >= 0.05f)
+	{
+		const FVector MeasuredVelocity = (NewDetection.LastKnownPosition - PreviousPosition) / TimeSinceReturn;
+		Track.EstimatedVelocity = SmoothVelocity(Track.EstimatedVelocity, MeasuredVelocity, 0.35f);
+	}
 	Track.ClosureRate = NewDetection.ClosureRate;
 	Track.Bearing = NewDetection.Bearing;
 	Track.Elevation = NewDetection.Elevation;
 	Track.Range = NewDetection.Range;
 	Track.SignalStrength = NewDetection.SignalStrength;
 	Track.AltitudeASL = NewDetection.AltitudeASL;
-	Track.TargetHeading = NewDetection.TargetHeading;
+	Track.TargetHeading = CalculateHeadingFromVelocity(Track.EstimatedVelocity, Track.TargetHeading > 0.0f ? Track.TargetHeading : NewDetection.TargetHeading);
+	Track.RCS = NewDetection.RCS;
+	Track.EffectiveRCS = NewDetection.EffectiveRCS;
+	Track.bHasRCSTag = NewDetection.bHasRCSTag;
 	Track.bIsNotching = NewDetection.bIsNotching;
 	Track.bIsJamming = NewDetection.bIsJamming;
+	Track.TargetDomain = NewDetection.TargetDomain;
+	Track.bIsGroundTarget = NewDetection.bIsGroundTarget;
+	Track.bIsGMTIMoving = NewDetection.bIsGMTIMoving;
 
 	// Reset age (fresh return)
 	Track.TrackAge = 0.0f;
 
 	// Restore preserved fields
 	Track.TrackID = SavedTrackID;
-	Track.Status = SavedStatus;
-	Track.IFFResult = SavedIFF;
+	Track.Status = SavedStatus == ERadarTrackStatus::Lost
+		? (RadarMode == ERadarOperatingMode::TrackWhileScan ? ERadarTrackStatus::Tracked : ERadarTrackStatus::Search)
+		: SavedStatus;
 	Track.bIsBeamTarget = bSavedBeamTarget;
+	Track.bIsBugged = (SavedTrackID == BuggedTrackID);
+
+	// Re-classify IFF on each update (team allegiance may change at runtime)
+	if (Track.TrackedActor.IsValid())
+	{
+		Track.IFFResult = ClassifyIFF(Track.TrackedActor.Get());
+	}
 
 	// If this track was a Search hit and we're in TWS, promote to Tracked
 	if (Track.Status == ERadarTrackStatus::Search && RadarMode == ERadarOperatingMode::TrackWhileScan)
@@ -94,7 +121,7 @@ void UAircraftRadarComponent::UpdateTrack(int32 TrackIndex, const FRadarTrack& N
 	}
 
 	// Broadcast notching warning
-	if (Track.bIsNotching)
+	if (Track.bIsNotching && !bWasNotching)
 	{
 		OnRadarTargetNotching.Broadcast(Track);
 	}
@@ -104,75 +131,47 @@ void UAircraftRadarComponent::UpdateTrack(int32 TrackIndex, const FRadarTrack& N
 
 void UAircraftRadarComponent::UpdateTrackFiles(float DeltaTime)
 {
+	(void)DeltaTime;
 	for (int32 i = Tracks.Num() - 1; i >= 0; --i)
 	{
-		FRadarTrack& Track = Tracks[i];
-
-		// Check if tracked actor is still valid
-		if (!Track.TrackedActor.IsValid())
+		if (Tracks[i].TrackedActor.IsValid()) continue;
+		const int32 LostTrackID = Tracks[i].TrackID;
+		const bool bWasLocked = LostTrackID == STTLockedTrackID;
+		const bool bWasBugged = LostTrackID == BuggedTrackID;
+		if (bWasLocked)
 		{
-			const int32 LostTrackID = Track.TrackID;
-
-			// Clear STT lock if this was the locked track
-			if (Track.TrackID == STTLockedTrackID)
-			{
-				STTLockedTrackID = -1;
-				OnRadarLockLost.Broadcast(LostTrackID);
-			}
-			if (Track.TrackID == BuggedTrackID)
-			{
-				BuggedTrackID = -1;
-			}
-
-			Tracks.RemoveAt(i);
-			OnRadarContactLost.Broadcast(LostTrackID);
-			continue;
+			STTLockedTrackID = -1;
+			STTLockedActor = nullptr;
+			RecordOperatorEvent(ERadarOperatorEventType::LockLost, LostTrackID);
+			OnRadarLockLost.Broadcast(LostTrackID);
 		}
-
-		// Update bearing/elevation/range from current actor position
-		if (Track.TrackedActor.IsValid())
-		{
-			const AActor* OwnerActor = GetOwner();
-			if (OwnerActor)
-			{
-				const FVector TargetPos = Track.TrackedActor->GetActorLocation();
-				const FVector RadarPos = OwnerActor->GetActorLocation();
-				const FVector ToTarget = TargetPos - RadarPos;
-
-				Track.LastKnownPosition = TargetPos;
-				Track.Range = ToTarget.Size();
-				ComputeBearingElevation(TargetPos, Track.Bearing, Track.Elevation);
-
-				// Update closure rate
-				const FVector RadarVel = OwnerActor->GetVelocity();
-				const FVector TargetVel = Track.TrackedActor->GetVelocity();
-				const FVector R_Hat = ToTarget.GetSafeNormal();
-				const FVector V_Rel = TargetVel - RadarVel;
-				Track.ClosureRate = -FVector::DotProduct(R_Hat, V_Rel);
-
-				// Update heading
-				Track.TargetHeading = Track.TrackedActor->GetActorRotation().Yaw;
-				Track.AltitudeASL = TargetPos.Z;
-
-				// Smooth velocity
-				Track.EstimatedVelocity = SmoothVelocity(Track.EstimatedVelocity, TargetVel, 0.2f);
-
-				// Check Doppler notch
-				if (NotchFilterVelocity > 0.0f)
-				{
-					Track.bIsNotching = FMath::Abs(Track.ClosureRate) < NotchFilterVelocity;
-				}
-			}
-		}
+		if (bWasBugged) BuggedTrackID = -1;
+		if (bWasLocked || bWasBugged) OnRadarTrackDeselected.Broadcast(LostTrackID);
+		Tracks.RemoveAt(i);
+		OnRadarContactLost.Broadcast(LostTrackID);
+		if (bWasLocked) BreakLock();
 	}
 }
 
 void UAircraftRadarComponent::PruneStaleTracks(float DeltaTime)
 {
 	// Scale timeout to at least 1.5x full frame sweep time so tracks never drop halfway through a multi-bar scan
-	const float ScanFrameTime = (AzimuthScanWidth > 0.0f && ScanRateDegreesPerSecond > 0.0f)
-		? (AzimuthScanWidth * FMath::Max(1, ElevationBars) / ScanRateDegreesPerSecond)
-		: 5.0f;
+	float ScanFrameTime = 5.0f;
+	if (ScanDrive == ERadarScanDrive::SocketDriven)
+	{
+		ScanFrameTime = FMath::Max(0.1f, SocketExpectedRevisitSeconds);
+	}
+	else if (ScanDrive == ERadarScanDrive::VirtualMechanical && ScanRateDegreesPerSecond > 0.0f)
+	{
+		ScanFrameTime = AzimuthScanWidth * FMath::Max(1, ElevationBars) / ScanRateDegreesPerSecond;
+	}
+	else if (ScanDrive == ERadarScanDrive::PESA || ScanDrive == ERadarScanDrive::AESA)
+	{
+		const int32 AzCells = FMath::Max(1, FMath::CeilToInt(AzimuthScanWidth / FMath::Max(BeamAzimuthWidth, 1.0f)));
+		const int32 Visits = ScanDrive == ERadarScanDrive::AESA ? FMath::Clamp(AESABeamsPerSample, 1, 32) : 1;
+		ScanFrameTime = FMath::CeilToFloat(static_cast<float>(AzCells * FMath::Max(1, ElevationBars)) / Visits) *
+			FMath::Clamp(ScanSampleInterval, 0.016f, 1.0f);
+	}
 	const float EffectiveDropTimeout = FMath::Max(TrackDropTimeout, ScanFrameTime * 1.5f);
 
 	for (int32 i = Tracks.Num() - 1; i >= 0; --i)
@@ -194,6 +193,7 @@ void UAircraftRadarComponent::PruneStaleTracks(float DeltaTime)
 			if (Track.TrackID == BuggedTrackID)
 			{
 				BuggedTrackID = -1;
+				OnRadarTrackDeselected.Broadcast(LostTrackID);
 			}
 
 			Tracks.RemoveAt(i);
@@ -223,10 +223,7 @@ void UAircraftRadarComponent::PerformSTTTracking()
 	if (TrackIndex == INDEX_NONE)
 	{
 		// Track file lost
-		const int32 OldLockID = STTLockedTrackID;
-		STTLockedTrackID = -1;
-		OnRadarLockLost.Broadcast(OldLockID);
-		SetRadarMode(PreSTTMode);
+		BreakLock();
 		return;
 	}
 
@@ -236,12 +233,50 @@ void UAircraftRadarComponent::PerformSTTTracking()
 	if (!Track.TrackedActor.IsValid())
 	{
 		const int32 OldLockID = STTLockedTrackID;
+		if (BuggedTrackID == OldLockID)
+		{
+			BuggedTrackID = -1;
+		}
 		STTLockedTrackID = -1;
+		STTLockedActor = nullptr;
 		Tracks.RemoveAt(TrackIndex);
+		RecordOperatorEvent(ERadarOperatorEventType::LockLost, OldLockID);
 		OnRadarLockLost.Broadcast(OldLockID);
+		OnRadarTrackDeselected.Broadcast(OldLockID);
 		OnRadarContactLost.Broadcast(OldLockID);
-		SetRadarMode(PreSTTMode);
+		BreakLock();
 		return;
+	}
+
+	// Check antenna gimbal limits (cannot track outside antenna gimbal bounds)
+	const FVector TargetPosition = Track.LastKnownPosition + Track.EstimatedVelocity * FMath::Min(Track.TrackAge, 2.0f);
+	float TargetBearing = 0.0f;
+	float TargetElevation = 0.0f;
+	ComputeBearingElevation(TargetPosition, TargetBearing, TargetElevation);
+
+	// Update antenna pointing azimuth to track locked target (for HUD/MFD B-scope rendering)
+	CurrentScanAzimuth = TargetBearing;
+
+	// STT tracking uses physical antenna gimbal limits (e.g. ±60°) unless omnidirectional/ground-turret tracking is enabled
+	if (!bOmnidirectionalTracking)
+	{
+		const float MaxAz = FMath::Max(MaxAntennaGimbalAzimuth, AzimuthScanWidth * 0.5f);
+		const float MaxEl = FMath::Max(MaxAntennaGimbalElevation, ElevationScanHeight * 0.5f);
+
+		const bool bCheckAz = (MaxAz < 180.0f);
+		const bool bCheckEl = (MaxEl < 90.0f);
+
+		const float AzDiff = bCheckAz ? FMath::Abs(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TargetBearing)) : 0.0f;
+		const float ElDiff = bCheckEl ? FMath::Abs(TargetElevation - ScanCenterElevation) : 0.0f;
+
+		// Allow a 10% gimbal margin before hard break-lock
+		if ((bCheckAz && AzDiff > MaxAz * 1.1f) || (bCheckEl && ElDiff > MaxEl * 1.1f))
+		{
+			Track.Status = ERadarTrackStatus::Lost;
+			Track.bIsBeamTarget = false;
+			BreakLock();
+			return;
+		}
 	}
 
 	// STT provides continuous high-rate updates — re-evaluate target
@@ -256,38 +291,26 @@ void UAircraftRadarComponent::PerformSTTTracking()
 		// Check range — if target exits max range, break lock
 		if (Track.Range > MaxDetectionRange * 1.1f)
 		{
-			const int32 OldLockID = STTLockedTrackID;
-			STTLockedTrackID = -1;
 			Track.Status = ERadarTrackStatus::Lost;
 			Track.bIsBeamTarget = false;
-			OnRadarLockLost.Broadcast(OldLockID);
-			SetRadarMode(PreSTTMode);
+			BreakLock();
 			return;
 		}
 
-		// Check Doppler notch in STT — some radars can hold through notch in STT due to angle tracking
-		if (Track.bIsNotching)
-		{
-			OnRadarTargetNotching.Broadcast(Track);
-
-			if (bEnableDebugTraces && bEnableDiagnosticHUD)
-			{
-				FAircraftCombatDebug::PrintRadarTelemetry(3, TEXT("[RADAR STT] TARGET NOTCHING!"), FColor::Yellow, 0.5f);
-			}
-		}
 	}
 	else
 	{
+		if (RawTrack.bIsNotching && !Track.bIsNotching)
+		{
+			Track.bIsNotching = true;
+			OnRadarTargetNotching.Broadcast(Track);
+		}
 		// Lost detection — target may have gone to ground or out of range
-		Track.TrackAge += GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.016f;
 		if (Track.TrackAge > TrackDropTimeout * 0.5f)
 		{
-			const int32 OldLockID = STTLockedTrackID;
-			STTLockedTrackID = -1;
 			Track.Status = ERadarTrackStatus::Lost;
 			Track.bIsBeamTarget = false;
-			OnRadarLockLost.Broadcast(OldLockID);
-			SetRadarMode(PreSTTMode);
+			BreakLock();
 		}
 	}
 }
@@ -301,90 +324,29 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 		return;
 	}
 
-	const FVector RadarPosition = OwnerActor->GetActorLocation();
-	const FRotator OwnerRotation = OwnerActor->GetActorRotation();
-	const FVector ForwardDir = OwnerRotation.Vector();
+	FVector RadarPosition;
+	FRotator RadarRotation;
+	GetRadarSourceTransform(RadarPosition, RadarRotation);
+	const FVector ForwardDir = RadarRotation.Vector();
 
-	float AcquisitionConeAngle = ACMBoresightConeAngle;
-	FVector AcquisitionDirection = ForwardDir;
-
-	switch (ACMSubMode)
+	// In ACM mode, antenna azimuth reflects the acquisition boresight, slew offset, or helmet cue
+	if (ACMSubMode == ERadarACMSubMode::SlewAcquisition)
 	{
-		case ERadarACMSubMode::Boresight:
-			AcquisitionConeAngle = ACMBoresightConeAngle;
-			AcquisitionDirection = ForwardDir;
-			break;
-
-		case ERadarACMSubMode::VerticalScan:
-			AcquisitionConeAngle = 5.0f; // Narrow horizontal, wide vertical
-			AcquisitionDirection = ForwardDir;
-			break;
-
-		case ERadarACMSubMode::SlewAcquisition:
-		{
-			// TDC-steered: Use scan center offsets
-			const FRotator SlewRotator(ScanCenterElevation, ScanCenterAzimuth, 0.0f);
-			AcquisitionDirection = (OwnerRotation.Quaternion() * SlewRotator.Quaternion()).GetForwardVector();
-			AcquisitionConeAngle = 10.0f;
-			break;
-		}
-
-		case ERadarACMSubMode::HelmetCue:
-			// Helmet cue would need external HMD look direction input
-			// Fallback to boresight
-			AcquisitionConeAngle = ACMBoresightConeAngle;
-			AcquisitionDirection = ForwardDir;
-			break;
+		CurrentScanAzimuth = ScanCenterAzimuth;
+	}
+	else if (ACMSubMode == ERadarACMSubMode::HelmetCue && !HelmetLookDirection.IsNearlyZero())
+	{
+		const FVector LocalHelmet = RadarRotation.UnrotateVector(HelmetLookDirection);
+		CurrentScanAzimuth = LocalHelmet.Rotation().Yaw;
+	}
+	else
+	{
+		CurrentScanAzimuth = 0.0f;
 	}
 
-	const float CosCone = FMath::Cos(FMath::DegreesToRadians(AcquisitionConeAngle));
-
-	// 2. Query potential targets: Subsystem registry first, then fallback to scene query
+	// 2. Query potential targets via fast spatial registry and fallback physics overlap
 	TArray<AActor*> CandidateActors;
-	if (UAircraftCombatSubsystem* Subsystem = UAircraftCombatSubsystem::Get(this))
-	{
-		Subsystem->GetCombatActorsInVolume(RadarPosition, ACMAutoLockRange, CandidateActors);
-	}
-
-	if (CandidateActors.Num() == 0)
-	{
-		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RadarACMAcquisition), false, OwnerActor);
-		QueryParams.AddIgnoredActor(OwnerActor);
-		TArray<AActor*> AttachedActors;
-		OwnerActor->GetAttachedActors(AttachedActors, true, true);
-		QueryParams.AddIgnoredActors(AttachedActors);
-
-		TArray<FOverlapResult> OverlapResults;
-		const FCollisionShape SphereShape = FCollisionShape::MakeSphere(ACMAutoLockRange);
-
-		if (bQueryAllDynamicObjects)
-		{
-			FCollisionObjectQueryParams ObjectParams;
-			ObjectParams.AddObjectTypesToQuery(ECC_Pawn);
-			ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
-			ObjectParams.AddObjectTypesToQuery(ECC_PhysicsBody);
-			ObjectParams.AddObjectTypesToQuery(ECC_Vehicle);
-
-			World->OverlapMultiByObjectType(OverlapResults, RadarPosition, FQuat::Identity, ObjectParams, SphereShape, QueryParams);
-
-			if (OverlapResults.IsEmpty())
-			{
-				World->OverlapMultiByChannel(OverlapResults, RadarPosition, FQuat::Identity, DetectionChannel, SphereShape, QueryParams);
-			}
-		}
-		else
-		{
-			World->OverlapMultiByChannel(OverlapResults, RadarPosition, FQuat::Identity, DetectionChannel, SphereShape, QueryParams);
-		}
-
-		for (const FOverlapResult& Overlap : OverlapResults)
-		{
-			if (AActor* Candidate = Overlap.GetActor())
-			{
-				CandidateActors.AddUnique(Candidate);
-			}
-		}
-	}
+	GatherCandidateActors(RadarPosition, ACMAutoLockRange, CandidateActors);
 
 	if (CandidateActors.IsEmpty())
 	{
@@ -395,14 +357,12 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 	AActor* BestTarget = nullptr;
 	float BestRangeSq = TNumericLimits<float>::Max();
 
-	TSet<AActor*> ProcessedActors;
 	for (AActor* Candidate : CandidateActors)
 	{
-		if (!Candidate || ProcessedActors.Contains(Candidate) || Candidate == OwnerActor)
+		if (!Candidate)
 		{
 			continue;
 		}
-		ProcessedActors.Add(Candidate);
 
 		// Tag filtering (checks actor and component tags)
 		if (!CheckCandidateTags(Candidate))
@@ -410,12 +370,24 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 			continue;
 		}
 
+		// Domain filtering for ACM mode
+		const ERadarTargetDomain CandidateDomain = ResolveCandidateDomain(Candidate);
+		if (!IsDomainAllowedForMode(CandidateDomain, RadarMode))
+		{
+			continue;
+		}
+
 		const FVector ToTarget = Candidate->GetActorLocation() - RadarPosition;
 		const float RangeSq = ToTarget.SizeSquared();
-		const FVector ToTargetDir = ToTarget.GetSafeNormal();
-		const float DotProduct = FVector::DotProduct(AcquisitionDirection, ToTargetDir);
+		if (RangeSq > FMath::Square(ACMAutoLockRange))
+		{
+			continue;
+		}
 
-		if (DotProduct >= CosCone && RangeSq < BestRangeSq)
+		const FVector ToTargetDir = ToTarget.GetSafeNormal();
+		const FVector LocalTargetDir = RadarRotation.UnrotateVector(ToTargetDir);
+
+		if (IsDirectionInACMVolume(LocalTargetDir, ACMSubMode) && RangeSq < BestRangeSq)
 		{
 			// Terrain masking check
 			if (bEnableTerrainMasking && IsTerrainMasked(RadarPosition, Candidate->GetActorLocation(), Candidate))
@@ -438,13 +410,6 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 			CommandLock(NewTrackID);
 		}
 	}
-
-	// Debug: Draw ACM cone
-	if (bEnableDebugTraces && bDrawAntennaBeam)
-	{
-		const float ConeAngleRad = FMath::DegreesToRadians(AcquisitionConeAngle);
-		DrawDebugCone(World, RadarPosition, AcquisitionDirection, ACMAutoLockRange * 0.3f, ConeAngleRad, ConeAngleRad, 16, FColor::Orange, false, -1.0f, 0, 1.5f);
-	}
 }
 
 FVector UAircraftRadarComponent::SmoothVelocity(const FVector& OldVelocity, const FVector& NewVelocity, float Alpha) const
@@ -461,7 +426,7 @@ void UAircraftRadarComponent::DrawDebugTracks() const
 		return;
 	}
 
-	const FVector RadarPosition = OwnerActor->GetActorLocation();
+	const FVector RadarPosition = GetRadarLocation();
 
 	// Deduplicate by target actor so each actor has exactly ONE dominant track displayed
 	// Priority hierarchy: Locked (5) > Bugged (4) > Tracked (3) > Jammed (2) > Search (1) > Lost (0)
@@ -505,7 +470,7 @@ void UAircraftRadarComponent::DrawDebugTracks() const
 	{
 		if (Pair.Value)
 		{
-			FAircraftCombatDebug::DrawTrackSymbology(World, RadarPosition, *Pair.Value, true);
+			FAircraftCombatDebug::DrawTrackSymbology(World, this, RadarPosition, *Pair.Value, true);
 		}
 	}
 }
