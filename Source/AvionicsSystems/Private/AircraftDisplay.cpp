@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftDisplay.h"
@@ -48,7 +47,7 @@ void UAircraftDisplay::NativeInitialization()
 		return;
 	}
 
-	// Auto-discover avionics and weapon components on the player aircraft all at once (skip if not present)
+	// Discover avionics and weapon components on the aircraft
 	if (!ModularMissionManagement)
 	{
 		ModularMissionManagement = PlayerAircraft->FindComponentByClass<UModularMissionManagement>();
@@ -78,7 +77,7 @@ void UAircraftDisplay::AssignLockedTarget(AActor* InLockedTarget)
 	LockedTarget = InLockedTarget;
 }
 
-bool UAircraftDisplay::IsSymbolInDisplayBoundarie(UWidget* SymbolWidget, FVector2D XLimits, FVector2D YLimits) const
+bool UAircraftDisplay::IsSymbolInDisplayBoundary(UWidget* SymbolWidget, FVector2D XLimits, FVector2D YLimits) const
 {
 	if (!SymbolWidget)
 	{
@@ -94,11 +93,6 @@ bool UAircraftDisplay::IsSymbolInDisplayBoundarie(UWidget* SymbolWidget, FVector
 
 	return (Translation.X >= MinX && Translation.X <= MaxX &&
 	        Translation.Y >= MinY && Translation.Y <= MaxY);
-}
-
-bool UAircraftDisplay::IsSymbolInHUD(UWidget* SymbolWidget) const
-{
-	return IsSymbolInDisplayBoundarie(SymbolWidget, FVector2D(-100.0f, 100.0f), FVector2D(-100.0f, 100.0f));
 }
 
 bool UAircraftDisplay::CheckGroundCollision() const

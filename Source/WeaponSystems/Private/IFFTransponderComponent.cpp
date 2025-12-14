@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "IFFTransponderComponent.h"
@@ -21,6 +20,11 @@ void UIFFTransponderComponent::BeginPlay()
 {
 	Super::BeginPlay();
 	AActor* OwnerActor = GetOwner();
+	if (OwnerActor && OwnerActor->HasAuthority())
+	{
+		if (UAircraftRadarComponent* Radar = OwnerActor->FindComponentByClass<UAircraftRadarComponent>())
+			Radar->RefreshDataLinkEligibility();
+	}
 	if (OwnerActor && OwnerActor->HasAuthority() &&
 		!OwnerActor->FindComponentByClass<UAircraftRadarComponent>())
 	{
@@ -65,6 +69,11 @@ void UIFFTransponderComponent::SetTeamID(uint8 NewTeamID)
 	}
 
 	TeamID = NewTeamID;
+	if (OwnerActor)
+	{
+		if (UAircraftRadarComponent* Radar = OwnerActor->FindComponentByClass<UAircraftRadarComponent>())
+			Radar->RefreshDataLinkEligibility();
+	}
 	OnTeamChanged.Broadcast(TeamID);
 }
 
@@ -83,6 +92,11 @@ void UIFFTransponderComponent::SetTransponderActive(bool bActive)
 	}
 
 	bTransponderActive = bActive;
+	if (OwnerActor)
+	{
+		if (UAircraftRadarComponent* Radar = OwnerActor->FindComponentByClass<UAircraftRadarComponent>())
+			Radar->RefreshDataLinkEligibility();
+	}
 	OnTransponderActiveChanged.Broadcast(bTransponderActive);
 }
 

@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -84,12 +83,10 @@ struct FGunFunnelConfig
 		return FMath::DegreesToRadians(FMath::Max(0.0f, DeadZone));
 	}
 
-	/** Backward-compatible helper for angular dead zone */
 	FORCEINLINE float GetAngularDeadZone() const { return DeadZone; }
 	FORCEINLINE void SetAngularDeadZone(float InValue) { DeadZone = InValue; }
 };
 
-// Typedef alias for backward-compatibility if referenced as FEEGSFunnel
 using FEEGSFunnel = FGunFunnelConfig;
 
 /**

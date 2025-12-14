@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -61,7 +60,8 @@ public:
 		int32 ElevationBars,
 		int32 ActiveBar,
 		float VisualRange,
-		const FColor& FrustumColor = FColor(0, 220, 100)
+		const FColor& FrustumColor = FColor(0, 220, 100),
+		bool bCellCenteredBars = false
 	);
 
 	static void DrawAntennaBeam(

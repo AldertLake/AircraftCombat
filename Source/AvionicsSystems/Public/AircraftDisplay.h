@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -105,11 +104,7 @@ public:
 
 	/** Checks if a symbol widget's render translation is within the specified boundary box */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display", meta = (DisplayName = "Is Symbol In Display Boundary"))
-	bool IsSymbolInDisplayBoundarie(UWidget* SymbolWidget, FVector2D XLimits = FVector2D(-100.0f, 100.0f), FVector2D YLimits = FVector2D(-100.0f, 100.0f)) const;
-
-	/** Verifies if a UWidget is within display boundaries (Deprecated: Use IsSymbolInDisplayBoundarie instead) */
-	UFUNCTION(BlueprintPure, Category = "Aircraft Display", meta = (DeprecatedFunction, DeprecationMessage = "Use IsSymbolInDisplayBoundarie instead."))
-	bool IsSymbolInHUD(UWidget* SymbolWidget) const;
+	bool IsSymbolInDisplayBoundary(UWidget* SymbolWidget, FVector2D XLimits = FVector2D(-100.0f, 100.0f), FVector2D YLimits = FVector2D(-100.0f, 100.0f)) const;
 
 	/** Evaluates altitude, sink rate, and terrain to trigger the ground collision warning */
 	UFUNCTION(BlueprintPure, Category = "Aircraft Display|Flight Safety")

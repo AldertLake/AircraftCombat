@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -70,9 +69,6 @@ struct WEAPONSYSTEMS_API FMissileLaunchConfiguration
 	bool bMadDog = false;
 };
 
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTargetLockedSignature, AActor*, LockedTarget);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTargetLockLostSignature, AActor*, LostTarget);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMissileLaunchedSignature, AActor*, LockedTarget);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnProximityFuzeTriggeredSignature, AActor*, TriggeringActor);
 
 /**
@@ -103,14 +99,6 @@ class WEAPONSYSTEMS_API UMissileGuidanceComponent : public UMasterWeaponComponen
 public:
 	UMissileGuidanceComponent();
 
-	/** Event dispatcher broadcast when a target lock is successfully acquired */
-	UPROPERTY(BlueprintAssignable, Category = "Missile|Events")
-	FOnTargetLockedSignature OnTargetLocked;
-
-	/** Event dispatcher broadcast when a previously acquired target lock is lost or invalidated */
-	UPROPERTY(BlueprintAssignable, Category = "Missile|Events")
-	FOnTargetLockLostSignature OnTargetLockLost;
-
 	/** Event dispatcher broadcast when the proximity fuze detonates near a valid target */
 	UPROPERTY(BlueprintAssignable, Category = "Missile|Events")
 	FOnProximityFuzeTriggeredSignature OnProximityFuzeTriggered;
@@ -139,6 +127,10 @@ public:
 	/** Maximum cruise velocity of the missile in cm/s */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "100.0", UIMin = "1000.0"))
 	float MaxCruiseSpeed = 35000.0f;
+
+	/** Planning horizon for launch-envelope estimates; guidance itself does not self-destruct at this time. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "1.0"))
+	float EffectiveFlightTimeSeconds = 40.0f;
 
 	/** Time delay in seconds after launch before PN guidance steering begins (clears parent aircraft) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Missile|Guidance|Kinematics", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "5.0"))
@@ -256,6 +248,8 @@ public:
 	 * @param bActivate Powers and enables the missile guidance system if true, shuts it down if false
 	 */
 	virtual void ActivateWeapon(bool bActivate = true) override;
+	virtual bool GetDynamicLaunchZone(const AActor* Target, float& OutRmin, float& OutRne, float& OutRmax) const override;
+	virtual float GetEstimatedTimeToImpact(const AActor* Target) const override;
 
 	/**
 	 * Assigns the target actor to track.
@@ -275,12 +269,18 @@ public:
 	void ClearTargetSolution();
 
 	/**
-	 * Returns true if the missile guidance system is activated and holding a valid target lock
+	 * Returns true if the missile guidance system is activated and ready to fire.
+	 *
+	 * @param OutReason Diagnostic launch failure reason if missile cannot fire
 	 */
-	virtual bool CanFireWeapon() const override;
+	using UMasterWeaponComponent::CanFireWeapon;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const override;
 
 	/** Returns true if the missile can be safely detached/jettisoned (i.e. not yet launched) */
 	virtual bool CanDetachWeapon() const override;
+
+	/** Releases an unfired missile as inert, gravity-driven debris with carrier velocity. */
+	void JettisonInert(const FVector& EjectionVelocity);
 
 	/**
 	 * Attempts to launch the missile.
@@ -301,7 +301,8 @@ public:
 	virtual void UpdateGuidanceVelocity(float DeltaTime);
 
 	/**
-	 * Performs a spherical proximity fuze trace around the seeker socket.
+	 * Sweeps the proximity fuze sphere over seeker travel since the previous sample.
+	 * Only the armed portion of travel is queried; stationary checks use a sphere overlap.
 	 * If a valid target is within the fuze radius, triggers OnProximityFuzeTriggered.
 	 *
 	 * @return True if a valid target triggered the proximity fuze, false otherwise
@@ -382,6 +383,12 @@ protected:
 	/** Indicates whether the proximity fuze has detonated (prevents repeated trigger callbacks) */
 	UPROPERTY(Transient)
 	bool bFuzeTriggered = false;
+
+	/** Previous seeker sample, recorded even while the fuze is unarmed or has no eligible lock. */
+	FVector PreviousFuzeLocation = FVector::ZeroVector;
+	float PreviousFuzeFlightTime = 0.0f;
+	bool bHasPreviousFuzeSample = false;
+	bool EvaluateProximityFuze(float SampleFlightTime);
 
 	/** Populates query parameters with ignored actors (owner, missile, player aircraft, and attached children) */
 	void PopulateSeekerIgnoredActors(FCollisionQueryParams& OutParams) const;

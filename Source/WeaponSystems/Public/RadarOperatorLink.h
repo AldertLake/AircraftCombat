@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -24,12 +23,15 @@ struct FRadarOperatorSnapshot
 	UPROPERTY() FRadarDisplayView DisplayView;
 	UPROPERTY() int32 DisplayViewRevision = 1;
 	UPROPERTY() float ScanAzimuth = 0.0f;
+	UPROPERTY() float ScanElevation = 0.0f;
+	UPROPERTY() bool bVirtuallySweepBeam = true;
+	UPROPERTY() TArray<FRadarBeamSample> SampleBeams;
 	UPROPERTY() float ScanCenterAzimuth = 0.0f;
 	UPROPERTY() float ScanCenterElevation = 0.0f;
 	UPROPERTY() float AzimuthScanWidth = 120.0f;
 	UPROPERTY() float ElevationScanHeight = 20.0f;
 	UPROPERTY() int32 ElevationBars = 4;
-	UPROPERTY() ERadarScanDrive ScanDrive = ERadarScanDrive::VirtualMechanical;
+	UPROPERTY() ERadarScanDrive ScanDrive = ERadarScanDrive::MSA;
 	UPROPERTY() ERadarScanSize ScanSizePreset = ERadarScanSize::Custom;
 	UPROPERTY() int32 LockedTrackID = -1;
 	UPROPERTY() int32 BuggedTrackID = -1;

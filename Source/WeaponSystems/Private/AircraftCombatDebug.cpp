@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftCombatDebug.h"
@@ -113,46 +112,52 @@ void FAircraftCombatDebug::DrawRadarFrustum(
 	int32 ElevationBars,
 	int32 ActiveBar,
 	float VisualRange,
-	const FColor& FrustumColor)
+	const FColor& FrustumColor,
+	bool bCellCenteredBars)
 {
 	if (!World || VisualRange <= 0.0f)
 	{
 		return;
 	}
 
-	const FQuat OwnerQuat = Orientation.Quaternion();
 	const float HalfAz = AzimuthWidthDeg * 0.5f;
 	const float HalfEl = ElevationHeightDeg * 0.5f;
-
-	// 1. Draw 4 corners and connecting frame of the scan volume frustum
-	const FRotator Corners[4] = {
-		FRotator(CenterElevationDeg + HalfEl, CenterAzimuthDeg - HalfAz, 0.0f),
-		FRotator(CenterElevationDeg + HalfEl, CenterAzimuthDeg + HalfAz, 0.0f),
-		FRotator(CenterElevationDeg - HalfEl, CenterAzimuthDeg + HalfAz, 0.0f),
-		FRotator(CenterElevationDeg - HalfEl, CenterAzimuthDeg - HalfAz, 0.0f)
+	const int32 Segments = FMath::Clamp(FMath::CeilToInt(AzimuthWidthDeg / 10.0f), 1, 72);
+	auto Point = [&](float Az, float El)
+	{
+		return Origin + Orientation.RotateVector(FRotator(FMath::Clamp(El, -90.0f, 90.0f), Az, 0.0f).Vector()) * VisualRange;
 	};
-
-	for (int32 i = 0; i < 4; ++i)
+	auto DrawArc = [&](float El, const FColor& Color, float Thickness)
 	{
-		const FVector Dir = (OwnerQuat * Corners[i].Quaternion()).GetForwardVector();
-		DrawDebugLine(World, Origin, Origin + Dir * VisualRange, FrustumColor, false, RadarDebugDrawLifetimeSeconds, 0, 1.2f);
-
-		const FVector DirNext = (OwnerQuat * Corners[(i + 1) % 4].Quaternion()).GetForwardVector();
-		DrawDebugLine(World, Origin + Dir * VisualRange, Origin + DirNext * VisualRange, FrustumColor, false, RadarDebugDrawLifetimeSeconds, 0, 0.8f);
+		FVector Previous = Point(CenterAzimuthDeg - HalfAz, El);
+		for (int32 Segment = 1; Segment <= Segments; ++Segment)
+		{
+			const FVector Next = Point(CenterAzimuthDeg - HalfAz + AzimuthWidthDeg * Segment / Segments, El);
+			DrawDebugLine(World, Previous, Next, Color, false, RadarDebugDrawLifetimeSeconds, 0, Thickness);
+			Previous = Next;
+		}
+	};
+	// Curved boundaries remain meaningful at wide angles, including a full 360-degree scan.
+	DrawArc(CenterElevationDeg - HalfEl, FrustumColor, 0.8f);
+	DrawArc(CenterElevationDeg + HalfEl, FrustumColor, 0.8f);
+	const int32 Spokes = AzimuthWidthDeg >= 360.0f ? 4 : 2;
+	for (int32 Spoke = 0; Spoke < Spokes; ++Spoke)
+	{
+		const float Az = CenterAzimuthDeg - HalfAz + (Spokes == 4 ? 90.0f * Spoke : AzimuthWidthDeg * Spoke);
+		const FVector Bottom = Point(Az, CenterElevationDeg - HalfEl);
+		const FVector Top = Point(Az, CenterElevationDeg + HalfEl);
+		DrawDebugLine(World, Origin, Bottom, FrustumColor, false, RadarDebugDrawLifetimeSeconds, 0, 1.2f);
+		DrawDebugLine(World, Origin, Top, FrustumColor, false, RadarDebugDrawLifetimeSeconds, 0, 1.2f);
+		if (Spokes == 2) DrawDebugLine(World, Bottom, Top, FrustumColor, false, RadarDebugDrawLifetimeSeconds, 0, 0.8f);
+	}
+	for (int32 Bar = 0; Bar < ElevationBars; ++Bar)
+	{
+		const float Level = bCellCenteredBars ? (Bar + 0.5f) / ElevationBars :
+			(ElevationBars > 1 ? static_cast<float>(Bar) / (ElevationBars - 1) : 0.5f);
+		DrawArc(CenterElevationDeg - HalfEl + ElevationHeightDeg * Level,
+			Bar == ActiveBar ? FColor::Yellow : FColor(0, 140, 70), Bar == ActiveBar ? 2.0f : 0.6f);
 	}
 
-	// 2. Draw elevation bar scan lines across the volume
-	const float ElevationStep = (ElevationBars > 1) ? ElevationHeightDeg / static_cast<float>(ElevationBars - 1) : 0.0f;
-	for (int32 BarIdx = 0; BarIdx < ElevationBars; ++BarIdx)
-	{
-		const float BarEl = CenterElevationDeg - HalfEl + (ElevationStep * BarIdx);
-		const FVector LeftBarDir = (OwnerQuat * FRotator(BarEl, CenterAzimuthDeg - HalfAz, 0.0f).Quaternion()).GetForwardVector();
-		const FVector RightBarDir = (OwnerQuat * FRotator(BarEl, CenterAzimuthDeg + HalfAz, 0.0f).Quaternion()).GetForwardVector();
-
-		const FColor BarColor = (BarIdx == ActiveBar) ? FColor::Yellow : FColor(0, 140, 70);
-		const float BarThickness = (BarIdx == ActiveBar) ? 2.0f : 0.6f;
-		DrawDebugLine(World, Origin + LeftBarDir * VisualRange, Origin + RightBarDir * VisualRange, BarColor, false, RadarDebugDrawLifetimeSeconds, 0, BarThickness);
-	}
 }
 
 void FAircraftCombatDebug::DrawAntennaBeam(
@@ -177,13 +182,13 @@ void FAircraftCombatDebug::DrawAntennaBeam(
 	const FVector BeamDir = (OwnerQuat * BeamRotator.Quaternion()).GetForwardVector();
 
 	// Antenna boresight ray
-	DrawDebugLine(World, Origin, Origin + BeamDir * (VisualRange * 1.05f), BeamColor, false, RadarDebugDrawLifetimeSeconds, 0, 2.5f);
+	DrawDebugLine(World, Origin, Origin + BeamDir * VisualRange, BeamColor, false, RadarDebugDrawLifetimeSeconds, 0, 2.5f);
 
 	if (bDrawCone)
 	{
 		const float AzConeRad = FMath::DegreesToRadians(FMath::Max(1.0f, BeamAzHalfWidthDeg));
 		const float ElConeRad = FMath::DegreesToRadians(FMath::Max(1.0f, BeamElHalfWidthDeg));
-		DrawDebugCone(World, Origin, BeamDir, VisualRange * 0.85f, AzConeRad, ElConeRad, 16, BeamColor, false, RadarDebugDrawLifetimeSeconds, 0, 1.0f);
+		DrawDebugCone(World, Origin, BeamDir, VisualRange, AzConeRad, ElConeRad, 16, BeamColor, false, RadarDebugDrawLifetimeSeconds, 0, 1.0f);
 	}
 }
 

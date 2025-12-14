@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "MissileGuidanceComponent.h"
@@ -34,7 +33,7 @@ void UMissileGuidanceComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Ensure parent movement component max speed does not restrict cruise speed
+	// Allow movement component speed to reach cruise speed
 	MaxSpeed = FMath::Max(MaxSpeed, MaxCruiseSpeed);
 
 	Weapon = Cast<AWeapon>(GetOwner());
@@ -54,53 +53,94 @@ void UMissileGuidanceComponent::GetLifetimeReplicatedProps(TArray<FLifetimePrope
 
 bool UMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfiguration& Configuration)
 {
-	if (bWeaponFired || (GetOwner() && !GetOwner()->HasAuthority())) return false;
+	if (bWeaponFired) return false;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return false;
 	if (IsValid(Configuration.Carrier)) InitializeWeapon(Configuration.Carrier);
 	TargetSolution = Configuration.Target;
-	if (IsValid(Configuration.Target.TargetActor)) LockMissile(Configuration.Target.TargetActor);
+	LockMissile(IsValid(Configuration.Target.TargetActor) ? Configuration.Target.TargetActor.Get() : nullptr);
 	return true;
 }
 
 void UMissileGuidanceComponent::ClearTargetSolution()
 {
-	if (bWeaponFired || (GetOwner() && !GetOwner()->HasAuthority())) return;
+	if (bWeaponFired) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	TargetSolution = FMissileTargetSolution();
 }
 
 void UMissileGuidanceComponent::ActivateWeapon(bool bActivate)
 {
 	// Powers the weapon and enables/disables seeker tracking systems
+	const bool bWasActivated = bIsWeaponActivated;
 	Super::ActivateWeapon(bActivate);
+	if (!bActivate) TransitionSeekerState(EWeaponSeekerState::Standby);
+	else if (!bWasActivated) TransitionSeekerState(EWeaponSeekerState::Caged);
 
 	if (!bIsWeaponActivated)
 	{
-		bFuzeTriggered = false;
+		// Power changes or a fuze callback must not rearm an already launched missile.
+		if (!bWeaponFired) bFuzeTriggered = false;
+		bHasPreviousFuzeSample = false;
 
-		if (LockedTarget)
-		{
-			AActor* LostTarget = LockedTarget;
-			LockedTarget = nullptr;
-			OnTargetLockLost.Broadcast(LostTarget);
-		}
+		LockedTarget = nullptr;
 	}
+}
+
+bool UMissileGuidanceComponent::GetDynamicLaunchZone(const AActor* Target,
+	float& OutRmin, float& OutRne, float& OutRmax) const
+{
+	OutRmin = OutRne = OutRmax = 0.0f;
+	if (!IsValid(Target) || !IsValid(GetOwner()) || MaxCruiseSpeed <= 0.0f ||
+		EffectiveFlightTimeSeconds <= 0.0f) return false;
+	const FVector Source = GetOwner()->GetActorLocation();
+	const FVector ToTarget = Target->GetActorLocation() - Source;
+	const float Range = ToTarget.Size();
+	if (Range <= KINDA_SMALL_NUMBER) return false;
+	const FVector LOS = ToTarget / Range;
+	const FVector CarrierVelocity = IsValid(PlayerAircraft) ? PlayerAircraft->GetVelocity() : GetOwner()->GetVelocity();
+	const float RelativeClosure = FVector::DotProduct(CarrierVelocity - Target->GetVelocity(), LOS);
+	const float SpeedAtLaunch = FMath::Max(InitialSpeed, FVector::DotProduct(Velocity, LOS));
+	const float Horizon = FMath::Min(EffectiveFlightTimeSeconds, 180.0f);
+	float Speed = FMath::Clamp(SpeedAtLaunch, 0.0f, MaxCruiseSpeed);
+	float Reach = 0.0f;
+	for (float Time = 0.0f; Time < Horizon; Time += 0.5f)
+	{
+		const float Step = FMath::Min(0.5f, Horizon - Time);
+		if (Time >= MotorIgnitionDelay)
+		{
+			const float BurnTime = Time - MotorIgnitionDelay;
+			const float Thrust = !bUseStagedMotorProfile ? MotorAcceleration :
+				(BurnTime <= BoostDurationSeconds ? MotorAcceleration :
+					(BurnTime <= BoostDurationSeconds + SustainDurationSeconds ? SustainAcceleration : 0.0f));
+			const float Drag = bUseStagedMotorProfile ?
+				FMath::Max(0.0f, QuadraticDragCoefficient) * FMath::Square(Speed) : 0.0f;
+			Speed = FMath::Clamp(Speed + (Thrust - Drag) * Step, 0.0f, MaxCruiseSpeed);
+		}
+		Reach += Speed * Step;
+	}
+	const float AltitudeFactor = FMath::Clamp(1.0f + (Source.Z / 1000000.0f) * 0.15f, 0.8f, 1.3f);
+	OutRmin = FMath::Max(TerminalDeadbandRange, FMath::Max(GuidanceActivationDelay, FuzeArmingDelay) *
+		FMath::Max(SpeedAtLaunch, MaxCruiseSpeed * 0.25f));
+	OutRmax = FMath::Max(OutRmin, (Reach * AltitudeFactor + RelativeClosure * Horizon) * 0.65f);
+	OutRne = FMath::Clamp(OutRmax * 0.45f, OutRmin, OutRmax);
+	return OutRmax > OutRmin;
+}
+
+float UMissileGuidanceComponent::GetEstimatedTimeToImpact(const AActor* Target) const
+{
+	if (!IsValid(Target) || !IsValid(GetOwner())) return 0.0f;
+	const FVector ToTarget = Target->GetActorLocation() - GetOwner()->GetActorLocation();
+	const float Range = ToTarget.Size();
+	if (Range <= KINDA_SMALL_NUMBER) return 0.0f;
+	const FVector MissileVelocity = bWeaponFired ? Velocity :
+		(ToTarget / Range) * MaxCruiseSpeed + (IsValid(PlayerAircraft) ? PlayerAircraft->GetVelocity() : FVector::ZeroVector);
+	const float ClosingSpeed = FVector::DotProduct(MissileVelocity - Target->GetVelocity(), ToTarget / Range);
+	return ClosingSpeed > 100.0f ? Range / ClosingSpeed : 0.0f;
 }
 
 void UMissileGuidanceComponent::LockMissile(AActor* InTargetActor)
 {
-	if (LockedTarget != InTargetActor)
-	{
-		AActor* PrevTarget = LockedTarget;
-		LockedTarget = InTargetActor;
-
-		if (LockedTarget)
-		{
-			OnTargetLocked.Broadcast(LockedTarget);
-		}
-		else if (PrevTarget)
-		{
-			OnTargetLockLost.Broadcast(PrevTarget);
-		}
-	}
+	LockedTarget = IsValid(InTargetActor) ? InTargetActor : nullptr;
 }
 
 void UMissileGuidanceComponent::SetIgnoredActors(const TArray<AActor*>& InActors)
@@ -199,11 +239,25 @@ TArray<AActor*> UMissileGuidanceComponent::GetIgnoredActors() const
 	return Result;
 }
 
-bool UMissileGuidanceComponent::CanFireWeapon() const
+bool UMissileGuidanceComponent::CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const
 {
-	if (!bIsWeaponActivated || bWeaponFired) return false;
-	if (!bRequireLockToFire) return true;
-	return IsValid(LockedTarget) || TargetSolution.bValid;
+	if (!bIsWeaponActivated)
+	{
+		OutReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
+	if (bWeaponFired)
+	{
+		OutReason = EWeaponLaunchFailureReason::AmmoDepleted;
+		return false;
+	}
+	if (FiringRequirement == EWeaponFiringRequirement::HardLock && !IsValid(LockedTarget))
+	{
+		OutReason = EWeaponLaunchFailureReason::TargetLockRequired;
+		return false;
+	}
+	OutReason = EWeaponLaunchFailureReason::None;
+	return true;
 }
 
 bool UMissileGuidanceComponent::CanDetachWeapon() const
@@ -211,9 +265,26 @@ bool UMissileGuidanceComponent::CanDetachWeapon() const
 	return !bWeaponFired;
 }
 
+void UMissileGuidanceComponent::JettisonInert(const FVector& EjectionVelocity)
+{
+	if (!CanDetachWeapon()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
+	ActivateWeapon(false);
+	if (!UpdatedComponent && GetOwner()) SetUpdatedComponent(GetOwner()->GetRootComponent());
+	DetachWeapon();
+	AppliedEjectionImpulse = EjectionVelocity;
+	Velocity = (IsValid(PlayerAircraft) ? PlayerAircraft->GetVelocity() : FVector::ZeroVector) + EjectionVelocity;
+	ProjectileGravityScale = 1.0f;
+	MaxSpeed = 0.0f;
+	SetActive(true);
+	SetComponentTickEnabled(true);
+	UpdateComponentVelocity();
+}
+
 bool UMissileGuidanceComponent::FireWeapon()
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return false;
+	if (!IsDirectFirePermitted()) return false;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return false;
 	// Launch requires the weapon system to be activated and holding a valid target lock
 	if (!CanFireWeapon())
 	{
@@ -306,6 +377,10 @@ bool UMissileGuidanceComponent::FireWeapon()
 	bWeaponFired = true;
 	bFuzeTriggered = false;
 	TimeSinceFired = 0.0f;
+	FRotator FuzeRotation;
+	GetSeekerTransform(PreviousFuzeLocation, FuzeRotation);
+	PreviousFuzeFlightTime = 0.0f;
+	bHasPreviousFuzeSample = true;
 	OnWeaponFired.Broadcast(LockedTarget);
 	return true;
 }
@@ -486,7 +561,7 @@ FVector UMissileGuidanceComponent::GetTargetTrackingLocation(const AActor* InTar
 
 	if (TargetTrackingSocket != NAME_None)
 	{
-		// Fast-path: Check target RootComponent first
+		// Check root component first
 		if (const USceneComponent* RootComp = InTarget->GetRootComponent())
 		{
 			if (RootComp->DoesSocketExist(TargetTrackingSocket))
@@ -495,7 +570,7 @@ FVector UMissileGuidanceComponent::GetTargetTrackingLocation(const AActor* InTar
 			}
 		}
 
-		// Fallback: Check other scene components with stack-allocated inline buffer
+		// Check remaining scene components
 		TInlineComponentArray<USceneComponent*, 8> SceneComponents(InTarget);
 		for (const USceneComponent* SceneComp : SceneComponents)
 		{
@@ -662,97 +737,80 @@ bool UMissileGuidanceComponent::IsCandidateTargetEligible(const AActor* Candidat
 
 bool UMissileGuidanceComponent::CheckProximityFuze()
 {
-	if (!bEnableProximityFuze || bFuzeTriggered || ProximityFuzeRadius <= 0.0f)
-	{
-		return false;
-	}
+	return EvaluateProximityFuze(TimeSinceFired);
+}
 
-	// Safety: Proximity fuze only arms after weapon has launched and satisfied the arming delay
-	if (!bWeaponFired || TimeSinceFired < FuzeArmingDelay)
-	{
-		return false;
-	}
+bool UMissileGuidanceComponent::EvaluateProximityFuze(float SampleFlightTime)
+{
+	if (!bWeaponFired || bFuzeTriggered) return false;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return false;
 
 	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return false;
-	}
+	if (!World) return false;
 
 	FVector SeekerLocation = FVector::ZeroVector;
 	FRotator SeekerRotation = FRotator::ZeroRotator;
 	GetSeekerTransform(SeekerLocation, SeekerRotation);
+	FVector SweepStart = bHasPreviousFuzeSample && SampleFlightTime >= PreviousFuzeFlightTime
+		? PreviousFuzeLocation : SeekerLocation;
+	const float StartFlightTime = bHasPreviousFuzeSample ? PreviousFuzeFlightTime : SampleFlightTime;
+	PreviousFuzeLocation = SeekerLocation;
+	PreviousFuzeFlightTime = SampleFlightTime;
+	bHasPreviousFuzeSample = true;
+
+	if (!bEnableProximityFuze || ProximityFuzeRadius <= 0.0f || SampleFlightTime < FuzeArmingDelay ||
+		(bFuzeOnlyTriggersOnLockedTarget && !IsValid(LockedTarget))) return false;
+
+	// Do not detonate for a contact passed before the fuze armed during this frame.
+	if (StartFlightTime < FuzeArmingDelay && SampleFlightTime > StartFlightTime)
+	{
+		SweepStart = FMath::Lerp(SweepStart, SeekerLocation,
+			FMath::Clamp((FuzeArmingDelay - StartFlightTime) / (SampleFlightTime - StartFlightTime), 0.0f, 1.0f));
+	}
+	const FVector Travel = SeekerLocation - SweepStart;
+	const bool bHasTravel = !Travel.IsNearlyZero();
+	const FVector QueryLocation = (SweepStart + SeekerLocation) * 0.5f;
+	const FQuat QueryRotation = bHasTravel
+		? FQuat::FindBetweenNormals(FVector::UpVector, Travel.GetSafeNormal()) : FQuat::Identity;
+	// A capsule is the complete volume swept by the sphere. An overlap collects every
+	// candidate, including those beyond an excluded actor that blocks a channel sweep.
+	const FCollisionShape QueryShape = bHasTravel
+		? FCollisionShape::MakeCapsule(ProximityFuzeRadius, Travel.Size() * 0.5f + ProximityFuzeRadius)
+		: FCollisionShape::MakeSphere(ProximityFuzeRadius);
 
 	if (bEnableDebugTraces)
 	{
-		DrawDebugSphere(World, SeekerLocation, ProximityFuzeRadius, 16, FColor::Orange, false, -1.0f, 0, 1.0f);
+		if (bHasTravel)
+		{
+			DrawDebugCapsule(World, QueryLocation,
+				QueryShape.GetCapsuleHalfHeight(), ProximityFuzeRadius, QueryRotation,
+				FColor::Orange, false, -1.0f, 0, 1.0f);
+		}
+		else DrawDebugSphere(World, SeekerLocation, ProximityFuzeRadius, 16, FColor::Orange, false, -1.0f, 0, 1.0f);
 	}
 
-	FCollisionQueryParams FuzeQueryParams(SCENE_QUERY_STAT(MissileProximityFuzeOverlap), false, GetOwner());
+	FCollisionQueryParams FuzeQueryParams(SCENE_QUERY_STAT(MissileProximityFuze), false, GetOwner());
+	FuzeQueryParams.bFindInitialOverlaps = true;
 	PopulateSeekerIgnoredActors(FuzeQueryParams);
 
 	TArray<FOverlapResult> OverlapResults;
-	const FCollisionShape SphereShape = FCollisionShape::MakeSphere(ProximityFuzeRadius);
-	bool bHasOverlaps = false;
+	FCollisionObjectQueryParams ObjectParams;
+	ObjectParams.AddObjectTypesToQuery(ECC_Pawn);
+	ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+	ObjectParams.AddObjectTypesToQuery(ECC_PhysicsBody);
+	ObjectParams.AddObjectTypesToQuery(ECC_Vehicle);
 
 	if (bQueryAllDynamicObjects)
+		World->OverlapMultiByObjectType(OverlapResults, QueryLocation,
+			QueryRotation, ObjectParams, QueryShape, FuzeQueryParams);
+	if (!bQueryAllDynamicObjects || OverlapResults.IsEmpty())
+		World->OverlapMultiByChannel(OverlapResults, QueryLocation,
+			QueryRotation, DetectionChannel, QueryShape, FuzeQueryParams);
+
+	TArray<AActor*> Candidates;
+	for (const FOverlapResult& Overlap : OverlapResults) Candidates.AddUnique(Overlap.GetActor());
+	for (AActor* Candidate : Candidates)
 	{
-		FCollisionObjectQueryParams ObjectParams;
-		ObjectParams.AddObjectTypesToQuery(ECC_Pawn);
-		ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
-		ObjectParams.AddObjectTypesToQuery(ECC_PhysicsBody);
-		ObjectParams.AddObjectTypesToQuery(ECC_Vehicle);
-
-		bHasOverlaps = World->OverlapMultiByObjectType(
-			OverlapResults,
-			SeekerLocation,
-			FQuat::Identity,
-			ObjectParams,
-			SphereShape,
-			FuzeQueryParams
-		);
-
-		if (OverlapResults.IsEmpty())
-		{
-			bHasOverlaps = World->OverlapMultiByChannel(
-				OverlapResults,
-				SeekerLocation,
-				FQuat::Identity,
-				DetectionChannel,
-				SphereShape,
-				FuzeQueryParams
-			);
-		}
-	}
-	else
-	{
-		bHasOverlaps = World->OverlapMultiByChannel(
-			OverlapResults,
-			SeekerLocation,
-			FQuat::Identity,
-			DetectionChannel,
-			SphereShape,
-			FuzeQueryParams
-		);
-	}
-
-	if (!bHasOverlaps || OverlapResults.IsEmpty())
-	{
-		return false;
-	}
-
-	TSet<AActor*> ProcessedActors;
-	ProcessedActors.Reserve(OverlapResults.Num());
-
-	for (const FOverlapResult& Overlap : OverlapResults)
-	{
-		AActor* Candidate = Overlap.GetActor();
-		if (!Candidate || ProcessedActors.Contains(Candidate))
-		{
-			continue;
-		}
-		ProcessedActors.Add(Candidate);
-
 		if (!IsFuzeTargetEligible(Candidate))
 		{
 			continue;
@@ -763,16 +821,20 @@ bool UMissileGuidanceComponent::CheckProximityFuze()
 			continue;
 		}
 
-		// Line-of-sight raycast check: ensure fuze does not detonate through terrain or structures
+		// Line-of-sight check against terrain and static obstacles
 		const FVector TargetLocation = GetTargetTrackingLocation(Candidate);
+		const FVector FuzeLocation = FMath::ClosestPointOnSegment(TargetLocation, SweepStart, SeekerLocation);
 		FHitResult HitResult;
 		const bool bHit = World->LineTraceSingleByChannel(
 			HitResult,
-			SeekerLocation,
+			FuzeLocation,
 			TargetLocation,
 			ECC_Visibility,
 			FuzeQueryParams
 		);
+		if (bEnableDebugTraces)
+			DrawDebugLine(World, FuzeLocation, bHit ? HitResult.ImpactPoint : TargetLocation,
+				bHit ? FColor::Red : FColor::Green, false, -1.0f, 0, 1.0f);
 
 		const bool bLOSClear = !bHit || (HitResult.GetActor() == Candidate) || (HitResult.GetActor() && (HitResult.GetActor()->IsAttachedTo(Candidate) || Candidate->IsAttachedTo(HitResult.GetActor())));
 		if (!bLOSClear)
@@ -804,12 +866,15 @@ void UMissileGuidanceComponent::TickComponent(float DeltaTime, ELevelTick TickTy
 		return;
 	}
 
-	const bool bHasAuthority = GetOwner() ? GetOwner()->HasAuthority() : true;
+	bool bHasAuthority = true;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+		bHasAuthority = !GetOwner() || GetOwner()->HasAuthority();
 
 	// 1. Proximity fuze detection (Server Authoritative)
-	if (bHasAuthority && bWeaponFired && !bFuzeTriggered && (IsValid(LockedTarget) || !bFuzeOnlyTriggersOnLockedTarget))
+	if (bHasAuthority && bWeaponFired && !bFuzeTriggered)
 	{
-		const bool bFuzeFired = CheckProximityFuze();
+		// Projectile movement has just advanced; guidance updates the flight clock later below.
+		const bool bFuzeFired = EvaluateProximityFuze(TimeSinceFired + DeltaTime);
 		if (bFuzeFired && (!IsValid(this) || !bIsWeaponActivated))
 		{
 			return;

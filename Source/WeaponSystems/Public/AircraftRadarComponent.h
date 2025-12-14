@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -29,10 +28,26 @@ struct FRadarOperatorSnapshot;
 UENUM(BlueprintType)
 enum class ERadarScanDrive : uint8
 {
-	VirtualMechanical UMETA(DisplayName = "Virtual Mechanical Sweep"),
-	SocketDriven UMETA(DisplayName = "Rotating Socket Forward Beam"),
+	MSA UMETA(DisplayName = "MSA (Mechanically Scanned Array)"),
 	PESA UMETA(DisplayName = "PESA Electronic Steering"),
 	AESA UMETA(DisplayName = "AESA Electronic Steering")
+};
+
+/** Captured detection footprint; diagnostics use exactly the same geometry as the sensor. */
+USTRUCT()
+struct WEAPONSYSTEMS_API FRadarBeamSample
+{
+	GENERATED_BODY()
+
+	UPROPERTY() FVector Origin = FVector::ZeroVector;
+	UPROPERTY() FRotator PlateRotation = FRotator::ZeroRotator;
+	UPROPERTY() FVector2D Angles = FVector2D::ZeroVector;
+	UPROPERTY() FVector2D HalfWidths = FVector2D(3.0f, 5.0f);
+	UPROPERTY() FVector2D SweepHalfWidths = FVector2D::ZeroVector;
+
+	FVector2D GetTargetAngles(const FVector& Position) const;
+	bool Contains(const FVector& Position) const;
+	float GetGain(const FVector& Position) const;
 };
 
 UENUM(BlueprintType)
@@ -41,7 +56,7 @@ enum class ERadarCommandType : uint8
 	SetMode, SetRange, SetACMMode, LockTrack, BugTrack, BreakLock, ClearBug,
 	DesignateCursor, SetCursor, SetCursorInput, SetScanVolume, OffsetScanCenter,
 	DesignateSpotlight, ClearSpotlight, HelmetCue, ApplyScanPreset, DesignateLinkedTrack,
-	SetDisplayWindow, SetDisplayGeometry, SetDisplayHeadingUp
+	SetDisplayGeometry, SetDisplayHeadingUp
 };
 
 UENUM(BlueprintType)
@@ -57,7 +72,7 @@ enum class ERadarTrackSource : uint8
 };
 
 /**
- * Radar operating mode determining scan behavior and track management
+ * Radar operating mode determining antenna scanning, beam steering, and track maintenance behavior.
  */
 UENUM(BlueprintType)
 enum class ERadarOperatingMode : uint8
@@ -74,7 +89,7 @@ enum class ERadarOperatingMode : uint8
 };
 
 /**
- * ACM sub-mode for close-range automatic acquisition
+ * ACM sub-mode for close-range automatic target acquisition in visual combat.
  */
 UENUM(BlueprintType)
 enum class ERadarACMSubMode : uint8
@@ -86,7 +101,7 @@ enum class ERadarACMSubMode : uint8
 };
 
 /**
- * Status of a radar track file
+ * Lifecycle status of an individual radar track file.
  */
 UENUM(BlueprintType)
 enum class ERadarTrackStatus : uint8
@@ -100,7 +115,7 @@ enum class ERadarTrackStatus : uint8
 };
 
 /**
- * IFF classification result
+ * IFF identification result.
  */
 UENUM(BlueprintType)
 enum class ERadarIFFResult : uint8
@@ -111,9 +126,8 @@ enum class ERadarIFFResult : uint8
 	Neutral UMETA(DisplayName = "Neutral")
 };
 
-
 /**
- * Preset radar scan azimuth widths
+ * Standardized azimuth scan volume presets.
  */
 UENUM(BlueprintType)
 enum class ERadarScanSize : uint8
@@ -126,122 +140,126 @@ enum class ERadarScanSize : uint8
 };
 
 /**
- * Individual radar track file representing a detected and/or tracked contact
+ * Individual radar track file representing a detected and/or tracked contact.
  */
 USTRUCT(BlueprintType)
 struct WEAPONSYSTEMS_API FRadarTrack
 {
 	GENERATED_BODY()
 
-	/** Unique track file number assigned by the radar */
+	/** Unique track file identifier assigned by this radar platform. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	int32 TrackID = 0;
 
-	/** Stable identity assigned by this receiver; several source tracks may share it. */
+	/** Correlated target contact identity; local and remote donor tracks sharing the same actor match this ContactID. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	int32 ContactID = 0;
 
-	/** Underlying actor being tracked (may be null for unresolved contacts) */
+	/** Underlying actor being tracked (may be null for unresolved or remote contacts). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	TWeakObjectPtr<AActor> TrackedActor;
 
-	/** Current status of this track */
+	/** Current tracking and lock status of this track file. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	ERadarTrackStatus Status = ERadarTrackStatus::Search;
 
-	/** IFF classification */
+	/** Identification Friend or Foe (IFF) classification status. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	ERadarIFFResult IFFResult = ERadarIFFResult::Unknown;
 
-	/** Local is assigned only to measurements made by this radar. */
+	/** Origin source of this track (Local radar measurement vs external Data Link network participant). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	ERadarTrackSource Source = ERadarTrackSource::Local;
 
+	/** Data Link participant network ID of the donor radar node (0 if local). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	int32 SourceParticipantID = 0;
+
+	/** Track file identifier on the original donor radar (0 if local). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	int32 SourceTrackID = 0;
 
+	/** True if this track has a confirmed server actor association. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bHasActorAssociation = false;
 
-	/** Last measured world position */
+	/** Last measured world position of the target. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	FVector LastKnownPosition = FVector::ZeroVector;
 
-	/** Smoothed velocity estimate */
+	/** Kalman-smoothed estimated velocity vector in cm/s. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	FVector EstimatedVelocity = FVector::ZeroVector;
 
-	/** Radial closure velocity toward the radar in cm/s (positive = closing) */
+	/** Radial closure velocity toward the radar in cm/s (positive = closing, negative = opening). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float ClosureRate = 0.0f;
 
-	/** Azimuth bearing from aircraft nose in degrees (-180 to 180) */
+	/** Azimuth bearing relative to radar plate forward in degrees (-180° to +180°). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float Bearing = 0.0f;
 
-	/** Elevation angle from aircraft horizon in degrees */
+	/** Elevation angle relative to radar plate axes in degrees (-90° to +90°). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float Elevation = 0.0f;
 
-	/** Slant range in cm */
+	/** Slant range to contact in Unreal centimeters (cm). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float Range = 0.0f;
 
-	/** Normalized signal strength / quality (0.0 = barely detectable, 1.0 = strong return) */
+	/** Normalized signal return strength / SNR quality (0.0 = sensitivity floor, 1.0 = saturation). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float SignalStrength = 0.0f;
 
-	/** Time in seconds since the last valid radar return for this track */
+	/** Time in seconds elapsed since the last fresh radar measurement was integrated. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float TrackAge = 0.0f;
 
-	/** Target altitude above sea level in cm */
+	/** Target altitude Above Sea Level (ASL) in centimeters. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float AltitudeASL = 0.0f;
 
-	/** Estimated target heading in degrees (0-360) */
+	/** Estimated target compass heading in degrees (0° to 360°). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float TargetHeading = 0.0f;
 
-	/** True if target is in the Doppler notch (perpendicular crossing) */
+	/** True if target is currently flying inside the Doppler notch filter (perpendicular crossing). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsNotching = false;
 
-	/** True if ECM jamming is detected from this contact */
+	/** True if active electronic countermeasures / ECM jamming are detected from this contact. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsJamming = false;
 
-	/** True if this track is the STT beam target or TWS bugged priority */
+	/** True if this track is the dedicated STT beam target or bugged priority contact. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsBeamTarget = false;
 
-	/** True if this track is currently bugged (PDT priority in TWS) */
+	/** True if this track is currently designated as the primary bugged track in TWS mode. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsBugged = false;
 
-	/** Detected or assigned Radar Cross Section in m² */
+	/** Target Radar Cross Section (RCS) in square meters (m²). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float RCS = 0.0f;
 
-	/** Aspect-modified effective Radar Cross Section in m² */
+	/** Aspect-modified effective Radar Cross Section in square meters (m²). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	float EffectiveRCS = 0.0f;
 
-	/** True if target provided an explicit 'RCS=X' tag; false if using the unnatural fallback */
+	/** True if target provided an explicit 'RCS=X' tag; false if using default fallback. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bHasRCSTag = false;
 
-	/** Operational domain of this target (Air, Ground, Sea) determined by tag classification */
+	/** Operational vehicle domain classification (Air, Ground, Sea, Missile). */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	ERadarTargetDomain TargetDomain = ERadarTargetDomain::Air;
 
-	/** True if this track was detected as a surface/ground/naval contact */
+	/** True if this track was detected as a surface/ground/naval contact. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsGroundTarget = false;
 
-	/** True if surface contact is a moving ground vehicle above the GMTI velocity threshold */
+	/** True if surface contact is a moving ground vehicle exceeding the GMTI velocity threshold. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Track")
 	bool bIsGMTIMoving = false;
 };
@@ -252,23 +270,23 @@ enum class ERadarMissileGuidanceSource : uint8
 	Inertial, DataLink, Illumination, OnboardSeeker, Unguided
 };
 
-/** One launched radar missile; transient estimates are refreshed when queried or sent to crew. */
+/**
+ * Status snapshot of an in-flight radar guided missile associated with this radar.
+ */
 USTRUCT(BlueprintType)
 struct WEAPONSYSTEMS_API FRadarLaunchedMissileStatus
 {
 	GENERATED_BODY()
+
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") int32 MissileID = 0;
-	/** May be null on a client if the missile actor is not network relevant. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<URadarMissileGuidanceComponent> MissileComponent = nullptr;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<AActor> MissileActor = nullptr;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<UAircraftRadarComponent> LaunchRadar = nullptr;
-	/** Active external provider, or the last one after onboard takeover; otherwise launch radar. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<UAircraftRadarComponent> RelevantRadar = nullptr;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<UAircraftRadarComponent> CurrentExternalRadar = nullptr;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") TObjectPtr<UAircraftRadarComponent> LastExternalRadar = nullptr;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") int32 LaunchTrackID = -1;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") int32 ContactID = 0;
-	/** Reporter identity stays available if the reporter component is not network relevant. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") int32 SourceParticipantID = 0;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") int32 SourceTrackID = -1;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") bool bMadDog = false;
@@ -276,9 +294,7 @@ struct WEAPONSYSTEMS_API FRadarLaunchedMissileStatus
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") ERadarMissileGuidanceSource GuidanceSource = ERadarMissileGuidanceSource::Inertial;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") bool bOnboardSeekerActive = false;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") float FlightTimeSeconds = 0.0f;
-	/** -1: no two-phase seeker or no usable estimate; 0: active after a two-phase transition. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") float TimeToActiveSeconds = -1.0f;
-	/** -1 when target state or positive closure is unavailable. An estimate, never a hit promise. */
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") float EstimatedTimeToImpactSeconds = -1.0f;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") float EstimatedTargetRangeCm = -1.0f;
 	UPROPERTY(BlueprintReadOnly, Category = "Radar|Launched Missiles") float ClosingSpeedCmPerSecond = 0.0f;
@@ -291,11 +307,11 @@ enum class ERadarOperatorEventType : uint8
 	LockAcquired, LockLost, CursorDesignated, SARReady
 };
 
-/** Recent discrete events retained across coalesced operator snapshots. */
 USTRUCT()
 struct FRadarOperatorEvent
 {
 	GENERATED_BODY()
+
 	UPROPERTY() int32 Sequence = 0;
 	UPROPERTY() ERadarOperatorEventType Type = ERadarOperatorEventType::LockLost;
 	UPROPERTY() int32 TrackID = -1;
@@ -325,19 +341,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnRadarDisplayStateUpdatedSignature
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FOnRadarCommandResultSignature, int32, RequestID, ERadarCommandType, Command, bool, bSuccess, int32, TrackID);
 
 /**
- * Aircraft Radar Component
- *
- * Full-fidelity airborne radar simulation supporting multiple operating modes
- * (RWS, TWS, STT, ACM, GM, SS), realistic antenna sweep simulation,
- * Doppler notch filtering, track file management, and configurable scan volumes.
- *
- * Designed for integration with fighter aircraft (AN/APG-68, APG-73, APG-77, APG-83),
- * AEW platforms, and ground-based air defense radars.
- *
- * Split implementation across multiple .cpp files:
- * - AircraftRadarComponent.cpp: Core logic, mode management, replication, helpers
- * - AircraftRadarComponent_Scan.cpp: Antenna sweep simulation, detection model
- * - AircraftRadarComponent_Tracking.cpp: Track file management, STT/TWS lock logic
+ * Universal airborne combat and surveillance radar simulation.
+ * Simulates pulse-Doppler search (RWS), track-while-scan (TWS), single-target track (STT),
+ * air combat maneuvering (ACM), surface mapping (GM/SS), and spotlight SAR dwell imaging.
  */
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class WEAPONSYSTEMS_API UAircraftRadarComponent : public UActorComponent, public IGenericTeamAgentInterface
@@ -347,389 +353,1154 @@ class WEAPONSYSTEMS_API UAircraftRadarComponent : public UActorComponent, public
 #if WITH_DEV_AUTOMATION_TESTS
 	friend class FRadarDisplaySelectionTest;
 	friend class FAircraftDataLinkRoutingTest;
+	friend class FRadarScanDriveModesTest;
 #endif
 
 public:
 	UAircraftRadarComponent();
 
-	/** Server-controlled radio configuration. An unassigned network never shares traffic. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Data Link")
-	FName DataLinkNetworkID = NAME_None;
+	// ========================================================================
+	// 1. Radar Configuration
+	// ========================================================================
+
+	/** Current radar operating mode (Off, Standby, Search, TWS, STT, ACM, GM, SS, SAR). Replicated to clients. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_RadarMode, Category = "Radar|Configuration")
+	ERadarOperatingMode RadarMode = ERadarOperatingMode::Search;
+
+	/** Common origin and plate axes for every drive/mode; empty or missing sockets use the owner root transform. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Configuration", meta = (DisplayName = "Radar Socket"))
+	FName RadarSocketName = NAME_None;
+
+	/** Stable cockpit display/cursor axes only; never drives detection. None uses the owner root. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Display & Cursor")
+	FName RadarDisplayReferenceComponentName = NAME_None;
+
+	/** Local translation offset applied to antenna origin for elevating turrets or adjusting mast sensors. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Configuration")
+	FVector RadarLocationOffset = FVector::ZeroVector;
+
+	/** If true, treats the platform as an omnidirectional or dome radar, bypassing antenna azimuth gimbal limits. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Configuration")
+	bool bOmnidirectionalTracking = false;
+
+	// ========================================================================
+	// 2. Scan Volume & Antenna Mechanics
+	// ========================================================================
+
+	/** Antenna drive mechanism; all drives scan relative to the radar socket transform. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
+	ERadarScanDrive ScanDrive = ERadarScanDrive::MSA;
+
+	/** MSA: add virtual steering relative to the socket. Disable when AnimBP steers the plate; commands still advance. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (EditCondition = "ScanDrive == ERadarScanDrive::MSA", EditConditionHides))
+	bool bVirtuallySweepBeam = true;
+
+	/** Standardized azimuth scan volume preset. Locked to custom when manually setting width. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
+	ERadarScanSize ScanSizePreset = ERadarScanSize::Full_120;
+
+	/** Total horizontal azimuth scan width in degrees (e.g. 120° for nose radar, 360° for AEW). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Scan Volume", meta = (ClampMin = "5.0", ClampMax = "360.0", EditCondition = "ScanSizePreset == ERadarScanSize::Custom"))
+	float AzimuthScanWidth = 120.0f;
+
+	/** Total vertical elevation scan height in degrees across all elevation bars. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "2.0", ClampMax = "120.0"))
+	float ElevationScanHeight = 20.0f;
+
+	/** Number of horizontal elevation scan bars (1, 2, 4, 6, 8). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "1", ClampMax = "8"))
+	int32 ElevationBars = 4;
+
+	/** Scan center azimuth offset in degrees from socket boresight. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
+	float ScanCenterAzimuth = 0.0f;
+
+	/** Scan center elevation offset in degrees from socket boresight. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
+	float ScanCenterElevation = 0.0f;
+
+	/** Maximum physical antenna gimbal limit in azimuth (degrees from antenna boresight, e.g. ±60°). Governs STT bounds. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "10.0", ClampMax = "180.0"))
+	float MaxAntennaGimbalAzimuth = 60.0f;
+
+	/** Maximum physical antenna gimbal limit in elevation (degrees from antenna boresight, e.g. ±60°). Governs STT bounds. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "10.0", ClampMax = "90.0"))
+	float MaxAntennaGimbalElevation = 60.0f;
+
+	// ========================================================================
+	// 3. Performance & Ticking
+	// ========================================================================
+
+	/** Antenna sweep rate in degrees per second for mechanical scan drives. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.1", UIMin = "1.0", UIMax = "360.0", EditCondition = "ScanDrive == ERadarScanDrive::MSA"))
+	float ScanRateDegreesPerSecond = 70.0f;
+
+	/** Spatial sampling interval in seconds between beam detection sweeps. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "0.016", ClampMax = "1.0"))
+	float ScanSampleInterval = 0.1f;
+
+	/** Interval in seconds between track file aging, Kalman velocity smoothing, and timeout pruning passes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.05", UIMin = "0.1", UIMax = "2.0"))
+	float TrackUpdateInterval = 0.5f;
+
+	/** Number of concurrent beams steered per sample in AESA mode. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "1", ClampMax = "32", EditCondition = "ScanDrive == ERadarScanDrive::AESA"))
+	int32 AESABeamsPerSample = 4;
+
+	/** If true, conducts periodic spatial overlap queries to discover actors not pre-registered with the combat subsystem. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
+	bool bEnablePhysicsCandidateDiscovery = true;
+
+	/** Interval in seconds between spatial overlap candidate discovery passes. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "0.05", ClampMax = "5.0", EditCondition = "bEnablePhysicsCandidateDiscovery"))
+	float CandidateDiscoveryInterval = 0.5f;
+
+	/** Platform displacement threshold in cm triggering immediate candidate re-discovery. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Performance", meta = (ClampMin = "1000.0", EditCondition = "bEnablePhysicsCandidateDiscovery"))
+	float DiscoveryDisplacementThresholdCm = 50000.0f;
+
+	/** Range delta threshold in cm triggering candidate re-discovery. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Performance", meta = (ClampMin = "10.0", EditCondition = "bEnablePhysicsCandidateDiscovery"))
+	float DiscoveryRangeDeltaThresholdCm = 100.0f;
+
+	/** Additional radial buffer in cm added to detection range for candidate discovery sweeps. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Performance", meta = (ClampMin = "1000.0", EditCondition = "bEnablePhysicsCandidateDiscovery"))
+	float CandidateDiscoveryExpandedRadiusCm = 100000.0f;
+
+	/** Maximum candidate actors evaluated per beam sample to avoid frame spikes. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "16", ClampMax = "4096"))
+	int32 MaxCandidatesPerSample = 512;
+
+	/** If true, candidate discovery queries all dynamic object types (Pawn, WorldDynamic, PhysicsBody, Vehicle). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (EditCondition = "bEnablePhysicsCandidateDiscovery"))
+	bool bQueryAllDynamicObjects = true;
+
+	/** Collision channel used for candidate overlap discovery when bQueryAllDynamicObjects is false. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (EditCondition = "bEnablePhysicsCandidateDiscovery && !bQueryAllDynamicObjects"))
+	TEnumAsByte<ECollisionChannel> DetectionChannel = ECC_Pawn;
+
+	/** Receiver dynamic range in dB above thermal sensitivity threshold for SignalStrength normalization. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "10.0", ClampMax = "80.0", UIMin = "20.0", UIMax = "60.0"))
+	float ReceiverDynamicRangeDB = 40.0f;
+
+	/** Minimum radial closure speed in cm/s below which ground clutter notch filtering rejects targets. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "10000.0"))
+	float NotchFilterVelocity = 3000.0f;
+
+	/** If true, STT mode retains angle-tracking lock when target enters the Doppler notch even if range degrades. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
+	bool bSTTAngleTrackThroughNotch = true;
+
+	// ========================================================================
+	// 4. Detection & Radar Equation (RCS)
+	// ========================================================================
+
+	/** Maximum instrumented radar detection range in cm (e.g. 15,000,000 cm = 150 km). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "100000.0"))
+	float MaxDetectionRange = 15000000.0f;
+
+	/** Minimum detection range in cm (clutter blind zone around antenna). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "0.0"))
+	float MinDetectionRange = 50000.0f;
+
+	/** Currently selected display range scale in cm. Replicated to clients. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_CurrentDisplayRange, Category = "Radar|Detection & RCS", meta = (ClampMin = "1000.0"))
+	float CurrentDisplayRange = 7400000.0f;
+
+	/** Selectable range scale presets in cm for MFD range stepping (e.g. 20nm, 40nm, 80nm, 160nm). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	TArray<float> RangeScalePresets;
+
+	/** Minimum target Radar Cross Section in m² detectable at MaxDetectionRange. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "0.001"))
+	float MinimumDetectableRCS = 1.0f;
+
+	/** Baseline RCS in m² assigned to target actors lacking an explicit 'RCS=X' tag. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "0.0001"))
+	float DefaultTargetRCS = 99.99f;
+
+	/** If true, parses 'RCS=X' tags from candidate actors and components. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	bool bEnableTargetRCSTagParsing = true;
+
+	/** If true, modifies effective target RCS based on relative aspect angle (beam broadside vs nose-on). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	bool bEnableAspectAngleRCS = true;
+
+	/** Multiplier applied to target RCS when presenting a beam/broadside aspect to the radar. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "1.0", ClampMax = "20.0", EditCondition = "bEnableAspectAngleRCS"))
+	float RCSAspectBeamMultiplier = 3.5f;
+
+	/** Multiplier applied to target RCS when presenting a tail aspect (engine cavity reflections). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "1.0", ClampMax = "10.0", EditCondition = "bEnableAspectAngleRCS"))
+	float RCSAspectTailMultiplier = 1.8f;
+
+	/** If true, evaluates terrain line-of-sight ray traces against static geometry for look-down masking. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	bool bEnableTerrainMasking = true;
+
+	/** If true, candidate tag checks inspect child component tags if root actor tags do not match. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	bool bSearchComponentTags = true;
+
+	/** Horizontal radar antenna beam half-power width in degrees. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "1.0", ClampMax = "45.0"))
+	float BeamAzimuthWidth = 6.0f;
+
+	/** Vertical radar antenna beam half-power width in degrees. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS", meta = (ClampMin = "1.0", ClampMax = "45.0"))
+	float BeamElevationWidth = 10.0f;
+
+	/** Actor tags required for radar detection. If empty, all valid pawns/vehicles within envelope are candidates. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Detection & RCS")
+	TArray<FName> DetectableActorTags;
+
+	// ========================================================================
+	// 5. Track Management
+	// ========================================================================
+
+	/** Maximum total track files maintained simultaneously by the radar computer. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Track Management", meta = (ClampMin = "1", ClampMax = "256"))
+	int32 MaxTrackFiles = 64;
+
+	/** Maximum simultaneous TWS track files tracked with priority velocity extrapolation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "1", ClampMax = "50"))
+	int32 MaxSimultaneousTWSTracks = 10;
+
+	/** Baseline duration in seconds without fresh radar returns before a track file is dropped. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "1.0"))
+	float TrackDropTimeout = 8.0f;
+
+	/** Multiplier applied to full antenna revisit frame time to ensure tracks do not drop mid-sweep. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Track Management", meta = (ClampMin = "1.0", ClampMax = "3.0"))
+	float TrackDropMarginMultiplier = 1.5f;
+
+	/** Maximum duration in seconds for dead-reckoning extrapolation when contact is temporarily obstructed. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Track Management", meta = (ClampMin = "0.5", ClampMax = "10.0"))
+	float MaxDeadReckoningSeconds = 2.0f;
+
+	/** Exponential smoothing weight for track velocity estimation (0.0 = frozen, 1.0 = raw measurement). */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Track Management", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float VelocitySmoothingAlpha = 0.35f;
+
+	// ========================================================================
+	// 6. Air Combat Maneuver (ACM) Dogfight Modes
+	// ========================================================================
+
+	/** Active ACM acquisition sub-mode (Boresight cone, Vertical Scan swath, HMD Helmet Cue, Slew Acquisition). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Air Combat Maneuver")
+	ERadarACMSubMode ACMSubMode = ERadarACMSubMode::Boresight;
+
+	/** Maximum slant range in cm within which the radar automatically locks contacts in ACM modes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Air Combat Maneuver", meta = (ClampMin = "100000.0"))
+	float ACMAutoLockRange = 1800000.0f;
+
+	/** Half-angle in degrees of the ACM Boresight acquisition cone. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Air Combat Maneuver", meta = (ClampMin = "2.0", ClampMax = "45.0"))
+	float ACMBoresightConeAngle = 10.0f;
+
+	/** Total azimuth width in degrees of the ACM Vertical Scan swath (centered on canopy centerline). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Air Combat Maneuver", meta = (ClampMin = "2.0", ClampMax = "30.0"))
+	float ACMVerticalScanAzimuthWidth = 10.0f;
+
+	/** Lower elevation boundary in degrees for ACM Vertical Scan (below waterline). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Air Combat Maneuver", meta = (ClampMin = "-30.0", ClampMax = "10.0"))
+	float ACMVerticalScanMinElevation = -10.0f;
+
+	/** Upper elevation boundary in degrees for ACM Vertical Scan (high canopy lift vector). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Air Combat Maneuver", meta = (ClampMin = "15.0", ClampMax = "85.0"))
+	float ACMVerticalScanMaxElevation = 60.0f;
+
+	// ========================================================================
+	// 7. Synthetic Aperture Radar (SAR) & Spotlight
+	// ========================================================================
+
+	/** Radius in cm of the high-resolution SAR Spotlight ground patch (e.g. 200,000 cm = 2 km). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "10000.0", ClampMax = "1000000.0"))
+	float SpotlightPatchRadius = 200000.0f;
+
+	/** Dwell integration duration in seconds required to synthesize full cross-range SAR image resolution. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "0.5", ClampMax = "10.0"))
+	float SpotlightDwellDuration = 2.5f;
+
+	/** Minimum squint angle in degrees relative to flight path below which Doppler gradient collapses into blind cone. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "2.0", ClampMax = "30.0"))
+	float SpotlightMinSquintAngle = 10.0f;
+
+	/** Maximum squint angle in degrees for Spotlight SAR image synthesis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "30.0", ClampMax = "85.0"))
+	float SpotlightMaxSquintAngle = 75.0f;
+
+	/** If true, automatically traces forward along antenna waterline to establish terrain patch if none designated. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR")
+	bool bSpotlightAutoGroundIntersect = true;
+
+	/** Default slant range in cm for ground patch projection if line trace misses terrain. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "100000.0", EditCondition = "bSpotlightAutoGroundIntersect"))
+	float SpotlightDefaultSlantRange = 2500000.0f;
+
+	/** Downward pitch angle in degrees from radar centerline for auto-intersect line trace. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "-45.0", ClampMax = "0.0", EditCondition = "bSpotlightAutoGroundIntersect"))
+	float SpotlightDefaultPitchAngle = -12.0f;
+
+	/** Ground velocity threshold in cm/s to classify a surface contact as moving (GMTI) vs stationary clutter. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "10.0"))
+	float GMTIVelocityThreshold = 150.0f;
+
+	// ========================================================================
+	// 8. Target Domain Classification
+	// ========================================================================
+
+	/** Allowed target vehicle domains in Air-to-Air modes (Search, TWS, ACM, STT). Defaults to [Air]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
+	TArray<ERadarTargetDomain> AirModeAllowedDomains = { ERadarTargetDomain::Air };
+
+	/** Allowed target vehicle domains in Ground Mapping (GM) mode. Defaults to [Ground]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
+	TArray<ERadarTargetDomain> GroundMappingAllowedDomains = { ERadarTargetDomain::Ground };
+
+	/** Allowed target vehicle domains in Sea Search (SS) mode. Defaults to [Sea]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
+	TArray<ERadarTargetDomain> SeaSearchAllowedDomains = { ERadarTargetDomain::Sea };
+
+	/** Allowed target vehicle domains in Spotlight SAR mode. Defaults to [Ground, Sea]. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
+	TArray<ERadarTargetDomain> SpotlightAllowedDomains = { ERadarTargetDomain::Ground, ERadarTargetDomain::Sea };
+
+	// ========================================================================
+	// 9. Identification Friend or Foe (IFF)
+	// ========================================================================
+
+	/** If true, interrogates contacts using IGenericTeamAgentInterface and transponders to classify IFF. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|IFF")
+	bool bEnableIFF = true;
+
+	/** Attitude assigned when an interrogated contact has no transponder or team interface. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|IFF", meta = (EditCondition = "bEnableIFF"))
+	EIFFUnknownAttitude UnknownContactAttitude = EIFFUnknownAttitude::Neutral;
+
+	/** Replicated faction/team identifier for this radar platform (0-254 = Factions, 255 = Neutral). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_TeamID, Category = "Radar|IFF")
+	uint8 TeamID = 1;
+
+	/** Replicated Mode 3/A transponder squawk code. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_SquawkCode, Category = "Radar|IFF", meta = (ClampMin = "0", ClampMax = "7777"))
+	int32 SquawkCode = 1200;
+
+	// ========================================================================
+	// 10. Radar Altimeter (RALT / AGL) Subsystem
+	// ========================================================================
+
+	/** If true, operates a high-fidelity radar altimeter measuring height Above Ground Level (AGL) independently of nose EMCON. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter")
+	bool bEnableRadarAltimeter = true;
+
+	/** Socket name on aircraft mesh representing the downward-looking radar altimeter antenna. None falls back to root. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter"))
+	FName RadarAltimeterSocketName = NAME_None;
+
+	/** Maximum operational altitude in cm above which the radar altimeter indicates out-of-limits (e.g. 152,400 cm = 5,000 ft). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", ClampMin = "1000.0"))
+	float MaxRadarAltitude = 152400.0f;
+
+	/** Maximum pitch or bank attitude angle in degrees before altimeter beam breaks ground reflection lock. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", ClampMin = "10.0", ClampMax = "89.0"))
+	float MaxAltimeterAttitudeAngle = 50.0f;
+
+	/** If true, executes multi-ray conical sampling to determine true first-return obstacle clearance; false uses single vertical nadir. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter"))
+	bool bAltimeterConicalSampling = true;
+
+	/** Full conical beamwidth in degrees for first-return terrain proximity evaluation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter && bAltimeterConicalSampling", ClampMin = "10.0", ClampMax = "90.0"))
+	float AltimeterBeamwidthDegrees = 45.0f;
+
+	/** Smoothing speed for altimeter height filter (higher = more responsive, lower = smoother). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", ClampMin = "1.0", ClampMax = "50.0"))
+	float AltimeterSmoothingSpeed = 15.0f;
+
+	/** Interval in seconds between altimeter ground trace updates (default ~30 Hz). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", ClampMin = "0.01", UIMin = "0.01", UIMax = "0.2"))
+	float AltimeterUpdateInterval = 0.033f;
+
+	// ========================================================================
+	// 11. Tactical Data Link Network
+	// ========================================================================
+
+	/** Enables participation in tactical data link networks for track sharing and cooperative engagement. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
 	bool bEnableDataLink = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	bool bContributeDataLinkTracks = true;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	bool bReceiveDataLinkTracks = true;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	bool bRelayDataLinkReports = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	bool bAllowRemoteWeaponSupport = false;
-	/** Correlate only reports with the same server-verified actor association. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link|Track Correlation")
-	bool bEnableTrackCorrelation = true;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link|Track Correlation", meta = (ClampMin = "0.1"))
-	float LocalCorrelationFreshnessSeconds = 1.5f;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	bool bRestrictDataLinkToFriendly = false;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (ClampMin = "1000.0"))
-	float DataLinkRangeCm = 20000000.0f;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (ClampMin = "0.1"))
-	float DataLinkDesyncSeconds = 3.0f;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (ClampMin = "0.1"))
-	float DataLinkTrackExpirySeconds = 5.0f;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (ClampMin = "1"))
-	int32 MaxLinkedDataLinkTracks = 128;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link")
-	EDataLinkPlatformType DataLinkPlatformType = EDataLinkPlatformType::Unknown;
 
+	/** Radio network identifier. Only nodes with matching network IDs can communicate. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	FName DataLinkNetworkID = NAME_None;
+
+	/** Platform classification broadcast to network participants (Fighter, AWACS, Surface, Ground). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	EDataLinkPlatformType DataLinkPlatformType = EDataLinkPlatformType::Fighter;
+
+	/** If true, transmits local radar tracks across the tactical data link network. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bContributeDataLinkTracks = true;
+
+	/** If true, receives and displays external tracks donated by network participants. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bReceiveDataLinkTracks = true;
+
+	/** If true, acts as a tactical message relay, forwarding packets to nodes out of direct transmitter range. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bRelayDataLinkReports = false;
+
+	/** Allows guided radar missiles to be launched against remote tracks donated via data link without local radar lock. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bAllowRemoteWeaponSupport = false;
+
+	/** Restricts data link communication strictly to verified friendly units (rejects neutral or unknown transponders). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bRestrictDataLinkToFriendly = false;
+
+	/** Maximum line-of-sight radio transmission and reception range in centimeters (e.g. 20,000,000 cm = 200 km). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink", ClampMin = "1000.0"))
+	float DataLinkRangeCm = 20000000.0f;
+
+	/** Duration in seconds without receiving network heartbeats before declaring data link connection lost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink", ClampMin = "0.1"))
+	float DataLinkDesyncSeconds = 3.0f;
+
+	/** Duration in seconds before an unrefreshed remote data link track expires and is pruned. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink", ClampMin = "0.1"))
+	float DataLinkTrackExpirySeconds = 5.0f;
+
+	/** Maximum number of external data link tracks stored in memory simultaneously. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink", ClampMin = "1", ClampMax = "512"))
+	int32 MaxLinkedDataLinkTracks = 128;
+
+	/** Maximum number of contact ID mappings retained in local table before garbage collection. */
+	UPROPERTY(EditDefaultsOnly, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink", ClampMin = "64", ClampMax = "1024"))
+	int32 MaxTrackedContactIDs = 256;
+
+	/** If true, correlates local radar returns and remote data link tracks of the same target into a single ContactID. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink"))
+	bool bEnableTrackCorrelation = true;
+
+	/** Maximum age in seconds for a local track return to maintain primary authority over a shared ContactID. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Data Link", meta = (EditCondition = "bEnableDataLink && bEnableTrackCorrelation", ClampMin = "0.1"))
+	float LocalCorrelationFreshnessSeconds = 1.5f;
+
+	// ========================================================================
+	// 12. Cockpit Display Projection & Target Cursor (TDC)
+	// ========================================================================
+
+	/** Master switch enabling target designator cursor (TDC) input, slew, and display symbology. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Display & Cursor")
+	bool bEnableTargetCursor = true;
+
+	/** Rescales the cursor's physical range when the display range changes to preserve its
+	 *  position on both B-scope and PPI. Azimuth and elevation stay fixed; cursor limits still apply. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Display & Cursor", meta = (EditCondition = "bEnableTargetCursor"))
+	bool bPreserveCursorDisplayPositionOnRangeChange = false;
+
+	/** B-scope horizontal cursor slew speed in degrees per second at standard display zoom. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Display & Cursor", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "120.0", EditCondition = "bEnableTargetCursor"))
+	float CursorAzimuthSpeed = 40.0f;
+
+	/** B-scope vertical cursor slew speed as a fraction of full range scale per second. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Display & Cursor", meta = (ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0", EditCondition = "bEnableTargetCursor"))
+	float CursorRangeSpeedFraction = 0.4f;
+
+	/** PPI top-down cursor slew speed as a fraction of visible display canvas dimensions per second. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Display & Cursor", meta = (ClampMin = "0.05", ClampMax = "2.0", EditCondition = "bEnableTargetCursor"))
+	float CursorDisplaySpeedFraction = 0.4f;
+
+	/** Target acquisition gate radius as a fraction of visible display dimensions for cursor designation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Display & Cursor", meta = (ClampMin = "0.005", ClampMax = "0.08", EditCondition = "bEnableTargetCursor"))
+	float CursorSelectionRadiusFraction = 0.04f;
+
+	/** Shared operator display view configuration (Geometry and Heading-Up orientation). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Display & Cursor")
+	FRadarDisplayView DisplayView;
+
+	// ========================================================================
+	// 13. Multiplayer & Multi-Crew Networking
+	// ========================================================================
+
+	/** Cadence in seconds at which authoritative radar snapshots and launched missile tracks are replicated to crew links. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Multiplayer", meta = (ClampMin = "0.05", UIMin = "0.05"))
+	float OperatorSnapshotIntervalSeconds = 0.2f;
+
+	// ========================================================================
+	// 14. Debug & Diagnostics Visualization
+	// ========================================================================
+
+	/** Master switch enabling 3D debug visualizations in the world and telemetry logging. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug")
+	bool bEnableDebugTraces = false;
+
+	/** If true, 3D debug lines and wireframes render only when the owning pawn is locally controlled. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDebugOnlyPlayerControlled = false;
+
+	/** Renders the 3D antenna scan frustum and elevation bar lines. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDrawScanVolume = true;
+
+	/** Renders actual sampled beam footprints/directions and terrain-query hit rays, including every AESA visit. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDrawAntennaBeam = true;
+
+	/** Renders 3D track diamonds, STT reticles, and velocity vectors. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDrawTrackSymbology = true;
+
+	/** Renders on-screen live diagnostics telemetry HUD. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bEnableDiagnosticHUD = true;
+
+	/** Renders 3D cursor position in space. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces && bEnableTargetCursor"))
+	bool bDebugCursor = true;
+
+	/** Logs candidate rejection reasons to log. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDebugCandidateRejections = false;
+
+	/** Visualizes candidate discovery overlap batches and candidate counts. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces && bEnablePhysicsCandidateDiscovery"))
+	bool bDebugPhysicsDiscovery = false;
+
+	/** Visualizes the live plate axes and the independent cockpit display axes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces"))
+	bool bDebugReferenceAxes = false;
+
+	// ========================================================================
+	// Events & Delegates
+	// ========================================================================
+
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarContactNewSignature OnRadarContactNew;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarContactUpdatedSignature OnRadarContactUpdated;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarContactLostSignature OnRadarContactLost;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarAllContactsClearedSignature OnRadarAllContactsCleared;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarLockAcquiredSignature OnRadarLockAcquired;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarLockLostByIDSignature OnRadarLockLost;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarModeChangedSignature OnRadarModeChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnScanSweepCompleteSignature OnScanSweepComplete;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarTargetNotchingSignature OnRadarTargetNotching;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarTrackSelectedSignature OnRadarTrackSelected;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarTrackDeselectedSignature OnRadarTrackDeselected;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarScanProgressSignature OnScanProgressUpdated;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarCursorMovedSignature OnRadarCursorMoved;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarCursorDesignatedSignature OnRadarCursorDesignated;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarDisplayRangeChangedSignature OnRadarDisplayRangeChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnSARImageReadySignature OnSARImageReady;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarSnapshotReadySignature OnRadarSnapshotReady;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarDisplayStateUpdatedSignature OnRadarDisplayStateUpdated;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnRadarCommandResultSignature OnRadarCommandResult;
+	UPROPERTY(BlueprintAssignable, Category = "Radar|Events") FOnCombatTeamChangedSignature OnTeamChanged;
+
+	// ========================================================================
+	// Unified Control & Designation API
+	// Automatically dispatches authoritative actions on server or submits
+	// operator commands when invoked by client/crew interfaces.
+	// ========================================================================
+
+	/**
+	 * Sets the radar operating mode (Off, Standby, RWS, TWS, STT, ACM, GM, SS, SAR).
+	 * @param NewMode Desired operating mode.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if the mode was changed or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Control", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetRadarMode(ERadarOperatingMode NewMode, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Sets the radar display range scale in centimeters.
+	 * @param NewRangeCm Desired display range scale in cm.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if the display range scale was changed or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Range", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetDisplayRange(float NewRangeCm, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Cycles the display range scale up or down through RangeScalePresets.
+	 * @param bIncrease True to increase range scale, false to decrease.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if the display range scale was cycled.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Range", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool CycleRangeScale(bool bIncrease = true, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Locks a target track file into Single Target Track (STT) mode.
+	 * @param TrackID The unique ID of the track file to lock.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if lock was acquired or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool LockTrack(int32 TrackID, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Locks a specific target actor by resolving its active track file.
+	 * @param TargetActor Actor to lock.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if target actor was locked.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool LockActor(AActor* TargetActor, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Acquires or locks a specific actor immediately.
+	 * If the actor is already tracked, locks or bugs it.
+	 * If not yet tracked, evaluates and creates a track immediately if within envelope.
+	 * @param TargetActor Target actor to acquire.
+	 * @param bForceSTT If true, acquires directly into STT mode; otherwise bugs in TWS or acquires in Search.
+	 * @return True if target was acquired or locked.
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Lock")
+	bool AcquireOrLockActor(AActor* TargetActor, bool bForceSTT = false);
+
+	/**
+	 * Designates/bugs a Track-While-Scan (TWS) track for priority tracking and weapon cueing.
+	 * @param TrackID Unique ID of the track file to designate.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if track was bugged or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool BugTrack(int32 TrackID, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Breaks the current STT lock and returns to the previous scan mode.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if lock was broken or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool BreakLock(bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Clears the priority bug designation on a TWS track.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if bug was cleared or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool ClearBugTrack(bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Sets the sub-mode for close-range Air Combat Maneuver (ACM) auto-acquisition.
+	 * Automatically switches RadarMode to AirCombatManeuver if not already active.
+	 * @param NewSubMode ACM sub-mode (Boresight, VerticalScan, HelmetCue, SlewAcquisition).
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if sub-mode was changed or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Air Combat Maneuver", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetACMSubMode(ERadarACMSubMode NewSubMode, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Configures custom antenna scan volume dimensions.
+	 * Sets ScanSizePreset to Custom automatically.
+	 * @param Azimuth Total azimuth scan width in degrees (5° to 360°).
+	 * @param Elevation Total elevation scan height in degrees (2° to 120°).
+	 * @param Bars Number of elevation scan bars (1, 2, 4, 6, 8).
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if scan volume was configured or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Scan Volume", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetScanVolume(float Azimuth, float Elevation, int32 Bars, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Applies a standardized scan azimuth preset (Narrow 20°, Medium 40°, Wide 60°, Full 120°).
+	 * @param Preset Predefined scan size preset.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if preset was applied or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Scan Volume", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool ApplyScanSizePreset(ERadarScanSize Preset, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Offsets the scan volume center azimuth and elevation (TDC antenna slew).
+	 * @param AzDelta Azimuth angle offset delta in degrees.
+	 * @param ElDelta Elevation angle offset delta in degrees.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if scan center was offset or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Scan Volume", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool OffsetScanCenter(float AzDelta, float ElDelta, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Designates a ground coordinate in world space for Spotlight Synthetic Aperture Radar (SAR) staring.
+	 * @param WorldLocation Target terrain location in world space coordinates.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if spotlight coordinate was designated or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight SAR", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool DesignateSpotlightPoint(const FVector& WorldLocation, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Designates a specific actor on the ground for Spotlight SAR slaved tracking.
+	 * @param TargetActor Target actor on surface.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if spotlight actor was designated or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight SAR", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool DesignateSpotlightActor(AActor* TargetActor, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Clears the active Spotlight SAR ground target coordinate.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if spotlight target was cleared or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight SAR", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool ClearSpotlightTarget(bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Sets the helmet-mounted display (HMD) or pilot gaze look direction in world space for HelmetCue ACM acquisition.
+	 * @param InWorldDirection Normalized world direction vector.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if helmet direction was set or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Air Combat Maneuver", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetHelmetLookDirection(const FVector& InWorldDirection, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Moves the radar Target Designator Control (TDC) cursor on the active display using 2D axis inputs.
+	 * @param DeltaAxis Movement input vector (X: Azimuth/Horizontal, Y: Range/Vertical).
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if cursor movement was processed or dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Display & Cursor", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool MoveTDCCursor(FVector2D DeltaAxis, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Sets the TDC cursor position directly from a 2D screen/widget coordinate.
+	 * @param DisplayPosition Center-relative widget translation matching ProjectWorldToDisplay.
+	 * @param WidgetSize Dimensions of the display canvas in Slate pixels.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if cursor position was set or dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Display & Cursor", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetTDCCursorFromDisplayPosition(const FVector2D& DisplayPosition, const FVector2D& WidgetSize, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Designates the track or contact currently under the TDC cursor on the active display.
+	 * Automatically uses the active display geometry and configured selection radius without requiring manual pins.
+	 * Bugs an unbugged track, locks a bugged track into STT, or designates a remote data link track.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if a track under the cursor was successfully designated or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Display & Cursor", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool DesignateUnderCursor(bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Sets the projection geometry mode for cockpit radar displays (B-Scope or PPI).
+	 * @param Geometry Display projection geometry.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if display geometry was set or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Display & Cursor", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetDisplayGeometry(ERadarDisplayGeometry Geometry, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Toggles heading-up versus north-up orientation for plan displays.
+	 * @param bHeadingUp True for heading-up aircraft-referenced view; false for north-up stabilized map.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if heading-up orientation was set or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Display & Cursor", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool SetDisplayHeadingUp(bool bHeadingUp, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	/**
+	 * Designates an external track received over Tactical Data Link.
+	 * @param TrackID The negative ID identifying the remote data link track.
+	 * @param bAuthoritative If true, executes directly on server.
+	 * @param Controller Optional requesting player controller for crew validation.
+	 * @return True if data link track was designated or request dispatched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Data Link", meta = (AdvancedDisplay = "bAuthoritative,Controller"))
+	bool DesignateLinkedTrack(int32 TrackID, bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	// ========================================================================
+	// Getters, Queries & Hardware Transform Resolvers
+	// ========================================================================
+
+	/** Returns the current radar operating mode. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Control")
+	FORCEINLINE ERadarOperatingMode GetRadarMode() const { return RadarMode; }
+
+	/** Returns true if the radar is actively emitting RF energy (not Off and not Standby). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Control")
+	bool IsRadarEmitting() const;
+
+	/** Returns the current ACM sub-mode. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Air Combat Maneuver")
+	FORCEINLINE ERadarACMSubMode GetACMSubMode() const { return ACMSubMode; }
+
+	/** Sets the socket name used as the radar antenna origin and boresight axis. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Configuration")
+	void SetRadarSocketName(FName InSocketName);
+
+	/** Returns the socket name used as the radar antenna origin. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Configuration")
+	FORCEINLINE FName GetRadarSocketName() const { return RadarSocketName; }
+
+	/** Returns the world-space location of the radar antenna source. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Source")
+	FVector GetRadarLocation() const;
+
+	/** Returns the world-space rotation/orientation of the radar antenna source. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Source")
+	FRotator GetRadarRotation() const;
+
+	/** Returns both world-space location and rotation of the radar antenna source. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Source")
+	void GetRadarSourceTransform(FVector& OutLocation, FRotator& OutRotation) const;
+
+	/** Returns the stable cockpit frame used only for display/cursor projection. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	void GetRadarDisplayReferenceTransform(FVector& OutLocation, FRotator& OutRotation) const;
+
+	/** Creates a display projection structure configured for MFD screen coordinate conversions. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	FRadarDisplayProjection MakeDisplayProjection(const FVector2D& WidgetTopLeft, const FVector2D& WidgetSize,
+		ERadarDisplayGeometry Geometry = ERadarDisplayGeometry::BScope, bool bHeadingUp = true) const;
+
+	/** Projects a world location into center-anchored MFD canvas coordinates (0, 0 is display center). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	bool ProjectWorldToDisplay(const FVector& WorldLocation, FVector2D WidgetSize, FVector2D& OutWidgetPosition) const;
+
+	/** Returns the current TDC cursor state struct (azimuth, elevation, range, world point). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	FRadarCursorState GetTDCCursorState() const;
+
+	/** Returns true if the target designator cursor subsystem is enabled. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	bool IsTargetCursorEnabled() const { return bEnableTargetCursor; }
+
+	/** Returns the world location of the TDC cursor. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	FVector GetTDCCursorWorldLocation() const;
+
+	/** Returns the world location of the TDC cursor if enabled and valid. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	bool TryGetTDCCursorWorldLocation(FVector& OutWorldLocation) const;
+
+	/** Returns the shared display view settings. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	FRadarDisplayView GetDisplayView() const { return DisplayView; }
+
+	/** Returns the monotonically increasing revision index of the display view. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	int32 GetDisplayViewRevision() const { return DisplayViewRevision; }
+
+	/** Returns commanded azimuth in degrees relative to the plate; animated MSA does not apply this to detection. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FORCEINLINE float GetCurrentScanAzimuth() const { return CurrentScanAzimuth; }
+
+	/** Returns commanded elevation in degrees, including STT/Spotlight steering. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FORCEINLINE float GetCurrentScanElevation() const { return CurrentScanElevation; }
+
+	/** World pointing command for AnimBP; STT/Spotlight commands point at the designated target. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FVector GetCommandedBeamDirection() const;
+
+	/** Returns the current active elevation bar index (0 to ElevationBars - 1). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FORCEINLINE int32 GetCurrentScanBar() const { return CurrentScanBar; }
+
+	/** Returns true if the mechanical antenna sweep is traveling left-to-right. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FORCEINLINE bool IsScanningRight() const { return bScanningRight; }
+
+	/** Retrieves normalized scan progress across bars and frame sweep. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	void GetScanProgress(int32& OutBar, float& OutBarLevel, float& OutSweepLevel, bool& bOutScanningRight) const;
+
+	/** Returns normalized scan position as (Azimuth%, Elevation%) for HUD/MFD sweeps. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	FVector2D GetCurrentScanPosition() const;
+
+	/** Evaluates whether an actor falls within the active antenna scan volume envelope. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Scan Volume")
+	bool IsTargetInScanVolume(AActor* Target) const;
+
+	/** Evaluates whether a direction vector in radar space falls within the active ACM sub-mode envelope. */
+	bool IsDirectionInACMVolume(const FVector& LocalDirection, ERadarACMSubMode SubMode) const;
+
+	/** Evaluates whether a target is terrain-masked by static geometry. */
+	bool IsTerrainMasked(const FVector& RadarPosition, const FVector& TargetPosition, const AActor* TargetActor = nullptr, FHitResult* OutHit = nullptr) const;
+
+	/** Returns true if in STT mode with an active tracked lock. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	bool IsSTTLocked() const;
+
+	/** Returns the actor currently locked in STT mode (or nullptr). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	AActor* GetSTTLockedActor() const;
+
+	/** Returns the track ID of the STT locked target (-1 if none). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	FORCEINLINE int32 GetSTTLockedTrackID() const { return STTLockedTrackID; }
+
+	/** Returns the track ID of the TWS bugged priority target (-1 if none). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	FORCEINLINE int32 GetBuggedTrackID() const { return BuggedTrackID; }
+
+	/** Returns the currently selected track (either STT locked or bugged in TWS). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	bool GetSelectedTrack(FRadarTrack& OutTrack) const;
+
+	/** Returns the actor of the currently selected track. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
+	AActor* GetSelectedTargetActor() const;
+
+	/** Clears target designation or breaks active STT lock (traditionally Stick TMS Down / Undesignate). */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock")
+	void UndesignateTarget();
+
+	/** Cycles target designation sequentially between active tracks (traditionally Stick TMS Right / Target Step). */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Lock")
+	bool CycleTargetDesignation(bool bForward = true);
+
+	/** Computes target aspect angle in degrees (-180° to +180°, 0° = tail-on, 180° = head-on). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Display & Cursor")
+	float GetTrackAspectAngle(int32 TrackID) const;
+
+	/** Calculates horizontal compass heading (0° to 360°) from a 3D velocity vector. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Kinematics")
+	static float CalculateHeadingFromVelocity(const FVector& InVelocity, float FallbackHeading = 0.0f, float MinSpeedCmPerSec = 100.0f);
+
+	/** Returns all local radar track files. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	const TArray<FRadarTrack>& GetAllTracks() const { return Tracks; }
+
+	/** Returns tracks filtered by status. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	void GetTracksByStatus(ERadarTrackStatus InStatus, TArray<FRadarTrack>& OutTracks) const;
+
+	/** Retrieves a specific track file by TrackID. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	bool GetTrackByID(int32 TrackID, FRadarTrack& OutTrack) const;
+
+	/** Retrieves a track file associated with a specific target actor. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	bool GetTrackByActor(const AActor* TargetActor, FRadarTrack& OutTrack) const;
+
+	/** Returns the actor of the closest contact. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	AActor* GetClosestContact() const;
+
+	/** Returns the bearing to a specific track in degrees. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	float GetBearingToTrack(int32 TrackID) const;
+
+	/** Returns the slant range to a specific track in cm. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	float GetRangeToTrack(int32 TrackID) const;
+
+	/** Returns the closure rate to a specific track in cm/s. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	float GetClosureRateToTrack(int32 TrackID) const;
+
+	/** Returns the total number of active local track files. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	FORCEINLINE int32 GetContactCount() const { return Tracks.Num(); }
+
+	/** Returns the track that represents the highest threat. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	bool GetHighestThreatTrack(FRadarTrack& OutTrack) const;
+
+	/** Dead-reckoned world position for display rendering without querying live actor. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
+	bool GetTrackDisplayWorldPosition(int32 TrackID, FVector& OutWorldPosition) const;
+
+	// ========================================================================
+	// Spotlight SAR & Terrain Staring Getters
+	// ========================================================================
+
+	/** Returns the designated Spotlight SAR world coordinate. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight SAR")
+	FORCEINLINE FVector GetSpotlightTargetLocation() const { return SpotlightTargetLocation; }
+
+	/** Returns current SAR dwell integration progress [0.0, 1.0]. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight SAR")
+	FORCEINLINE float GetSpotlightDwellProgress() const { return SpotlightDwellProgress; }
+
+	/** Returns squint angle in degrees between flight path and ground spotlight target. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight SAR")
+	FORCEINLINE float GetSpotlightSquintAngle() const { return SpotlightSquintAngle; }
+
+	/** Returns true if Spotlight SAR mode is active with an active ground lock. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight SAR")
+	FORCEINLINE bool IsSpotlightActive() const { return RadarMode == ERadarOperatingMode::Spotlight && bHasSpotlightPoint; }
+
+	/** Returns the helmet look direction in world space. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Air Combat Maneuver")
+	FORCEINLINE FVector GetHelmetLookDirection() const { return HelmetLookDirection; }
+
+	// ========================================================================
+	// Radar Altimeter (RALT) Getters
+	// ========================================================================
+
+	/**
+	 * Returns current radar altitude Above Ground Level (AGL) in centimeters.
+	 * @param OutAltitudeCm Measured altitude above terrain in cm.
+	 * @return True if a valid altimeter return is available within limits.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
+	bool GetRadarAltitude(float& OutAltitudeCm) const;
+
+	/** Sets the socket name used as the radar altimeter antenna source. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Altimeter")
+	void SetRadarAltimeterSocketName(FName InSocketName);
+
+	/** Returns the socket name used as the radar altimeter antenna source. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
+	FORCEINLINE FName GetRadarAltimeterSocketName() const { return RadarAltimeterSocketName; }
+
+	/** Returns both world-space location and rotation of the radar altimeter antenna source. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
+	void GetRadarAltimeterTransform(FVector& OutLocation, FRotator& OutRotation) const;
+
+	// ========================================================================
+	// Continuous Wave (CW) & Missile Guidance Illumination
+	// ========================================================================
+
+	/** Registers an in-flight missile requiring parent radar illumination (SARH, TVM, Command Guidance). */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
+	void RegisterGuidingMissile(URadarMissileGuidanceComponent* Missile);
+
+	/** Unregisters a missile that has finished flight or terminated guidance. */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
+	void UnregisterGuidingMissile(URadarMissileGuidanceComponent* Missile);
+
+	/** Returns true if transmitting Continuous Wave (CW) illumination towards TargetActor. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
+	bool IsContinuousWaveIlluminating(const AActor* TargetActor = nullptr) const;
+
+	/** Returns the current continuous wave illuminated target actor (if active). */
+	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
+	AActor* GetContinuousWaveTarget() const { return ManualCWTargetActor.Get(); }
+
+	/** Manually commands Continuous Wave (CW) illumination towards a target actor. */
+	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
+	void SetContinuousWaveIllumination(AActor* TargetActor, bool bEnable);
+
+	/** Returns all currently active guided missiles relying on this radar. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
+	TArray<URadarMissileGuidanceComponent*> GetActiveGuidingMissiles() const;
+
+	void RegisterLaunchedRadarMissile(URadarMissileGuidanceComponent* Missile);
+	void UnregisterLaunchedRadarMissile(URadarMissileGuidanceComponent* Missile);
+
+	/** Returns statuses of all launched radar missiles currently supported. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Launched Missiles")
+	void GetLaunchedRadarMissiles(TArray<FRadarLaunchedMissileStatus>& OutMissiles) const;
+
+	// ========================================================================
+	// Tactical Data Link Methods
+	// ========================================================================
+
+	/** Sets the radio network identifier (Server authority only). */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Data Link")
 	void SetDataLinkNetworkID(FName NewNetworkID);
+
+	/** Enables or disables track transmission across the data link network. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Data Link")
 	void SetDataLinkContributionEnabled(bool bEnabled);
+
+	/** Enables or disables reception of remote data link tracks. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Data Link")
 	void SetDataLinkReceptionEnabled(bool bEnabled);
+
+	/** Returns true if actively connected and receiving data link network traffic. */
 	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	bool IsDataLinkConnected() const;
+
+	/** Returns the participant network ID assigned by the Data Link Subsystem. */
 	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	int32 GetDataLinkParticipantID() const { return DataLinkParticipantID; }
+
+	/** Returns all external tracks received via Data Link. */
 	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	void GetLinkedTracks(TArray<FRadarTrack>& OutTracks) const { OutTracks = LinkedTracks; }
+
+	/** Immediately drops linked tracks invalidated by a local IFF policy change. */
+	void RefreshDataLinkEligibility();
+
+	/** Returns correlated tracks combining local radar returns and remote data link reports. */
 	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	void GetDisplayTracks(TArray<FRadarTrack>& OutTracks) const;
-	/** Best fresh measured source for a verified actor, preferring this radar over donors. */
+
+	/** Retrieves the best fresh weapon support track for a target actor. */
 	bool GetBestWeaponSupportTrackForActor(const AActor* Actor, FRadarTrack& OutTrack) const;
-	UFUNCTION(BlueprintPure, Category = "Radar|Data Link|Track Correlation")
+
+	/** Returns the currently selected ContactID. */
+	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	int32 GetSelectedContactID() const { return SelectedContactID; }
+
+	/** Retrieves a linked track by its unique negative TrackID. */
 	UFUNCTION(BlueprintPure, Category = "Radar|Data Link")
 	bool GetLinkedTrackByID(int32 TrackID, FRadarTrack& OutTrack) const;
-	/** Server-only actor association and original reporting radar lookup. */
+
+	/** Retrieves fresh linked track for an actor from the data link cache. */
 	bool GetFreshLinkedTrackForActor(const AActor* Actor, int32 OriginID, FRadarTrack& OutTrack) const;
+
+	/** Returns the originating radar component that donated a linked track. */
 	UAircraftRadarComponent* GetLinkedTrackSource(int32 TrackID) const;
+
 	bool GetSelectedLinkedTrackForActor(const AActor* Actor, FRadarTrack& OutTrack) const;
 	void ClearLinkedDesignation() { SelectedLinkedTrackID = -1; if (STTLockedTrackID < 0 && BuggedTrackID < 0) SelectedContactID = 0; }
 	int32 GetSelectedLinkedTrackID() const { return SelectedLinkedTrackID; }
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Data Link")
-	bool DesignateLinkedTrack(int32 TrackID);
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestDesignateLinkedTrack(int32 TrackID, APlayerController* RequestingController);
+
 	bool CanDataLinkTransmit() const;
 	bool CanDataLinkReceive() const;
 	bool CanDataLinkRelay() const;
-	/** Per-node radio inhibition hook for future jammer effects. */
+
+	/** Inhibits radio transmission or reception (jammer hook). */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Data Link")
 	void SetDataLinkRadioInhibited(bool bTransmitInhibited, bool bReceiveInhibited);
+
 	void SetDataLinkParticipantID(int32 NewID) { DataLinkParticipantID = NewID; }
 	void ReceiveDataLinkHeartbeat(float WorldTime);
 	void ReceiveDataLinkReport(const FRadarTrack& Report, UAircraftRadarComponent* SourceRadar, float MeasurementTime, float WorldTime);
 
-	/** New radar contact detected */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarContactNewSignature OnRadarContactNew;
-
-	/** Existing track file updated with fresh data */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarContactUpdatedSignature OnRadarContactUpdated;
-
-	/** Track file dropped (timeout, out of range, or notched) */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarContactLostSignature OnRadarContactLost;
-
-	/** All tracks cleared (e.g. radar powered down or mode reset) */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarAllContactsClearedSignature OnRadarAllContactsCleared;
-
-	/** STT lock successfully acquired on a target */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarLockAcquiredSignature OnRadarLockAcquired;
-
-	/** STT lock broken (mode change, target lost, or manual break) */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarLockLostByIDSignature OnRadarLockLost;
-
-	/** Radar operating mode changed */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarModeChangedSignature OnRadarModeChanged;
-
-	/** Full scan sweep (frame) completed */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnScanSweepCompleteSignature OnScanSweepComplete;
-
-	/** Target entered Doppler notch */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarTargetNotchingSignature OnRadarTargetNotching;
-
-	/** Target track selected by pilot (bugged in TWS/Search or locked in STT) */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarTrackSelectedSignature OnRadarTrackSelected;
-
-	/** Target track deselected / cleared */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarTrackDeselectedSignature OnRadarTrackDeselected;
-
-	/** Authoritative scan samples; local operators receive the latest sample after each versioned display snapshot. */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarScanProgressSignature OnScanProgressUpdated;
-
-	/** Broadcasts radar-space cursor azimuth, elevation, and slant range after an authoritative change. */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarCursorMovedSignature OnRadarCursorMoved;
-
-	/** Broadcasts when target designation is triggered under the cursor, indicating success and designated TrackID (-1 if none) */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarCursorDesignatedSignature OnRadarCursorDesignated;
-
-	/** Broadcasts when the radar display range scale changes */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarDisplayRangeChangedSignature OnRadarDisplayRangeChanged;
-
-	/** Broadcasts when a synthetic aperture radar (SAR) Spotlight image dwell integration completes */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnSARImageReadySignature OnSARImageReady;
-
-	/** Initial operator state has arrived; widgets should hydrate from getters. */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarSnapshotReadySignature OnRadarSnapshotReady;
-
-	/** Coherent state refresh for UI; late subscribers should first query getters. */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarDisplayStateUpdatedSignature OnRadarDisplayStateUpdated;
-
-	/** A server-validated control request has completed. */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnRadarCommandResultSignature OnRadarCommandResult;
-
-	/** Current radar operating mode */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, ReplicatedUsing = OnRep_RadarMode, Category = "Radar|Configuration")
-	ERadarOperatingMode RadarMode = ERadarOperatingMode::Search;
-
-	UFUNCTION()
-	void OnRep_RadarMode();
-
-	/** Socket name on the aircraft mesh where the radar antenna/source is located. If None or not found, falls back to the aircraft root (0, 0, 0) */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Configuration", meta = (DisplayName = "Radar Socket"))
-	FName RadarSocketName = NAME_None;
-
-	/** Stable bearing/UI frame. None uses the owning actor root; it must not rotate with the antenna. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Configuration")
-	FName RadarReferenceComponentName = NAME_None;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
-	ERadarScanDrive ScanDrive = ERadarScanDrive::VirtualMechanical;
-
-	/** Local translation offset applied to radar source location (useful for elevating antenna origin on ground vehicles/turrets without custom mesh sockets) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Configuration")
-	FVector RadarLocationOffset = FVector::ZeroVector;
-
-	/** If true, this radar is ground/surface-based or turret-mounted with full hemispherical/360° tracking coverage, bypassing chassis-relative antenna gimbal break-locks */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Configuration")
-	bool bOmnidirectionalTracking = false;
-
-	/** ACM sub-mode (only used when RadarMode == ACM) */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Configuration", meta = (EditCondition = "RadarMode == ERadarOperatingMode::AirCombatManeuver", EditConditionHides))
-	ERadarACMSubMode ACMSubMode = ERadarACMSubMode::Boresight;
-
-	/** Scan size preset for quick azimuth configuration */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
-	ERadarScanSize ScanSizePreset = ERadarScanSize::Wide_60;
-
-	/** Total azimuth scan width in degrees (e.g. 120 for fighter, 360 for AEW). Locked to preset unless Custom is selected. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "5.0", ClampMax = "360.0", EditCondition = "ScanSizePreset == ERadarScanSize::Custom", EditConditionHides))
-	float AzimuthScanWidth = 120.0f;
-
-	/** Total elevation scan height in degrees */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "2.0", ClampMax = "120.0"))
-	float ElevationScanHeight = 20.0f;
-
-	/** Number of elevation bar scan lines (1, 2, 4, 6, 8) */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume", meta = (ClampMin = "1", ClampMax = "8"))
-	int32 ElevationBars = 4;
-
-	/** Scan center azimuth offset in degrees (TDC cursor slew) */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
-	float ScanCenterAzimuth = 0.0f;
-
-	/** Scan center elevation offset in degrees */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Scan Volume")
-	float ScanCenterElevation = 0.0f;
-
-	/** Maximum physical antenna gimbal limit in azimuth (degrees from antenna boresight, e.g. ±60°). Governs STT tracking lock bounds. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Scan Volume", meta = (ClampMin = "10.0", ClampMax = "180.0"))
-	float MaxAntennaGimbalAzimuth = 60.0f;
-
-	/** Maximum physical antenna gimbal limit in elevation (degrees from antenna boresight, e.g. ±60°). Governs STT tracking lock bounds. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Scan Volume", meta = (ClampMin = "10.0", ClampMax = "90.0"))
-	float MaxAntennaGimbalElevation = 60.0f;
-
-	/** Maximum instrumented detection range in cm (e.g. 30,000,000 cm = 300 km for AN/APG-77) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Range", meta = (ClampMin = "100000.0"))
-	float MaxDetectionRange = 15000000.0f;
-
-	/** Minimum detection range in cm (clutter rejection blind zone) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Range", meta = (ClampMin = "0.0"))
-	float MinDetectionRange = 50000.0f;
-
-	/** Currently selected display range scale in cm */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Range", meta = (ClampMin = "1000.0"))
-	float CurrentDisplayRange = 7400000.0f;
-
-	UFUNCTION()
-	void OnRep_CurrentDisplayRange();
-
-	/** Selectable range scale presets in cm (e.g. 20nm, 40nm, 80nm, 160nm) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Range")
-	TArray<float> RangeScalePresets;
-
-	/** Virtual mechanical antenna scan rate in degrees per second. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.1", UIMin = "1.0", UIMax = "360.0", EditCondition = "ScanDrive == ERadarScanDrive::VirtualMechanical", EditConditionHides))
-	float ScanRateDegreesPerSecond = 70.0f;
-
-	/** Track update interval in seconds (how often track files are refreshed) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.05", UIMin = "0.1", UIMax = "2.0"))
-	float TrackUpdateInterval = 0.5f;
-
-	/** Detection sample period; the mechanical and socket modes cover the sector crossed between samples. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "0.016", ClampMax = "1.0"))
-	float ScanSampleInterval = 0.1f;
-
-	/** Expected full antenna revolution in socket-driven mode. Set from the mesh animation rate. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "0.1", ClampMax = "120.0", EditCondition = "ScanDrive == ERadarScanDrive::SocketDriven", EditConditionHides))
-	float SocketExpectedRevisitSeconds = 10.0f;
-
-	/** Disable when all radar targets are registered with the combat subsystem; skips physics overlap discovery entirely. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	bool bEnablePhysicsCandidateDiscovery = true;
-
-	/** How often physics overlaps discover actors absent from the combat registry. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "0.1", ClampMax = "5.0", EditCondition = "bEnablePhysicsCandidateDiscovery", EditConditionHides))
-	float CandidateDiscoveryInterval = 0.5f;
-
-	/** Electronic beam visits per sample. PESA always uses one; AESA can use several. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "1", ClampMax = "32", EditCondition = "ScanDrive == ERadarScanDrive::AESA", EditConditionHides))
-	int32 AESABeamsPerSample = 4;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Track Management", meta = (ClampMin = "1", ClampMax = "256"))
-	int32 MaxTrackFiles = 64;
-
-	/** Upper bound for expensive per-beam candidate evaluation; existing tracks take priority. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Radar|Performance", meta = (ClampMin = "16", ClampMax = "4096"))
-	int32 MaxCandidatesPerSample = 512;
-
-	/** Minimum target Radar Cross Section (m²) detectable at MaxDetectionRange */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.001"))
-	float MinimumDetectableRCS = 1.0f;
-
-	/** Default RCS in m² assigned when a target has no 'RCS=X' tag (defaults to 99.99 m² as an unnatural indicator of a missing tag) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.0001"))
-	float DefaultTargetRCS = 99.99f;
-
-	/** Disable RCS tag parsing when every target should use DefaultTargetRCS. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	bool bEnableTargetRCSTagParsing = true;
-
-	/** If true, target heading/pitch aspect angle modifies effective RCS (e.g. beam broadside reflection vs nose-on) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	bool bEnableAspectAngleRCS = true;
-
-	/** RCS multiplier when target presents beam/broadside aspect (large specular reflection from fuselage and vertical stabilizers) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "1.0", ClampMax = "20.0", UIMin = "1.0", UIMax = "10.0", EditCondition = "bEnableAspectAngleRCS", EditConditionHides))
-	float RCSAspectBeamMultiplier = 3.5f;
-
-	/** RCS multiplier when target presents tail aspect (engine turbine cavity retro-reflections) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "1.0", ClampMax = "10.0", UIMin = "1.0", UIMax = "5.0", EditCondition = "bEnableAspectAngleRCS", EditConditionHides))
-	float RCSAspectTailMultiplier = 1.8f;
-
-	/** Receiver dynamic range in dB above detection sensitivity for normalized SignalStrength (default 40 dB: 0 dB = threshold, 40 dB = AGC saturation) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "10.0", ClampMax = "80.0", UIMin = "20.0", UIMax = "60.0"))
-	float ReceiverDynamicRangeDB = 40.0f;
-
-	/** Minimum radial velocity in cm/s for Doppler track maintenance (notch filter) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "10000.0"))
-	float NotchFilterVelocity = 3000.0f;
-
-	/** Allows STT angle tracking to retain a notched target while range/Doppler data is degraded. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (EditCondition = "RadarMode == ERadarOperatingMode::SingleTargetTrack", EditConditionHides))
-	bool bSTTAngleTrackThroughNotch = true;
-
-	/** If true, LOS ray trace checks are performed for look-down / terrain masking */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	bool bEnableTerrainMasking = true;
-
-	/** If true, queries all dynamic object types (Pawn, WorldDynamic, PhysicsBody, Vehicle) to prevent missing pawns with custom collision presets */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (EditCondition = "bEnablePhysicsCandidateDiscovery", EditConditionHides))
-	bool bQueryAllDynamicObjects = true;
-
-	/** If true, also inspects component tags if the candidate actor itself does not have matching tags */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	bool bSearchComponentTags = true;
-
-	/** Radar antenna beam horizontal width in degrees */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "1.0", ClampMax = "45.0"))
-	float BeamAzimuthWidth = 6.0f;
-
-	/** Radar antenna beam vertical width in degrees (covers elevation bar spacing to eliminate blind gaps) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (ClampMin = "1.0", ClampMax = "45.0"))
-	float BeamElevationWidth = 10.0f;
-
-	/** Collision channel for target detection overlaps (used when bQueryAllDynamicObjects is false) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance", meta = (EditCondition = "bEnablePhysicsCandidateDiscovery && !bQueryAllDynamicObjects", EditConditionHides))
-	TEnumAsByte<ECollisionChannel> DetectionChannel = ECC_Pawn;
-
-	/** Actor tags required for radar detection (if empty, all pawns are candidates) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Performance")
-	TArray<FName> DetectableActorTags;
-
-	/** Target operational domains accepted in Air-to-Air modes (Search, TWS, ACM, STT). Defaults to [Air]. Remove or empty to accept all domains. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
-	TArray<ERadarTargetDomain> AirModeAllowedDomains = { ERadarTargetDomain::Air };
-
-	/** Target operational domains accepted in Ground Mapping (GM) mode. Defaults to [Ground]. Remove or empty to accept all domains. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
-	TArray<ERadarTargetDomain> GroundMappingAllowedDomains = { ERadarTargetDomain::Ground };
-
-	/** Target operational domains accepted in Sea Search (SS) mode. Defaults to [Sea]. Remove or empty to accept all domains. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
-	TArray<ERadarTargetDomain> SeaSearchAllowedDomains = { ERadarTargetDomain::Sea };
-
-	/** If true, radar uses IGenericTeamAgentInterface to classify track IFF (Friendly/Hostile/Neutral). If false, all tracks remain Unknown. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|IFF")
-	bool bEnableIFF = true;
-
-	/** How unclassified contacts are treated when the target actor does not implement IGenericTeamAgentInterface */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|IFF", meta = (EditCondition = "bEnableIFF", EditConditionHides))
-	EIFFUnknownAttitude UnknownContactAttitude = EIFFUnknownAttitude::Neutral;
-
-	/** Team ID for this aircraft / SAM platform (0-254 = Factions, 255 = NoTeam/Neutral). Acts as transponder when platform has no separate IFF component. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_TeamID, Category = "Radar|IFF")
-	uint8 TeamID = 1;
-
-	/** Squawk code for civilian/ATC or military Mode 3/A transponder squawk */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_SquawkCode, Category = "Radar|IFF", meta = (ClampMin = "0", ClampMax = "7777"))
-	int32 SquawkCode = 1200;
-
-	/** Broadcast when radar platform's team ID changes */
-	UPROPERTY(BlueprintAssignable, Category = "Radar|Events")
-	FOnCombatTeamChangedSignature OnTeamChanged;
-
-	UFUNCTION()
-	void OnRep_TeamID();
-
-	UFUNCTION()
-	void OnRep_SquawkCode();
-
-	/** Sets the radar platform's team ID (Server/Authoritative). Updates all replicated clients. */
-	UFUNCTION(BlueprintCallable, Category = "Radar|IFF")
+	// ========================================================================
+	// IFF & Transponder Methods
+	// ========================================================================
+
+	/** Sets the radar platform's faction/team ID (Server authoritative). */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|IFF")
 	void SetTeamID(uint8 NewTeamID);
 
-	/** Returns the assigned team ID */
+	/** Returns the assigned team ID. */
 	UFUNCTION(BlueprintPure, Category = "Radar|IFF")
 	uint8 GetTeamID() const { return TeamID; }
 
-	/** Sets the radar platform's squawk code (Server/Authoritative). */
-	UFUNCTION(BlueprintCallable, Category = "Radar|IFF")
+	/** Sets the radar platform's transponder squawk code. */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|IFF")
 	void SetSquawkCode(int32 NewSquawkCode);
 
-	/** Returns the current squawk code */
+	/** Returns the current squawk code. */
 	UFUNCTION(BlueprintPure, Category = "Radar|IFF")
 	int32 GetSquawkCode() const { return SquawkCode; }
 
@@ -739,788 +1510,122 @@ public:
 	virtual ETeamAttitude::Type GetTeamAttitudeTowards(const AActor& Other) const override;
 	// ~End IGenericTeamAgentInterface
 
-	/** Target operational domains accepted in Spotlight SAR mode. Defaults to [Ground, Sea]. Remove or empty to accept all domains. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Target Classification")
-	TArray<ERadarTargetDomain> SpotlightAllowedDomains = { ERadarTargetDomain::Ground, ERadarTargetDomain::Sea };
-
-	/** Maximum number of simultaneous TWS track files */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "1", ClampMax = "50"))
-	int32 MaxSimultaneousTWSTracks = 10;
-
-	/** Time in seconds before a track file is dropped due to no radar return */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "1.0"))
-	float TrackDropTimeout = 8.0f;
-
-	/** ACM auto-lock range in cm (targets within this range are auto-locked in ACM mode) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management")
-	float ACMAutoLockRange = 1800000.0f;
-
-	/** ACM boresight cone half-angle in degrees */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "5.0", ClampMax = "45.0", EditCondition = "ACMSubMode != ERadarACMSubMode::VerticalScan", EditConditionHides))
-	float ACMBoresightConeAngle = 10.0f;
-
-	/** Total azimuth width in degrees of the ACM Vertical Scan swath (default 10.0° -> ±5° from aircraft centerline) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "2.0", ClampMax = "30.0", UIMin = "2.0", UIMax = "20.0", EditCondition = "ACMSubMode == ERadarACMSubMode::VerticalScan", EditConditionHides))
-	float ACMVerticalScanAzimuthWidth = 10.0f;
-
-	/** Minimum elevation limit in degrees for ACM Vertical Scan (default -10.0°, slightly below HUD waterline) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "-30.0", ClampMax = "10.0", UIMin = "-20.0", UIMax = "5.0", EditCondition = "ACMSubMode == ERadarACMSubMode::VerticalScan", EditConditionHides))
-	float ACMVerticalScanMinElevation = -10.0f;
-
-	/** Maximum elevation limit in degrees for ACM Vertical Scan (default +60.0°, high canopy lift vector) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Track Management", meta = (ClampMin = "15.0", ClampMax = "85.0", UIMin = "30.0", UIMax = "75.0", EditCondition = "ACMSubMode == ERadarACMSubMode::VerticalScan", EditConditionHides))
-	float ACMVerticalScanMaxElevation = 60.0f;
-
-	/** Radius of the high-resolution SAR Spotlight ground patch in cm (default 200,000 cm = 2 km) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "50000.0", ClampMax = "1000000.0", UIMin = "50000.0", UIMax = "500000.0"))
-	float SpotlightPatchRadius = 200000.0f;
-
-	/** Dwell duration in seconds required to synthesize full cross-range SAR image resolution */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "0.5", ClampMax = "10.0", UIMin = "1.0", UIMax = "5.0"))
-	float SpotlightDwellDuration = 2.5f;
-
-	/** Minimum squint angle in degrees relative to aircraft velocity (below this angle, Doppler gradient is zero / Doppler blind cone) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "2.0", ClampMax = "30.0"))
-	float SpotlightMinSquintAngle = 10.0f;
-
-	/** Maximum squint angle in degrees for SAR image synthesis */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "30.0", ClampMax = "85.0"))
-	float SpotlightMaxSquintAngle = 75.0f;
-
-	/** If true, automatically traces forward/downward along radar waterline to intersect terrain if no ground point was manually designated */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR")
-	bool bSpotlightAutoGroundIntersect = true;
-
-	/** Default slant range in cm used for initial ground intersect projection if terrain trace misses */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "500000.0", EditCondition = "bSpotlightAutoGroundIntersect", EditConditionHides))
-	float SpotlightDefaultSlantRange = 2500000.0f;
-
-	/** Default downward pitch angle in degrees from radar centerline for auto-intersect trace (default -12°) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "-45.0", ClampMax = "0.0", EditCondition = "bSpotlightAutoGroundIntersect", EditConditionHides))
-	float SpotlightDefaultPitchAngle = -12.0f;
-
-	/** Ground velocity threshold in cm/s to classify a contact as moving (GMTI) vs stationary structure (default 150 cm/s ≈ 3 knots) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Spotlight SAR", meta = (ClampMin = "10.0"))
-	float GMTIVelocityThreshold = 150.0f;
-
-	/** Master switch for debug visualization and HUD telemetry */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug")
-	bool bEnableDebugTraces = false;
-
-	/** If true, 3D debug visualizations are only rendered if owner is locally player-controlled */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDebugOnlyPlayerControlled = false;
-
-	/** If true, renders the 3D scan volume wireframe frustum and elevation bars */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDrawScanVolume = true;
-
-	/** If true, renders the 3D antenna beam boresight ray and scanning cone */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDrawAntennaBeam = true;
-
-	/** If true, renders 3D track symbology (diamonds, STT reticles, velocity vectors) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDrawTrackSymbology = true;
-
-	/** If true, renders on-screen live telemetry diagnostics table */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bEnableDiagnosticHUD = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces && bEnableTargetCursor", EditConditionHides))
-	bool bDebugCursor = true;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDebugCandidateRejections = false;
-
-	/** Labels throttled overlap discovery batches and their raw hit count. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces && bEnablePhysicsCandidateDiscovery", EditConditionHides))
-	bool bDebugPhysicsDiscovery = false;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Debug", meta = (EditCondition = "bEnableDebugTraces", EditConditionHides))
-	bool bDebugReferenceAxes = false;
-
-	// -----------------------------------------------------
-	// Radar Altimeter (RALT / AGL) Subsystem
-	// -----------------------------------------------------
-
-	/** If true, the radar component operates a radar altimeter subsystem measuring height Above Ground Level (AGL) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter")
-	bool bEnableRadarAltimeter = true;
-
-	/** Optional socket name on the aircraft mesh for the radar altimeter antenna. If None, falls back to RadarSocketName or actor root */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides))
-	FName RadarAltimeterSocketName = NAME_None;
-
-	/** Maximum operational altitude for the radar altimeter in cm (e.g. 152,400 cm = 5,000 ft). Above this ceiling, the altimeter flags invalid. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides, ClampMin = "1000.0"))
-	float MaxRadarAltitude = 152400.0f;
-
-	/** Maximum aircraft attitude tilt angle (pitch or bank from level) in degrees before altimeter beam breaks ground lock (default 50°) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides, ClampMin = "10.0", ClampMax = "89.0"))
-	float MaxAltimeterAttitudeAngle = 50.0f;
-
-	/** If true, uses a multi-ray conical sweep to detect closest terrain obstacle/slope (first-return); if false, uses a single vertical nadir trace */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides))
-	bool bAltimeterConicalSampling = true;
-
-	/** Full conical beamwidth of the radar altimeter in degrees (e.g. 45°). Used for first-return terrain proximity detection. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter && bAltimeterConicalSampling", EditConditionHides, ClampMin = "10.0", ClampMax = "90.0"))
-	float AltimeterBeamwidthDegrees = 45.0f;
-
-	/** Smoothing speed for the radar altimeter tracking loop (higher = more responsive, lower = smoother) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides, ClampMin = "1.0", ClampMax = "50.0"))
-	float AltimeterSmoothingSpeed = 15.0f;
-
-	/** How often the radar altimeter updates in seconds (e.g. 0.033 = ~30 Hz, 0.0 = every frame) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Altimeter", meta = (EditCondition = "bEnableRadarAltimeter", EditConditionHides, ClampMin = "0.0", UIMin = "0.0", UIMax = "0.2"))
-	float AltimeterUpdateInterval = 0.033f;
-
-	/** Sets the radar operating mode */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Control")
-	void SetRadarMode(ERadarOperatingMode NewMode);
-
-	/** Returns a request ID for OnRadarCommandResult, or INDEX_NONE when no local operator link exists. */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestSetRadarMode(ERadarOperatingMode NewMode, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestSetDisplayRange(float NewRangeCm, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestLockTrack(int32 TrackID, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestBugTrack(int32 TrackID, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestBreakLock(APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	int32 RequestDesignateCursor(APlayerController* RequestingController);
-
-	/** Designate the symbol beneath the cursor in the radar's active display view. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	int32 RequestDesignateUnderDisplayCursor(APlayerController* RequestingController);
-
-	/** Shared operator view. PPI offset is km right/forward; B-scope offset is degrees/km. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Display Projection")
-	FRadarDisplayView DisplayView;
-
-	UFUNCTION(BlueprintPure, Category = "Display Projection")
-	FRadarDisplayView GetDisplayView() const { return DisplayView; }
-
-	UFUNCTION(BlueprintPure, Category = "Display Projection")
-	int32 GetDisplayViewRevision() const { return DisplayViewRevision; }
-
-	/** Changes the active geometry's window. RequestingController must be the active operator;
-	 * check OnRadarCommandResult for the server's success result. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection")
-	int32 RequestSetDisplayWindow(float ZoomFactor,
-		FVector2D ViewCenterOffset, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Display Projection")
-	int32 RequestSetDisplayGeometry(ERadarDisplayGeometry Geometry, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Display Projection")
-	int32 RequestSetDisplayHeadingUp(bool bHeadingUp, APlayerController* RequestingController);
-
-	/** Center-anchored canvas translation: (0,0) is the MFD center. Use for waypoints,
-	 * track LastKnownPosition, and FRadarCursorState::WorldLocation. */
-	UFUNCTION(BlueprintPure, Category = "Display Projection")
-	bool ProjectWorldToDisplay(const FVector& WorldLocation, FVector2D WidgetSize,
-		FVector2D& OutWidgetPosition) const;
-
-	/** WidgetPosition is center-relative, matching ProjectWorldToDisplay's output. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	int32 RequestSetCursorFromDisplayPosition(FVector2D WidgetPosition, FVector2D WidgetSize,
-		APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	int32 RequestSetCursorFromWidgetPosition(const FVector2D& WidgetPosition,
-		const FRadarDisplayProjection& Projection, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestSetACMSubMode(ERadarACMSubMode NewSubMode, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestSetScanVolume(float AzimuthWidth, float ElevationHeight, int32 Bars,
-		APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestOffsetScanCenter(float AzimuthDelta, float ElevationDelta,
-		APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestApplyScanSizePreset(ERadarScanSize Preset, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestClearBugTrack(APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestDesignateSpotlightPoint(const FVector& WorldLocation, APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestClearSpotlightTarget(APlayerController* RequestingController);
-
-	UFUNCTION(BlueprintCallable, Category = "Radar|Requests")
-	int32 RequestSetHelmetLookDirection(const FVector& WorldDirection, APlayerController* RequestingController);
-
-	/** Axis input uses an unreliable 20 Hz operator channel and times out automatically. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	bool RequestMoveTDCCursor(float XAxis, float YAxis, APlayerController* RequestingController);
-
-	/** Returns the current radar mode */
-	UFUNCTION(BlueprintPure, Category = "Radar|Control")
-	FORCEINLINE ERadarOperatingMode GetRadarMode() const { return RadarMode; }
-
-	/** Returns the current ACM sub-mode */
-	UFUNCTION(BlueprintPure, Category = "Radar|Control")
-	FORCEINLINE ERadarACMSubMode GetACMSubMode() const { return ACMSubMode; }
-
-	/** Sets the socket name used as the radar antenna origin and boresight axis */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Configuration")
-	void SetRadarSocketName(FName InSocketName);
-
-	/** Returns the socket name used as the radar antenna origin */
-	UFUNCTION(BlueprintPure, Category = "Radar|Configuration")
-	FORCEINLINE FName GetRadarSocketName() const { return RadarSocketName; }
-
-	/** Returns the world-space location of the radar antenna (uses RadarSocketName if valid, otherwise falls back to root (0, 0, 0) / actor origin) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Source")
-	FVector GetRadarLocation() const;
-
-	/** Returns the world-space rotation/orientation of the radar antenna (uses RadarSocketName if valid, otherwise falls back to root actor rotation) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Source")
-	FRotator GetRadarRotation() const;
-
-	/** Returns both world-space location and rotation of the radar antenna source */
-	UFUNCTION(BlueprintPure, Category = "Radar|Source")
-	void GetRadarSourceTransform(FVector& OutLocation, FRotator& OutRotation) const;
-
-	/** Stable platform frame for track bearing and display projection. */
-	UFUNCTION(BlueprintPure, Category = "Radar|Source")
-	void GetRadarReferenceTransform(FVector& OutLocation, FRotator& OutRotation) const;
-
-	UFUNCTION(BlueprintPure, Category = "Radar|Display")
-	FRadarDisplayProjection MakeDisplayProjection(const FVector2D& WidgetTopLeft, const FVector2D& WidgetSize,
-		ERadarDisplayGeometry Geometry = ERadarDisplayGeometry::BScope, bool bHeadingUp = true) const;
-
-	/** Returns true if the radar is actively emitting RF energy (not Off, not Standby) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Control")
-	bool IsRadarEmitting() const;
-
-	/** Sets the ACM sub-mode and switches to ACM mode if not already */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Control")
-	void SetACMSubMode(ERadarACMSubMode NewSubMode);
-
-	/**
-	 * Evaluates whether a direction vector (in local radar component coordinates) falls within the active ACM sub-mode acquisition volume.
-	 * @param LocalDirection Direction vector in local radar component coordinates (X = Forward, Y = Right, Z = Up).
-	 * @param SubMode The active ACM sub-mode being evaluated.
-	 * @return True if within the sub-mode acquisition envelope.
-	 */
-	bool IsDirectionInACMVolume(const FVector& LocalDirection, ERadarACMSubMode SubMode) const;
-
-	/** Sets the scan volume parameters */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Scan")
-	void SetScanVolume(float Azimuth, float Elevation, int32 Bars);
-
-	/** Applies a scan size preset */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Scan")
-	void ApplyScanSizePreset(ERadarScanSize Preset);
-
-	/** Offsets the scan center (TDC cursor slew) */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Scan")
-	void OffsetScanCenter(float AzDelta, float ElDelta);
-
-	/** Cycles the display range scale up or down */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Range")
-	void CycleRangeScale(bool bIncrease);
-
-	/** Sets the display range scale directly in cm */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Range")
-	void SetRangeScale(float NewRange);
-
-	/**
-	 * Returns the current radar altitude Above Ground Level (AGL) in centimeters.
-	 *
-	 * Performs a realistic first-return RF altimeter measurement accounting for terrain contours,
-	 * antenna mounting location, attitude cutoff limits (bank/pitch), and maximum operational ceiling.
-	 *
-	 * @param OutAltitudeCm The measured height above terrain in Unreal centimeters (cm).
-	 * @return True if a valid radar altimeter return is available (within operational ceiling and attitude limits); false otherwise.
-	 */
-	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
-	bool GetRadarAltitude(float& OutAltitudeCm) const;
-
-	/** Sets the socket name on the aircraft mesh used as the radar altimeter antenna source */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Altimeter")
-	void SetRadarAltimeterSocketName(FName InSocketName);
-
-	/** Returns the socket name used as the radar altimeter antenna source */
-	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
-	FORCEINLINE FName GetRadarAltimeterSocketName() const { return RadarAltimeterSocketName; }
-
-	/** Returns both world-space location and rotation of the radar altimeter antenna source */
-	UFUNCTION(BlueprintPure, Category = "Radar|Altimeter")
-	void GetRadarAltimeterTransform(FVector& OutLocation, FRotator& OutRotation) const;
-
-	/** Returns the current scan antenna azimuth position in degrees (for HUD B-scope rendering) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	FORCEINLINE float GetCurrentScanAzimuth() const { return CurrentScanAzimuth; }
-
-	/** Returns the current scan antenna elevation bar index */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	FORCEINLINE int32 GetCurrentScanBar() const { return CurrentScanBar; }
-
-	/** Returns true if the antenna is currently sweeping to the right */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	FORCEINLINE bool IsScanningRight() const { return bScanningRight; }
-
-	/** Last authoritative scan progress sample, also available after a late UI bind. */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	void GetScanProgress(int32& OutBar, float& OutBarLevel, float& OutSweepLevel, bool& bOutScanningRight) const;
-
-	/** Returns the normalized scan position as (Azimuth%, Elevation%) for HUD display */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	FVector2D GetCurrentScanPosition() const;
-
-	/** Returns true if the given actor is within the current scan volume */
-	UFUNCTION(BlueprintPure, Category = "Radar|Scan")
-	bool IsTargetInScanVolume(AActor* Target) const;
-
-	/** Calculates the maximum detection range for a target with the given RCS in m² */
-	float CalculateDetectionRange(float TargetRCS) const;
-
-	/**
-	 * Resolves the Radar Cross Section (in m²) for a candidate actor by parsing 'RCS=X' or 'RCS:X' tags.
-	 * Inspects Candidate Actor tags, and if bSearchComponentTags is true, inspects Component tags.
-	 * @param Candidate The actor being scanned.
-	 * @param bOutFoundTag Set to true if an explicit 'RCS=X' tag was found; false if defaulting to the unnatural fallback.
-	 * @param OutParsedTag The raw tag string that matched (or "NONE").
-	 * @return Parsed RCS in m², or DefaultTargetRCS (unnatural number) if not found.
-	 */
-	float ResolveTargetRCS(const AActor* Candidate, bool& bOutFoundTag, FString& OutParsedTag) const;
-
-	/**
-	 * Calculates the effective target RCS in m² taking into account aspect angle (relative orientation).
-	 * Computes target aspect without expensive trigonometric functions using vector dot products.
-	 * @param BaseRCS The baseline target RCS (e.g. from tags or default).
-	 * @param TargetActor The target actor (used for heading/forward orientation).
-	 * @param TargetToRadar Normalized direction vector pointing from target towards the radar.
-	 * @return Aspect-modified effective RCS in m².
-	 */
-	float CalculateEffectiveRCS(float BaseRCS, const AActor* TargetActor, const FVector& TargetToRadar) const;
-
-	/**
-	 * Calculates the one-way antenna beam gain factor (0.0 to 1.0) for a target direction.
-	 * Accounts for mechanical beam Gaussian roll-off, AESA array scan loss, or STT boresight lock.
-	 * @param TargetBearing Local bearing from radar forward in degrees.
-	 * @param TargetElevation Local elevation from radar waterline in degrees.
-	 * @param LocalTargetDir Normalized local direction vector to target in radar antenna space.
-	 * @return Antenna beam gain factor (0.01 to 1.0).
-	 */
-	float CalculateAntennaBeamGain(float TargetBearing, float TargetElevation, const FVector& LocalTargetDir) const;
-
-	/** Designates a world coordinate for Spotlight SAR ground-stared imaging */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight")
-	void DesignateSpotlightPoint(const FVector& WorldLocation);
-
-	/** Designates a specific actor on the ground for Spotlight SAR slaved tracking */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight")
-	void DesignateSpotlightActor(AActor* TargetActor);
-
-	/** Clears current Spotlight target coordinate */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Spotlight")
-	void ClearSpotlightTarget();
-
-	/** Returns the currently designated Spotlight ground location */
-	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight")
-	FORCEINLINE FVector GetSpotlightTargetLocation() const { return SpotlightTargetLocation; }
-
-	/** Returns the current SAR dwell synthesis progress (0.0 to 1.0) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight")
-	FORCEINLINE float GetSpotlightDwellProgress() const { return SpotlightDwellProgress; }
-
-	/** Returns the current squint angle in degrees to the spotlight ground target */
-	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight")
-	FORCEINLINE float GetSpotlightSquintAngle() const { return SpotlightSquintAngle; }
-
-	/** Returns true if Spotlight mode is active with an active ground lock */
-	UFUNCTION(BlueprintPure, Category = "Radar|Spotlight")
-	FORCEINLINE bool IsSpotlightActive() const { return RadarMode == ERadarOperatingMode::Spotlight && bHasSpotlightPoint; }
-
-	/** Sets the helmet or pilot camera look direction in world coordinates for HelmetCue ACM mode */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Helmet Cue")
-	void SetHelmetLookDirection(const FVector& InWorldDirection);
-
-	/** Returns the current helmet look direction in world coordinates */
-	UFUNCTION(BlueprintPure, Category = "Radar|Helmet Cue")
-	FORCEINLINE FVector GetHelmetLookDirection() const { return HelmetLookDirection; }
-
-	/** Resolves the operational domain (Air, Ground, Sea) of a candidate actor based on its tags. Defaults to Air if untagged. */
-	ERadarTargetDomain ResolveCandidateDomain(const AActor* Candidate) const;
-
-	/** Returns true if the given target domain is allowed in the specified radar operating mode */
-	bool IsDomainAllowedForMode(ERadarTargetDomain Domain, ERadarOperatingMode Mode) const;
-
-	/**
-	 * Calculates normalized radar return signal strength (0.0 to 1.0) using two-way radar equation SNR.
-	 * Normalized over ReceiverDynamicRangeDB (e.g. 40 dB: 0 dB = detection threshold, 40 dB = saturation).
-	 * @param Range Slant range to target in cm.
-	 * @param EffectiveRCS Effective target RCS in m² (aspect-modified).
-	 * @param BeamGain One-way antenna beam gain (0.0 to 1.0).
-	 * @return Normalized signal strength [0.0, 1.0].
-	 */
-	float CalculateSignalStrength(float Range, float EffectiveRCS, float BeamGain) const;
-
-	/** Checks if a target is terrain-masked (LOS blocked by ground geometry) */
-	bool IsTerrainMasked(const FVector& RadarPosition, const FVector& TargetPosition, const AActor* TargetActor = nullptr, FHitResult* OutHit = nullptr) const;
-
-	/** Commands STT lock on a specific track file (transitions radar to STT mode) */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (DeprecatedFunction, DeprecationMessage = "Use RequestLockTrack and OnRadarCommandResult for multiplayer."))
-	bool CommandLock(int32 TrackID);
-
-	/** Commands STT lock on a specific target actor by searching active tracks */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Lock")
-	bool CommandLockActor(AActor* TargetActor);
-
-	/**
-	 * Acquires or locks a specific actor immediately.
-	 * If the actor is already in tracks, locks or bugs it.
-	 * If not yet tracked but within radar parameters, evaluates and creates a track immediately.
-	 *
-	 * @param TargetActor The actor to acquire
-	 * @param bForceSTT If true, transitions to STT mode; if false, bugs in TWS or acquires in Search
-	 */
-	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Lock")
-	bool AcquireOrLockActor(AActor* TargetActor, bool bForceSTT = false);
-
-	/** Breaks the current STT lock and returns to the previous scan mode */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Lock")
-	void BreakLock();
-
-	/** Bugs/designates a TWS track for priority tracking and weapon cueing (does not change to STT) */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Lock", meta = (DeprecatedFunction, DeprecationMessage = "Use RequestBugTrack and OnRadarCommandResult for multiplayer."))
-	bool CommandBugTrack(int32 TrackID);
-
-	/** Clears the TWS bug designation */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Lock")
-	void ClearBugTrack();
-
-	/** Returns true if the radar is in STT mode with an active lock */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	bool IsSTTLocked() const;
-
-	/** Returns the actor currently locked in STT mode (or nullptr) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	AActor* GetSTTLockedActor() const;
-
-	/** Returns the track ID of the STT locked track (-1 if none) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	FORCEINLINE int32 GetSTTLockedTrackID() const { return STTLockedTrackID; }
-
-	/** Returns the track ID of the TWS bugged track (-1 if none) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	FORCEINLINE int32 GetBuggedTrackID() const { return BuggedTrackID; }
-
-	/** Returns the currently selected track (either STT locked or bugged in TWS) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	bool GetSelectedTrack(FRadarTrack& OutTrack) const;
-
-	/** Returns the actor of the currently selected track (STT locked or bugged, or nullptr) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Lock")
-	AActor* GetSelectedTargetActor() const;
-
-	// -----------------------------------------------------
-	// Continuous Wave (CW) / Missile Guidance Illumination
-	// -----------------------------------------------------
-
-	/**
-	 * Registers an in-flight missile requiring parent radar illumination (SARH, TVM, or Command Guidance).
-	 * Tracks launched supported missiles for RWR reporting. Registration does not create illumination.
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
-	void RegisterGuidingMissile(URadarMissileGuidanceComponent* Missile);
-
-	/**
-	 * Unregisters a missile that has finished its flight (hit, detonated, or lost lock).
-	 * If no other missiles require illumination, CW illumination ceases.
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
-	void UnregisterGuidingMissile(URadarMissileGuidanceComponent* Missile);
-
-	/** Returns true if this radar is actively transmitting Continuous Wave (CW) illumination or guidance bursts towards TargetActor (or any target if TargetActor is null) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
-	bool IsContinuousWaveIlluminating(const AActor* TargetActor = nullptr) const;
-
-	/** Returns the current continuous wave (CW) illuminated target actor (if active) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
-	AActor* GetContinuousWaveTarget() const { return ManualCWTargetActor.Get(); }
-
-	/**
-	 * Manually controls Continuous Wave (CW) illumination towards a target actor.
-	 * Used by SAM batteries, ships, AI controllers, or mission scripts to engage missile guidance modes.
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Guidance")
-	void SetContinuousWaveIllumination(AActor* TargetActor, bool bEnable);
-
-	/** Returns all currently active guided missiles relying on this radar */
-	UFUNCTION(BlueprintPure, Category = "Radar|Guidance")
-	TArray<URadarMissileGuidanceComponent*> GetActiveGuidingMissiles() const;
-
-	/** Launch ownership is independent of whichever radar currently supplies guidance. */
-	void RegisterLaunchedRadarMissile(URadarMissileGuidanceComponent* Missile);
-	void UnregisterLaunchedRadarMissile(URadarMissileGuidanceComponent* Missile);
-	/** Current launched radar missiles. Clients receive this through the authorized operator snapshot. */
-	UFUNCTION(BlueprintPure, Category = "Radar|Launched Missiles")
-	void GetLaunchedRadarMissiles(TArray<FRadarLaunchedMissileStatus>& OutMissiles) const;
-	/** Cadence shared by operator display state and launched missile status. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Radar|Multiplayer", meta = (ClampMin = "0.05", UIMin = "0.05"))
-	float OperatorSnapshotIntervalSeconds = 0.2f;
-
-	/** Completely disables TDC input, projection, designation, events, and debug for radars without a cursor. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Display Projection|Target Cursor")
-	bool bEnableTargetCursor = true;
-
-	UFUNCTION(BlueprintPure, Category = "Display Projection|Target Cursor")
-	bool IsTargetCursorEnabled() const { return bEnableTargetCursor; }
-
-	/** Current TDC (Target Designator Control) cursor azimuth offset in degrees relative to antenna scan center */
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Display Projection|Target Cursor")
-	float TDCCursorAzimuth = 0.0f;
-
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Display Projection|Target Cursor")
-	float TDCCursorElevation = 0.0f;
-
-	/** Current TDC cursor range position in cm */
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Display Projection|Target Cursor")
-	float TDCCursorRange = 3704000.0f; // Default 20nm
-
-	/** B-scope horizontal speed, in degrees per second at zoom 1. Zoom scales the world-space movement. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection|Target Cursor", meta = (ClampMin = "1.0", UIMin = "5.0", UIMax = "120.0", EditCondition = "bEnableTargetCursor", EditConditionHides))
-	float CursorAzimuthSpeed = 40.0f;
-
-	/** B-scope vertical speed as a fraction of the full range per second at zoom 1. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection|Target Cursor", meta = (ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.1", UIMax = "1.0", EditCondition = "bEnableTargetCursor", EditConditionHides))
-	float CursorRangeSpeedFraction = 0.4f;
-
-	/** Fraction of the visible PPI MFD width/height crossed per second at full input. B-scope uses the existing azimuth and range speed settings. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection|Target Cursor", meta = (ClampMin = "0.05", ClampMax = "2.0", EditCondition = "bEnableTargetCursor", EditConditionHides))
-	float CursorDisplaySpeedFraction = 0.4f;
-
-	/** Selection radius in fractions of the visible display width/height. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection|Target Cursor", meta = (ClampMin = "0.005", ClampMax = "0.08", EditCondition = "bEnableTargetCursor", EditConditionHides))
-	float CursorSelectionRadiusFraction = 0.04f;
-
-	/**
-	 * Moves the radar target designator (TDC) cursor on the display using 2D axis inputs.
-	 * Automatically calculates delta time from the world.
-	 *
-	 * @param XAxis Horizontal movement input (-1.0 to +1.0) in the active MFD view.
-	 * @param YAxis Vertical movement input (-1.0 to +1.0) in the active MFD view.
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor", meta = (DisplayName = "Move TDC Cursor", DeprecatedFunction, DeprecationMessage = "Use RequestMoveTDCCursor with the owning player controller for UI input."))
-	void MoveTDCCursor(float XAxis, float YAxis);
-
-	/** Direct mouse/touch placement. Returns false when the point is outside the display. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor", meta = (DeprecatedFunction, DeprecationMessage = "Use RequestSetCursorFromDisplayPosition and OnRadarCommandResult for UI input."))
-	bool SetTDCCursorFromWidgetPosition(const FVector2D& WidgetPosition, const FRadarDisplayProjection& Projection);
-
-	UFUNCTION(BlueprintPure, Category = "Display Projection|Target Cursor")
-	FRadarCursorState GetTDCCursorState() const;
-
-	UFUNCTION(BlueprintPure, Category = "Display Projection|Target Cursor", meta = (DeprecatedFunction, DeprecationMessage = "Use TryGetTDCCursorWorldLocation to handle a disabled cursor."))
-	FVector GetTDCCursorWorldLocation() const;
-
-	/** Returns false and a zero point when the TDC is disabled. */
-	UFUNCTION(BlueprintPure, Category = "Display Projection|Target Cursor")
-	bool TryGetTDCCursorWorldLocation(FVector& OutWorldLocation) const;
-
-	/** Returns normalized (X: 0..1, Y: 0..1) TDC cursor coordinates for MFD screen space rendering */
-	UFUNCTION(BlueprintPure, Category = "Display Projection|Target Cursor", meta = (DeprecatedFunction, DeprecationMessage = "Project GetTDCCursorState.WorldLocation with ProjectWorldToDisplay."))
-	FVector2D GetTDCCursorScreenPosition() const;
-
-	/** Designates track under cursor (Bugs an unbugged track, or locks a bugged track to STT; traditionally Stick TMS Up / TDC Depress) */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor", meta = (DeprecatedFunction, DeprecationMessage = "Use RequestDesignateUnderDisplayCursor."))
-	bool DesignateTrackUnderCursor(float AzimuthGateDegrees = 6.0f, float RangeGatePercent = 0.15f);
-
-	/** Selection in normalized display space, with the same projection used by tracks and cursor. */
-	UFUNCTION(BlueprintCallable, Category = "Display Projection|Target Cursor")
-	bool DesignateTrackUnderCursorInDisplay(ERadarDisplayGeometry Geometry, float NormalizedGate = 0.04f);
-
-	/** Last measured position plus bounded dead-reckoning, without consulting the live actor. */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	bool GetTrackDisplayWorldPosition(int32 TrackID, FVector& OutWorldPosition) const;
-
-	/** Server-only authorization for crew on this radar platform. */
+	// ========================================================================
+	// Multi-Crew Authorization
+	// ========================================================================
+
+	/** Grants radar control access to a crew member's player controller. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Multiplayer")
 	bool GrantRadarAccess(APlayerController* Controller);
 
+	/** Revokes radar control access from a player controller. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Multiplayer")
 	void RevokeRadarAccess(APlayerController* Controller);
 
+	/** Sets the currently active operator controlling radar inputs and cursor. */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Radar|Multiplayer")
 	bool SetActiveRadarOperator(APlayerController* Controller);
 
-	/** Local owner-only channel, or null when the local player lacks radar access. */
+	/** Returns the local player's operator link channel (or null if unauthorized). */
 	UFUNCTION(BlueprintPure, Category = "Radar|Multiplayer")
 	ARadarOperatorLink* GetLocalOperatorLink() const { return LocalOperatorLink.Get(); }
 
-	// Called by the owner-only link after a coherent replicated snapshot is available.
 	void RegisterLocalOperatorLink(ARadarOperatorLink* Link);
 	void UnregisterLocalOperatorLink(ARadarOperatorLink* Link);
 	void ApplyOperatorSnapshot(const FRadarOperatorSnapshot& Snapshot);
 	void ApplyOperatorEvent(const FRadarOperatorEvent& Event);
 	bool IsAuthorizedOperatorLink(const ARadarOperatorLink* Link) const;
+
 	bool ExecuteOperatorCommand(ERadarCommandType Command, int32 IntValue, float ValueA, float ValueB,
 		const FVector& WorldValue, const FRadarCursorState& Cursor, ERadarDisplayGeometry Geometry,
 		int32& OutTrackID, int32 ViewRevision = -1);
 
-	/** Clears target designation or breaks active STT lock (traditionally Stick TMS Down / Undesignate) */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Target Selection")
-	void UndesignateTarget();
-
-	/** Cycles target designation sequentially between active tracks (traditionally Stick TMS Right / Target Step) */
-	UFUNCTION(BlueprintCallable, Category = "Radar|Target Selection")
-	bool CycleTargetDesignation(bool bForward = true);
-
-	/** Converts a track's position to normalized B-scope MFD screen coordinates: X (-1..+1), Y (0..1) */
-	UFUNCTION(BlueprintPure, Category = "Display Projection", meta = (DeprecatedFunction, DeprecationMessage = "Project FRadarTrack.LastKnownPosition with ProjectWorldToDisplay."))
-	bool GetTrackBScopePosition(int32 TrackID, FVector2D& OutScreenPos) const;
-
-	/** Computes target aspect angle in degrees (-180..+180, 0 = pure tail-on, 180 = pure head-on) for display heading vectors */
-	UFUNCTION(BlueprintPure, Category = "Radar|Display")
-	float GetTrackAspectAngle(int32 TrackID) const;
-
-	/**
-	 * Calculates the horizontal ground-track compass heading (0-360 degrees) from a velocity vector.
-	 * If horizontal speed is below MinSpeedCmPerSec, returns FallbackHeading to prevent noise on stationary targets.
-	 *
-	 * @param InVelocity Velocity vector in world coordinates
-	 * @param FallbackHeading Heading in degrees (0-360) to maintain if target is stationary
-	 * @param MinSpeedCmPerSec Minimum horizontal speed threshold in cm/s (default 100 cm/s = 1 m/s)
-	 * @return Compass heading in degrees [0.0, 360.0)
-	 */
-	UFUNCTION(BlueprintPure, Category = "Radar|Kinematics")
-	static float CalculateHeadingFromVelocity(const FVector& InVelocity, float FallbackHeading = 0.0f, float MinSpeedCmPerSec = 100.0f);
-
-	/** Returns all active radar tracks */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	const TArray<FRadarTrack>& GetAllTracks() const { return Tracks; }
-
-	/** Returns tracks filtered by status */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	void GetTracksByStatus(ERadarTrackStatus InStatus, TArray<FRadarTrack>& OutTracks) const;
-
-	/** Retrieves a specific track by ID */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	bool GetTrackByID(int32 TrackID, FRadarTrack& OutTrack) const;
-
-	/** Retrieves a track associated with a specific target actor */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	bool GetTrackByActor(const AActor* TargetActor, FRadarTrack& OutTrack) const;
-
-	/** Returns the actor of the closest contact */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	AActor* GetClosestContact() const;
-
-	/** Returns the bearing to a specific track in degrees */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	float GetBearingToTrack(int32 TrackID) const;
-
-	/** Returns the range to a specific track in cm */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	float GetRangeToTrack(int32 TrackID) const;
-
-	/** Returns the closure rate to a specific track in cm/s */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	float GetClosureRateToTrack(int32 TrackID) const;
-
-	/** Returns the total number of active tracks */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	FORCEINLINE int32 GetContactCount() const { return Tracks.Num(); }
-
-	/** Returns the track that is the highest threat (closest, fastest closing) */
-	UFUNCTION(BlueprintPure, Category = "Radar|Tracks")
-	bool GetHighestThreatTrack(FRadarTrack& OutTrack) const;
+	// Physics / Radar equation helpers
+	float CalculateDetectionRange(float TargetRCS) const;
+	float ResolveTargetRCS(const AActor* Candidate, bool& bOutFoundTag, FString& OutParsedTag) const;
+	float CalculateEffectiveRCS(float BaseRCS, const AActor* TargetActor, const FVector& TargetToRadar) const;
+	float CalculateAntennaBeamGain(const FVector& TargetPosition) const;
+	float CalculateSignalStrength(float Range, float EffectiveRCS, float BeamGain) const;
+	ERadarTargetDomain ResolveCandidateDomain(const AActor* Candidate) const;
+	bool IsDomainAllowedForMode(ERadarTargetDomain Domain, ERadarOperatingMode Mode) const;
 
 protected:
+	virtual void PostLoad() override;
 	virtual void BeginPlay() override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
+	UFUNCTION() void OnRep_RadarMode();
+	UFUNCTION() void OnRep_CurrentDisplayRange();
+	UFUNCTION() void OnRep_TeamID();
+	UFUNCTION() void OnRep_SquawkCode();
+
 	// Scan & Detection
-	/** Advances antenna azimuth, sweeps elevation bars, and optionally broadcasts HUD progress and cycle events */
-	void AdvanceAntennaSweep(float DeltaTime, bool bBroadcastEvents = true);
+	void AdvanceAntennaSweep(float DeltaTime);
+	FRadarBeamSample MakeBeamSample(float Azimuth, float Elevation, float SweepAzimuth = 0.0f, float SweepElevation = 0.0f) const;
+	void SamplePhysicalPlateBeam(bool bIncludeMotion);
+	bool UsesPhysicalPlateBeam() const { return ScanDrive == ERadarScanDrive::MSA && !bVirtuallySweepBeam; }
+	bool IsWithinAntennaGimbal(float Bearing, float Elevation, float Margin = 1.0f) const;
+	float CalculatePlateGain(const FVector& LocalTargetDir) const;
 	void EmitScanProgress(int32 Bar, float BarLevel, float SweepLevel, bool bMovingRight);
-
-	/** Gathers candidate actors within Range of Origin using spatial subsystem and bounded physics queries */
 	void GatherCandidateActors(const FVector& Origin, float Range, TArray<AActor*>& OutCandidates) const;
-
-	/** Flushes cached scene/mesh socket components so they are re-resolved on next query */
 	void InvalidateSocketCaches();
-
-	/** Advances the antenna sweep position and performs detection for the current beam position */
 	void PerformScanSweep(float DeltaTime);
-
-	/** Performs the radar detection model against a candidate actor at the current beam position, populating OutRejectReason if rejected */
 	bool EvaluateCandidate(AActor* Candidate, FRadarTrack& OutTrack, FString* OutRejectReason = nullptr) const;
-
-	/** Checks if candidate satisfies DetectableActorTags (checking both actor and component tags) */
 	bool CheckCandidateTags(const AActor* Candidate, FString* OutFoundTags = nullptr) const;
-
-	/** Classifies a tracked actor's IFF using IGenericTeamAgentInterface on the radar's owner */
 	ERadarIFFResult ClassifyIFF(const AActor* TargetActor) const;
-
-	/** Renders debug visualization for the scan volume and sweeping antenna beam */
 	void DrawDebugScanVolume() const;
 
 	// Track Management
-	/** Updates all existing track files with new data and prunes stale tracks */
 	void UpdateTrackFiles(float DeltaTime);
-
-	/** Creates a new track file from a raw detection */
 	int32 CreateTrack(AActor* DetectedActor, const FRadarTrack& RawDetection);
-
-	/** Updates an existing track with a new detection */
 	void UpdateTrack(int32 TrackIndex, const FRadarTrack& NewDetection);
-
-	/** Removes stale tracks that have exceeded the timeout */
 	void PruneStaleTracks(float DeltaTime);
-
-	/** Performs STT dedicated tracking on the locked target */
 	void PerformSTTTracking();
-
-	/** Performs ACM auto-acquisition scan */
 	void PerformACMAcquisition();
-
-	/** Performs Spotlight SAR ground-stared tracking, squint Doppler integration, and GMTI detection */
 	void PerformSpotlightTracking(float DeltaTime);
-
-	/** Resolves the initial ground intersect point via line trace forward/downward along radar waterline */
 	bool ResolveAutoGroundIntersect(FVector& OutGroundLocation) const;
-
-	/** Calculates bearing and elevation from radar to a world position */
 	void ComputeBearingElevation(const FVector& TargetPosition, float& OutBearing, float& OutElevation) const;
-
-	/** Smooths velocity estimate for a track (simple exponential filter) */
 	FVector SmoothVelocity(const FVector& OldVelocity, const FVector& NewVelocity, float Alpha) const;
-
-	/** Renders debug visualization for all tracks */
 	void DrawDebugTracks() const;
 
 #if WITH_EDITOR
+	virtual void PreEditChange(FProperty* PropertyAboutToChange) override;
 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+	TOptional<float> DisplayRangeBeforeEdit;
 #endif
 
-	/** All active radar track files */
-	UPROPERTY(Transient)
-	TArray<FRadarTrack> Tracks;
-	UPROPERTY(Transient)
-	TArray<FRadarTrack> LinkedTracks;
+	/** Central unified command execution dispatcher. */
+	bool ExecuteOrSubmitCommand(ERadarCommandType Command, int32 IntValue = 0, float ValueA = 0.0f,
+		float ValueB = 0.0f, const FVector& WorldValue = FVector::ZeroVector,
+		const FRadarCursorState& Cursor = FRadarCursorState(),
+		ERadarDisplayGeometry Geometry = ERadarDisplayGeometry::BScope,
+		bool bAuthoritative = true, APlayerController* Controller = nullptr);
+
+	// Authoritative execution helpers (run on server / standalone)
+	bool ExecuteAuthoritativeSetRadarMode(ERadarOperatingMode NewMode);
+	bool ExecuteAuthoritativeSetDisplayRange(float NewRangeCm);
+	bool ExecuteAuthoritativeCycleRangeScale(bool bIncrease = true);
+	bool ExecuteAuthoritativeSetACMSubMode(ERadarACMSubMode NewSubMode);
+	bool ExecuteAuthoritativeSetScanVolume(float InAzimuthWidth, float InElevationHeight, int32 InBars);
+	bool ExecuteAuthoritativeApplyScanSizePreset(ERadarScanSize Preset);
+	bool ExecuteAuthoritativeOffsetScanCenter(float AzimuthDelta, float ElevationDelta);
+	bool ExecuteAuthoritativeDesignateSpotlightPoint(const FVector& WorldLocation);
+	bool ExecuteAuthoritativeDesignateSpotlightActor(AActor* Actor);
+	bool ExecuteAuthoritativeClearSpotlightTarget();
+	bool ExecuteAuthoritativeSetHelmetLookDirection(const FVector& WorldDirection);
+	bool ExecuteAuthoritativeLockTrack(int32 TrackID);
+	bool ExecuteAuthoritativeBugTrack(int32 TrackID);
+	bool ExecuteAuthoritativeBreakLock();
+	bool ExecuteAuthoritativeClearBugTrack();
+	bool ExecuteAuthoritativeMoveTDCCursor(FVector2D DeltaAxis);
+	bool ExecuteAuthoritativeDesignateUnderCursor();
+	bool ExecuteAuthoritativeDesignateLinkedTrack(int32 TrackID);
+
+	// Internal state
+	UPROPERTY(Transient) TArray<FRadarTrack> Tracks;
+	UPROPERTY(Transient) TArray<FRadarTrack> LinkedTracks;
 	TMap<int32, TWeakObjectPtr<UAircraftRadarComponent>> LinkedTrackSources;
 	int32 DataLinkParticipantID = 0;
 	int32 NextLinkedTrackID = -2;
@@ -1531,70 +1636,37 @@ protected:
 	int32 AssignContactID(AActor* Actor);
 	bool GetBestTrackForContact(int32 ContactID, FRadarTrack& OutTrack) const;
 	void RefreshCorrelatedSelection();
-	float LastDataLinkReceptionTime = -1000000.0f;
+	float LastDataLinkReceptionTime = -1.0f;
 	bool bDataLinkTransmitInhibited = false;
 	bool bDataLinkReceiveInhibited = false;
 	bool bClientDataLinkConnected = false;
-	void PruneLinkedTracks(float WorldTime);
+	void PruneLinkedTracks(float DeltaTime);
 
-	/** Current antenna azimuth position in degrees relative to aircraft nose */
-	UPROPERTY(Transient)
-	float CurrentScanAzimuth = 0.0f;
+	// Cached scan frame revisit time
+	float CachedScanFrameTime = 5.0f;
+	void RecalculateScanFrameTime();
 
-	/** Current elevation bar being scanned (0-indexed) */
-	UPROPERTY(Transient)
-	int32 CurrentScanBar = 0;
-
-	/** Scan direction: true = sweeping right, false = sweeping left */
-	UPROPERTY(Transient)
-	bool bScanningRight = true;
+	UPROPERTY(Transient) float CurrentScanAzimuth = 0.0f;
+	UPROPERTY(Transient) float CurrentScanElevation = 0.0f;
+	UPROPERTY(Transient) int32 CurrentScanBar = 0;
+	UPROPERTY(Transient) bool bScanningRight = true;
 	float ScanBarLevel = 0.0f;
 	float ScanSweepLevel = 0.0f;
 	uint32 ScanProgressRevision = 0;
 
-	/** Track ID of the current STT locked target (-1 = no lock) */
-	UPROPERTY(Transient)
-	int32 STTLockedTrackID = -1;
+	UPROPERTY(Transient) int32 STTLockedTrackID = -1;
+	UPROPERTY(Transient) TObjectPtr<AActor> STTLockedActor = nullptr;
+	UPROPERTY(Transient) int32 BuggedTrackID = -1;
+	UPROPERTY(Transient) ERadarOperatingMode PreSTTMode = ERadarOperatingMode::Search;
+	UPROPERTY(Transient) int32 NextTrackID = 1;
 
-	/** Target actor currently locked in STT mode (replicated to all clients for RWR / threat detection) */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Runtime")
-	TObjectPtr<AActor> STTLockedActor = nullptr;
-
-	/** Track ID of the TWS bugged/priority track (-1 = none) */
-	UPROPERTY(Transient)
-	int32 BuggedTrackID = -1;
-
-	/** The radar mode that was active before entering STT (for BreakLock restoration) */
-	UPROPERTY(Transient)
-	ERadarOperatingMode PreSTTMode = ERadarOperatingMode::Search;
-
-	/** Monotonically increasing track ID counter */
-	UPROPERTY(Transient)
-	int32 NextTrackID = 1;
-
-	/** Time accumulator for track update interval throttling */
-	UPROPERTY(Transient)
 	float TrackUpdateAccumulator = 0.0f;
-
-	UPROPERTY(Transient)
 	float ScanSampleAccumulator = 0.0f;
-
-	UPROPERTY(Transient)
-	float PreviousSampleAzimuth = 0.0f;
-
-	UPROPERTY(Transient)
-	FVector PreviousSocketLocalForward = FVector::ZeroVector;
-
-	UPROPERTY(Transient)
-	float SocketSweepDegrees = 0.0f; // Signed rotation; oscillation does not count as a full revolution.
-
-	UPROPERTY(Transient)
+	FQuat PreviousPlateRelativeRotation = FQuat::Identity;
+	bool bHasPreviousPlateSample = false;
 	int32 ElectronicBeamIndex = 0;
 
-	/** Local azimuth/elevation centers covered by the latest scan sample. */
-	TArray<FVector2D> ActiveSampleBeams;
-	float SampleSweepAzHalf = 0.0f;
-	float SampleSweepElHalf = 0.0f;
+	TArray<FRadarBeamSample> ActiveSampleBeams;
 
 	mutable TArray<TWeakObjectPtr<AActor>> CachedDiscoveryActors;
 	mutable float LastCandidateDiscoveryTime = -1000.0f;
@@ -1603,32 +1675,17 @@ protected:
 	float LastCandidateDebugTime = -1000.0f;
 	float LastRadarDebugTime = -1000.0f;
 
-	UPROPERTY(Transient)
-	TArray<TObjectPtr<ARadarOperatorLink>> OperatorLinks;
+	UPROPERTY(Transient) TArray<TObjectPtr<ARadarOperatorLink>> OperatorLinks;
+	UPROPERTY(Transient) TWeakObjectPtr<APlayerController> ActiveRadarOperator;
+	UPROPERTY(Transient) TWeakObjectPtr<APlayerController> AutoAuthorizedController;
+	UPROPERTY(Transient) TWeakObjectPtr<ARadarOperatorLink> LocalOperatorLink;
 
-	UPROPERTY(Transient)
-	TWeakObjectPtr<APlayerController> ActiveRadarOperator;
-
-	UPROPERTY(Transient)
-	TWeakObjectPtr<APlayerController> AutoAuthorizedController;
-
-	UPROPERTY(Transient)
-	TWeakObjectPtr<ARadarOperatorLink> LocalOperatorLink;
-
-	UPROPERTY(Transient)
 	float OperatorSnapshotAccumulator = 0.0f;
-
-	UPROPERTY(Transient)
 	int32 OperatorSnapshotRevision = 0;
-	UPROPERTY(Transient)
 	int32 DisplayViewRevision = 1;
 	int32 OperatorEventSequence = 0;
 	int32 LastAppliedOperatorEventSequence = 0;
-
-	UPROPERTY(Transient)
 	int32 ScanSweepCounter = 0;
-
-	UPROPERTY(Transient)
 	int32 SARImageRevision = 0;
 
 	bool bHasAppliedOperatorSnapshot = false;
@@ -1642,138 +1699,70 @@ protected:
 		bool bSuccess = false, const FRadarTrack* Track = nullptr,
 		const FVector& Location = FVector::ZeroVector);
 	bool IsCursorWithinLimits(const FRadarCursorState& Cursor) const;
-	bool SetDisplayWindowAuthoritative(ERadarDisplayGeometry Geometry, const FRadarDisplayWindow& Window);
+
 	bool SetCursorFromDisplayPoint(const FVector2D& WidgetPosition, const FVector2D& WidgetSize);
 	bool ResolveDisplayPointToCursor(const FVector2D& WidgetPosition,
 		const FRadarDisplayProjection& Projection, FRadarCursorState& OutCursor) const;
-	int32 SubmitControlRequest(ERadarCommandType Command, int32 IntValue = 0, float ValueA = 0.0f,
-		float ValueB = 0.0f, const FVector& WorldValue = FVector::ZeroVector,
-		const FRadarCursorState& Cursor = FRadarCursorState(),
-		ERadarDisplayGeometry Geometry = ERadarDisplayGeometry::BScope,
-		APlayerController* RequestingController = nullptr);
 
-	/** Designated ground coordinate in world space for Spotlight SAR */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
+	// Target designator cursor coordinates (transient runtime state)
+	float TDCCursorAzimuth = 0.0f;
+	float TDCCursorElevation = 0.0f;
+	float TDCCursorRange = 3704000.0f;
+
 	FVector SpotlightTargetLocation = FVector::ZeroVector;
-
-	/** True if a ground point is currently active and locked */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
 	bool bHasSpotlightPoint = false;
-
-	/** Current SAR dwell integration progress [0.0, 1.0] */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
 	float SpotlightDwellProgress = 0.0f;
-
-	/** Current squint angle in degrees between aircraft velocity and line of sight to ground point */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
 	float SpotlightSquintAngle = 0.0f;
-
-	/** True if aircraft velocity vector points too close to ground target (zero Doppler gradient) */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
 	bool bSpotlightInBlindCone = false;
-
-	/** True if ground target is outside the radar antenna gimbal limits */
-	UPROPERTY(Transient, BlueprintReadOnly, Category = "Radar|Spotlight SAR")
 	bool bSpotlightGimbalExceeded = false;
-
-	/** Optional tracked actor locked as ground target */
-	UPROPERTY(Transient)
 	TWeakObjectPtr<AActor> SpotlightTrackedActor = nullptr;
-
-	/** Internal dwell accumulator in seconds */
-	UPROPERTY(Transient)
 	float SpotlightDwellAccumulator = 0.0f;
-
-	/** Current helmet look direction in world coordinates */
-	UPROPERTY(Transient)
 	FVector HelmetLookDirection = FVector::ZeroVector;
 
 private:
-	/** Finds the array index for a given TrackID. Returns INDEX_NONE if not found. */
 	FORCEINLINE int32 FindTrackIndex(int32 TrackID) const
 	{
 		for (int32 i = 0; i < Tracks.Num(); ++i)
 		{
-			if (Tracks[i].TrackID == TrackID)
-			{
-				return i;
-			}
+			if (Tracks[i].TrackID == TrackID) return i;
 		}
 		return INDEX_NONE;
 	}
 
-	/** Finds the array index for a given TrackedActor. Returns INDEX_NONE if not found. */
 	FORCEINLINE int32 FindTrackIndexByActor(const AActor* InActor) const
 	{
-		if (!InActor)
-		{
-			return INDEX_NONE;
-		}
-
+		if (!InActor) return INDEX_NONE;
 		for (int32 i = 0; i < Tracks.Num(); ++i)
 		{
-			if (Tracks[i].TrackedActor.Get() == InActor)
-			{
-				return i;
-			}
+			if (Tracks[i].TrackedActor.Get() == InActor) return i;
 		}
 		return INDEX_NONE;
 	}
 
-	/** Cached scene or mesh component containing the radar socket to avoid per-frame component searches */
-	UPROPERTY(Transient)
-	mutable TWeakObjectPtr<USceneComponent> CachedRadarSocketComponent = nullptr;
-
-	/** Flag indicating whether the radar antenna socket resolution has been performed */
+	UPROPERTY(Transient) mutable TWeakObjectPtr<USceneComponent> CachedRadarSocketComponent = nullptr;
 	mutable bool bRadarSocketResolved = false;
 
-	/** Cached scene or mesh component containing the radar altimeter socket to avoid per-frame component searches */
-	UPROPERTY(Transient)
-	mutable TWeakObjectPtr<USceneComponent> CachedAltimeterSocketComponent = nullptr;
-
-	/** Flag indicating whether the radar altimeter socket resolution has been performed */
+	UPROPERTY(Transient) mutable TWeakObjectPtr<USceneComponent> CachedAltimeterSocketComponent = nullptr;
 	mutable bool bAltimeterSocketResolved = false;
 
-	/** World-space location of the radar altimeter antenna source */
 	FVector GetRadarAltimeterLocation() const;
-
-	/** World-space orientation of the radar altimeter antenna source */
 	FRotator GetRadarAltimeterRotation() const;
-
-	/** Performs the radar altimeter line trace and updates cached altitude and validity */
 	void UpdateRadarAltimeter(float DeltaTime);
 
-	/** Cached radar altitude in cm from the most recent altimeter measurement */
-	UPROPERTY(Transient)
 	float CachedRadarAltitude = 0.0f;
-
-	/** True if the radar altimeter currently has a valid ground return within limits */
-	UPROPERTY(Transient)
 	bool bIsRadarAltitudeValid = false;
-
-	/** Time accumulator for altimeter update throttling */
-	UPROPERTY(Transient)
 	float AltimeterUpdateAccumulator = 0.0f;
 
-	/** In-flight missiles relying on this radar for SARH illumination or command guidance */
-	UPROPERTY(Transient)
-	TArray<TWeakObjectPtr<URadarMissileGuidanceComponent>> ActiveGuidingMissiles;
+	UPROPERTY(Transient) TArray<TWeakObjectPtr<URadarMissileGuidanceComponent>> ActiveGuidingMissiles;
 	struct FLaunchedMissileEntry
 	{
 		TWeakObjectPtr<URadarMissileGuidanceComponent> Missile;
 		int32 ID = 0;
 	};
-	/** Server-owned weak registry; missiles remain listed after switching guidance source. */
 	TArray<FLaunchedMissileEntry> LaunchedRadarMissiles;
 	int32 NextLaunchedMissileID = 1;
-	UPROPERTY(Transient)
-	TArray<FRadarLaunchedMissileStatus> ClientLaunchedRadarMissiles;
+	UPROPERTY(Transient) TArray<FRadarLaunchedMissileStatus> ClientLaunchedRadarMissiles;
 
-	/** Manual CW illumination target (for SAM sites / AI script control) */
-	UPROPERTY(Transient)
-	TWeakObjectPtr<AActor> ManualCWTargetActor = nullptr;
-
-	/** Whether manual CW illumination is currently enabled */
-	UPROPERTY(Transient)
+	UPROPERTY(Transient) TWeakObjectPtr<AActor> ManualCWTargetActor = nullptr;
 	bool bManualCWIlluminating = false;
 };

@@ -1,16 +1,43 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftDataLinkSubsystem.h"
 #include "AircraftRadarComponent.h"
+#include "AircraftCombatSettings.h"
 #include "CombatTeamUtility.h"
 #include "IFFTransponderComponent.h"
 #include "Engine/World.h"
 #include "CollisionQueryParams.h"
 #include "Stats/Stats.h"
+
+void UAircraftDataLinkSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+
+	if (const UAircraftCombatSettings* Settings = UAircraftCombatSettings::Get())
+	{
+		TransmissionInterval = FMath::Max(0.05f, Settings->DefaultTransmissionInterval);
+		ReportsPerWindow = FMath::Max(1, Settings->DefaultReportsPerWindow);
+		MaxRelayHops = FMath::Max(0, Settings->DefaultMaxRelayHops);
+	}
+}
+
+void UAircraftDataLinkSubsystem::SetTransmissionInterval(float InInterval)
+{
+	TransmissionInterval = FMath::Max(0.05f, InInterval);
+}
+
+void UAircraftDataLinkSubsystem::SetReportsPerWindow(int32 InReports)
+{
+	ReportsPerWindow = FMath::Max(1, InReports);
+}
+
+void UAircraftDataLinkSubsystem::SetMaxRelayHops(int32 InHops)
+{
+	MaxRelayHops = FMath::Max(0, InHops);
+}
 
 void UAircraftDataLinkSubsystem::RegisterRadar(UAircraftRadarComponent* Radar)
 {
@@ -48,10 +75,22 @@ void UAircraftDataLinkSubsystem::Tick(float DeltaTime)
 {
 	UWorld* World = GetWorld();
 	if (!World || World->GetNetMode() == NM_Client) return;
-	Participants.RemoveAll([](const TWeakObjectPtr<UAircraftRadarComponent>& Entry) { return !Entry.IsValid(); });
+
+	// Early exit when insufficient participants exist to communicate
+	if (Participants.Num() < 2)
+	{
+		TransmissionAccumulator = 0.0f;
+		return;
+	}
+
 	TransmissionAccumulator += DeltaTime;
-	if (TransmissionAccumulator < FMath::Max(0.1f, TransmissionInterval)) return;
-	TransmissionAccumulator = FMath::Fmod(TransmissionAccumulator, FMath::Max(0.1f, TransmissionInterval));
+	const float EffectiveInterval = FMath::Max(0.05f, TransmissionInterval);
+	if (TransmissionAccumulator < EffectiveInterval) return;
+	TransmissionAccumulator = FMath::Fmod(TransmissionAccumulator, EffectiveInterval);
+
+	Participants.RemoveAll([](const TWeakObjectPtr<UAircraftRadarComponent>& Entry) { return !Entry.IsValid(); });
+	if (Participants.Num() < 2) return;
+
 	TransmitWindow(World->GetTimeSeconds());
 }
 

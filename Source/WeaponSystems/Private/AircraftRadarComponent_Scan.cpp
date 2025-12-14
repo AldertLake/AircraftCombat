@@ -1,8 +1,8 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
+
 //
 // AircraftRadarComponent_Scan.cpp — Antenna sweep simulation, radar detection model, and candidate evaluation
 //
@@ -20,6 +20,55 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogAircraftRadarScan, Log, All);
 
+FVector2D FRadarBeamSample::GetTargetAngles(const FVector& Position) const
+{
+	const FRotator Look = PlateRotation.UnrotateVector(Position - Origin).Rotation();
+	return FVector2D(Look.Yaw, Look.Pitch);
+}
+
+bool FRadarBeamSample::Contains(const FVector& Position) const
+{
+	const FVector2D Look = GetTargetAngles(Position);
+	return FMath::Abs(FMath::FindDeltaAngleDegrees(Angles.X, Look.X)) <= HalfWidths.X + SweepHalfWidths.X &&
+		FMath::Abs(Look.Y - Angles.Y) <= HalfWidths.Y + SweepHalfWidths.Y;
+}
+
+float FRadarBeamSample::GetGain(const FVector& Position) const
+{
+	if (!Contains(Position)) return 0.0f;
+	const FVector2D Look = GetTargetAngles(Position);
+	const float Az = FMath::Max(0.0f, FMath::Abs(FMath::FindDeltaAngleDegrees(Angles.X, Look.X)) - SweepHalfWidths.X) / HalfWidths.X;
+	const float El = FMath::Max(0.0f, FMath::Abs(Look.Y - Angles.Y) - SweepHalfWidths.Y) / HalfWidths.Y;
+	return FMath::Exp(-0.69314718f * (Az * Az + El * El));
+}
+
+FRadarBeamSample UAircraftRadarComponent::MakeBeamSample(float Azimuth, float Elevation, float SweepAzimuth, float SweepElevation) const
+{
+	FRadarBeamSample Beam;
+	GetRadarSourceTransform(Beam.Origin, Beam.PlateRotation);
+	Beam.Angles = FVector2D(Azimuth, Elevation);
+	Beam.HalfWidths = FVector2D(FMath::Max(0.5f, BeamAzimuthWidth * 0.5f), FMath::Max(0.5f, BeamElevationWidth * 0.5f));
+	Beam.SweepHalfWidths = FVector2D(SweepAzimuth, SweepElevation);
+	return Beam;
+}
+
+void UAircraftRadarComponent::SamplePhysicalPlateBeam(bool bIncludeMotion)
+{
+	FRadarBeamSample Beam = MakeBeamSample(0.0f, 0.0f);
+	const FQuat PlatformRotation = GetOwner() ? GetOwner()->GetActorQuat() : FQuat::Identity;
+	if (bIncludeMotion && bHasPreviousPlateSample)
+	{
+		// Carry the previous plate pose with the aircraft to avoid smearing the beam during aircraft maneuvers.
+		const FVector PreviousForward = (PlatformRotation * PreviousPlateRelativeRotation).GetForwardVector();
+		const FRotator PreviousLook = Beam.PlateRotation.UnrotateVector(PreviousForward).Rotation();
+		Beam.Angles = FVector2D(PreviousLook.Yaw * 0.5f, PreviousLook.Pitch * 0.5f);
+		Beam.SweepHalfWidths = FVector2D(FMath::Abs(PreviousLook.Yaw) * 0.5f, FMath::Abs(PreviousLook.Pitch) * 0.5f);
+	}
+	PreviousPlateRelativeRotation = PlatformRotation.Inverse() * Beam.PlateRotation.Quaternion();
+	bHasPreviousPlateSample = true;
+	ActiveSampleBeams.Add(Beam);
+}
+
 void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 {
 	UWorld* World = GetWorld();
@@ -29,76 +78,34 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 		return;
 	}
 
-	const ERadarScanDrive Drive = ScanDrive;
-	const FVector RadarPosition = GetRadarLocation();
 	ActiveSampleBeams.Reset();
-	SampleSweepAzHalf = 0.0f;
-	SampleSweepElHalf = 0.0f;
-	float EffectiveBeamAzHalf = FMath::Max(0.5f, BeamAzimuthWidth * 0.5f);
-	float EffectiveBeamElHalf = FMath::Max(0.5f, BeamElevationWidth * 0.5f);
-
-	if (Drive == ERadarScanDrive::SocketDriven)
+	if (ScanDrive == ERadarScanDrive::MSA)
 	{
-		FVector SourceLocation, ReferenceLocation;
-		FRotator SourceRotation, ReferenceRotation;
-		GetRadarSourceTransform(SourceLocation, SourceRotation);
-		GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
-		const FVector CurrentLocalForward = ReferenceRotation.UnrotateVector(SourceRotation.Vector());
-		const FRotator CurrentLocal = CurrentLocalForward.Rotation();
-		const FRotator PreviousLocal = PreviousSocketLocalForward.IsNearlyZero()
-			? CurrentLocal : PreviousSocketLocalForward.Rotation();
-		const float SweptAz = FMath::FindDeltaAngleDegrees(PreviousLocal.Yaw, CurrentLocal.Yaw);
-		const float SweptEl = CurrentLocal.Pitch - PreviousLocal.Pitch;
-		ActiveSampleBeams.Add(FVector2D(PreviousLocal.Yaw + SweptAz * 0.5f,
-			PreviousLocal.Pitch + SweptEl * 0.5f));
-		EffectiveBeamAzHalf += FMath::Abs(SweptAz) * 0.5f;
-		EffectiveBeamElHalf += FMath::Abs(SweptEl) * 0.5f;
-		SampleSweepAzHalf = FMath::Abs(SweptAz) * 0.5f;
-		SampleSweepElHalf = FMath::Abs(SweptEl) * 0.5f;
-		PreviousSocketLocalForward = CurrentLocalForward;
-		SocketSweepDegrees += SweptAz;
-		if (FMath::Abs(SocketSweepDegrees) >= 360.0f)
+		if (UsesPhysicalPlateBeam()) SamplePhysicalPlateBeam(true);
+		else
 		{
-			SocketSweepDegrees = FMath::Fmod(SocketSweepDegrees, 360.0f);
-			++ScanSweepCounter;
-			OnScanSweepComplete.Broadcast();
+			bHasPreviousPlateSample = false;
+			AdvanceAntennaSweep(DeltaTime);
 		}
-		CurrentScanAzimuth = CurrentLocal.Yaw;
-		CurrentScanBar = 0;
-		EmitScanProgress(0, 0.5f, FMath::Abs(SocketSweepDegrees) / 360.0f, SweptAz >= 0.0f);
-	}
-	else if (Drive == ERadarScanDrive::VirtualMechanical && ScanRateDegreesPerSecond > 0.0f)
-	{
-		const float OldAzimuth = CurrentScanAzimuth;
-		AdvanceAntennaSweep(DeltaTime, true);
-		const float SweptAz = FMath::FindDeltaAngleDegrees(OldAzimuth, CurrentScanAzimuth);
-		const float ElevationStep = ElevationBars > 1 ? ElevationScanHeight / (ElevationBars - 1) : 0.0f;
-		const float BarElevation = ElevationBars > 1
-			? ScanCenterElevation - ElevationScanHeight * 0.5f + ElevationStep * CurrentScanBar : ScanCenterElevation;
-		ActiveSampleBeams.Add(FVector2D(OldAzimuth + SweptAz * 0.5f, BarElevation));
-		EffectiveBeamAzHalf += FMath::Abs(SweptAz) * 0.5f;
-		SampleSweepAzHalf = FMath::Abs(SweptAz) * 0.5f;
-		EffectiveBeamElHalf = FMath::Max(EffectiveBeamElHalf, ElevationStep * 0.5f);
 	}
 	else
 	{
-		// PESA visits one beam at a time. AESA visits several independently steered beams per sample.
+		bHasPreviousPlateSample = false;
+		// Electronic beam scheduling is always relative to the live plate, including its roll.
 		const int32 AzCells = FMath::Max(1, FMath::CeilToInt(AzimuthScanWidth / FMath::Max(BeamAzimuthWidth, 1.0f)));
-		const int32 Bars = FMath::Max(1, ElevationBars);
+		const int32 Bars = FMath::Clamp(ElevationBars, 1, 8);
 		const int32 TotalCells = AzCells * Bars;
-		const int32 Visits = Drive == ERadarScanDrive::AESA ? FMath::Clamp(AESABeamsPerSample, 1, 32) : 1;
+		const int32 Visits = ScanDrive == ERadarScanDrive::AESA ? FMath::Clamp(AESABeamsPerSample, 1, 32) : 1;
 		for (int32 Visit = 0; Visit < Visits; ++Visit)
 		{
 			const int32 Cell = ElectronicBeamIndex % TotalCells;
 			const int32 AzCell = Cell % AzCells;
-			const int32 Bar = Cell / AzCells;
-			const float Az = ScanCenterAzimuth - AzimuthScanWidth * 0.5f +
+			CurrentScanBar = Cell / AzCells;
+			CurrentScanAzimuth = ScanCenterAzimuth - AzimuthScanWidth * 0.5f +
 				(AzCell + 0.5f) * AzimuthScanWidth / AzCells;
-			const float El = ScanCenterElevation - ElevationScanHeight * 0.5f +
-				(Bar + 0.5f) * ElevationScanHeight / Bars;
-			ActiveSampleBeams.Add(FVector2D(Az, El));
-			CurrentScanAzimuth = Az;
-			CurrentScanBar = Bar;
+			CurrentScanElevation = ScanCenterElevation - ElevationScanHeight * 0.5f +
+				(CurrentScanBar + 0.5f) * ElevationScanHeight / Bars;
+			ActiveSampleBeams.Add(MakeBeamSample(CurrentScanAzimuth, CurrentScanElevation));
 			ElectronicBeamIndex = (ElectronicBeamIndex + 1) % TotalCells;
 			if (ElectronicBeamIndex == 0)
 			{
@@ -106,12 +113,11 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 				OnScanSweepComplete.Broadcast();
 			}
 		}
-		EffectiveBeamAzHalf = FMath::Max(EffectiveBeamAzHalf, AzimuthScanWidth / (AzCells * 2.0f));
-		EffectiveBeamElHalf = FMath::Max(EffectiveBeamElHalf, ElevationScanHeight / (Bars * 2.0f));
 		EmitScanProgress(CurrentScanBar,
 			FMath::Clamp((CurrentScanAzimuth - ScanCenterAzimuth + AzimuthScanWidth * 0.5f) / FMath::Max(AzimuthScanWidth, 1.0f), 0.0f, 1.0f),
 			static_cast<float>(ElectronicBeamIndex) / TotalCells, true);
 	}
+	const FVector RadarPosition = GetRadarLocation();
 
 	// Search range belongs to the sensor, not to a pilot's display scale.
 	TArray<AActor*> CandidateActors;
@@ -158,14 +164,6 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 			continue;
 		}
 
-		// Domain filtering for active scan mode (Air, Ground, Sea)
-		const ERadarTargetDomain CandidateDomain = ResolveCandidateDomain(Candidate);
-		if (!IsDomainAllowedForMode(CandidateDomain, RadarMode))
-		{
-			DebugReject(Candidate, TEXT("Domain filter"));
-			continue;
-		}
-
 		const FVector TargetPosition = Candidate->GetActorLocation();
 
 		// Compute candidate local bearing and elevation relative to radar nose
@@ -176,7 +174,7 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 		// Check total scan volume bounds
 		const float TargetAzDiff = FMath::Abs(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TargetBearing));
 		const float TargetElDiff = FMath::Abs(TargetElevation - ScanCenterElevation);
-		const bool bInScanVolume = Drive == ERadarScanDrive::SocketDriven ||
+		const bool bInScanVolume = UsesPhysicalPlateBeam() ||
 			((AzimuthScanWidth >= 360.0f || TargetAzDiff <= HalfAz) && TargetElDiff <= HalfEl);
 
 		if (!bInScanVolume)
@@ -185,16 +183,8 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 			continue;
 		}
 
-		bool bInSampledBeam = false;
-		for (const FVector2D& Beam : ActiveSampleBeams)
-		{
-			if (FMath::Abs(TargetElevation - Beam.Y) <= EffectiveBeamElHalf &&
-				FMath::Abs(FMath::FindDeltaAngleDegrees(Beam.X, TargetBearing)) <= EffectiveBeamAzHalf)
-			{
-				bInSampledBeam = true;
-				break;
-			}
-		}
+		const bool bInSampledBeam = ActiveSampleBeams.ContainsByPredicate(
+			[&](const FRadarBeamSample& Beam) { return Beam.Contains(TargetPosition); });
 		if (!bInSampledBeam)
 		{
 			DebugReject(Candidate, TEXT("Outside live beam"));
@@ -219,7 +209,7 @@ void UAircraftRadarComponent::PerformScanSweep(float DeltaTime)
 			continue;
 		}
 
-		// TARGET DETECTED! Update or create track file
+		// Update or create track file
 		const int32 ExistingTrackIndex = FindTrackIndexByActor(Candidate);
 		if (ExistingTrackIndex != INDEX_NONE)
 		{
@@ -252,7 +242,7 @@ bool UAircraftRadarComponent::CheckCandidateTags(const AActor* Candidate, FStrin
 		return true; // No filter configured -> all candidates accepted
 	}
 
-	// Fast path: inspect actor tags directly without allocating dynamic arrays
+	// Check actor tags directly
 	for (const FName& RequiredTag : DetectableActorTags)
 	{
 		if (Candidate->ActorHasTag(RequiredTag))
@@ -352,7 +342,7 @@ bool UAircraftRadarComponent::EvaluateCandidate(AActor* Candidate, FRadarTrack& 
 	FString MatchedRCSTag;
 	float TargetRCS = DefaultTargetRCS;
 
-	// Optimization: if target is already known in track files, reuse its cached base RCS to avoid per-frame tag parsing
+	// Reuse cached RCS if track already exists
 	const int32 ExistingTrackIdx = FindTrackIndexByActor(Candidate);
 	if (!bEnableTargetRCSTagParsing)
 	{
@@ -427,13 +417,7 @@ bool UAircraftRadarComponent::EvaluateCandidate(AActor* Candidate, FRadarTrack& 
 	float Bearing, Elevation;
 	ComputeBearingElevation(TargetPosition, Bearing, Elevation);
 
-	// Compute local target direction in antenna coordinate space for beam pattern gain
-	FVector AntennaLoc;
-	FRotator AntennaRot;
-	GetRadarSourceTransform(AntennaLoc, AntennaRot);
-	const FVector LocalTargetDir = AntennaRot.UnrotateVector(ToTarget.GetSafeNormal());
-
-	const float BeamGain = CalculateAntennaBeamGain(Bearing, Elevation, LocalTargetDir);
+	const float BeamGain = CalculateAntennaBeamGain(TargetPosition);
 	if (BeamGain <= KINDA_SMALL_NUMBER || Range > DetectionRange * FMath::Sqrt(BeamGain))
 	{
 		if (OutRejectReason) *OutRejectReason = TEXT("Below beam-adjusted detection threshold");
@@ -543,6 +527,16 @@ bool UAircraftRadarComponent::IsTerrainMasked(const FVector& RadarPosition, cons
 	{
 		*OutHit = HitResult;
 	}
+	const APawn* DebugPawn = Cast<APawn>(OwnerActor);
+	if (bEnableDebugTraces && bDrawAntennaBeam &&
+		(!bDebugOnlyPlayerControlled || !DebugPawn || DebugPawn->IsLocallyControlled()))
+	{
+		// These are the exact collision-query endpoints and hit, rather than a hypothetical target line.
+		const FVector End = bHit && HitResult.bBlockingHit ? HitResult.ImpactPoint : TraceEnd;
+		DrawDebugLine(World, TraceStart, End, bHit ? FColor::Red : FColor::Green, false,
+			FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.0f);
+		if (bHit) DrawDebugPoint(World, End, 12.0f, FColor::Red, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds);
+	}
 
 	if (bHit && HitResult.bBlockingHit)
 	{
@@ -572,11 +566,7 @@ void UAircraftRadarComponent::ComputeBearingElevation(const FVector& TargetPosit
 	GetRadarSourceTransform(RadarPosition, RadarRotation);
 	const FVector ToTarget = TargetPosition - RadarPosition;
 
-	// Bearings remain stable while a mesh-driven socket rotates the live beam.
-	FVector ReferenceLocation;
-	FRotator ReferenceRotation;
-	GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
-	const FVector LocalDir = ReferenceRotation.UnrotateVector(ToTarget.GetSafeNormal());
+	const FVector LocalDir = RadarRotation.UnrotateVector(ToTarget.GetSafeNormal());
 	const FRotator LocalRot = LocalDir.Rotation();
 
 	OutBearing = LocalRot.Yaw;
@@ -586,186 +576,62 @@ void UAircraftRadarComponent::ComputeBearingElevation(const FVector& TargetPosit
 void UAircraftRadarComponent::DrawDebugScanVolume() const
 {
 	UWorld* World = GetWorld();
-	const AActor* OwnerActor = GetOwner();
-	if (!World || !OwnerActor)
-	{
-		return;
-	}
+	if (!World || !GetOwner() || !IsRadarEmitting()) return;
+	FVector Origin;
+	FRotator PlateRotation;
+	GetRadarSourceTransform(Origin, PlateRotation);
+	const float VisualRange = FMath::Min(MaxDetectionRange, 300000.0f);
+	const float Lifetime = FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds;
 
-	FVector RadarPosition;
-	FRotator RadarRotation;
-	GetRadarSourceTransform(RadarPosition, RadarRotation);
-
-	// 1. Air Combat Maneuver (ACM) mode visualization
 	if (RadarMode == ERadarOperatingMode::AirCombatManeuver)
 	{
-		if (!bDrawScanVolume && !bDrawAntennaBeam)
+		// The acquisition envelope is broader than a physical MSA beam.
+		if (bDrawScanVolume || (bDrawAntennaBeam && !UsesPhysicalPlateBeam()))
 		{
-			return;
-		}
-
-		const float DebugDrawDist = FMath::Min(ACMAutoLockRange * 0.3f, 300000.0f);
-
-		if (ACMSubMode == ERadarACMSubMode::VerticalScan)
-		{
-			const float HalfAz = ACMVerticalScanAzimuthWidth * 0.5f;
-			auto MakeSwathPoint = [&](float AzDeg, float ElDeg) -> FVector
+			const float Range = FMath::Min(ACMAutoLockRange, VisualRange);
+			if (ACMSubMode == ERadarACMSubMode::VerticalScan)
 			{
-				const FRotator Rot(ElDeg, AzDeg, 0.0f);
-				const FVector LocalDir = Rot.Vector();
-				return RadarPosition + RadarRotation.RotateVector(LocalDir) * DebugDrawDist;
-			};
-
-			const FVector WorldBL = MakeSwathPoint(-HalfAz, ACMVerticalScanMinElevation);
-			const FVector WorldBR = MakeSwathPoint( HalfAz, ACMVerticalScanMinElevation);
-			const FVector WorldTL = MakeSwathPoint(-HalfAz, ACMVerticalScanMaxElevation);
-			const FVector WorldTR = MakeSwathPoint( HalfAz, ACMVerticalScanMaxElevation);
-
-			const FVector WorldMidMin = MakeSwathPoint(0.0f, ACMVerticalScanMinElevation);
-			const FVector WorldMidMax = MakeSwathPoint(0.0f, ACMVerticalScanMaxElevation);
-
-			const FColor SwathColor = FColor::Orange;
-
-			// 4 boundary corner rays from antenna origin
-			DrawDebugLine(World, RadarPosition, WorldBL, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, RadarPosition, WorldBR, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, RadarPosition, WorldTL, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, RadarPosition, WorldTR, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-
-			// Perimeter frame at distance
-			DrawDebugLine(World, WorldBL, WorldBR, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, WorldBR, WorldTR, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, WorldTR, WorldTL, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-			DrawDebugLine(World, WorldTL, WorldBL, SwathColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
-
-			// Centerline spine along lift vector
-			DrawDebugLine(World, WorldMidMin, WorldMidMax, FColor::Yellow, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.0f);
-
-			// Waterline reference line (0° elevation) if spanned by swath
-			if (ACMVerticalScanMinElevation < 0.0f && ACMVerticalScanMaxElevation > 0.0f)
+				FAircraftCombatDebug::DrawRadarFrustum(World, Origin, PlateRotation,
+					ACMVerticalScanAzimuthWidth, ACMVerticalScanMaxElevation - ACMVerticalScanMinElevation,
+					0.0f, (ACMVerticalScanMaxElevation + ACMVerticalScanMinElevation) * 0.5f, 0, -1, Range, FColor::Orange);
+			}
+			else
 			{
-				const FVector WorldML = MakeSwathPoint(-HalfAz, 0.0f);
-				const FVector WorldMR = MakeSwathPoint( HalfAz, 0.0f);
-				DrawDebugLine(World, WorldML, WorldMR, FColor::Cyan, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.0f);
+				const float HalfAngle = FMath::DegreesToRadians(ACMSubMode == ERadarACMSubMode::SlewAcquisition ? 10.0f : ACMBoresightConeAngle);
+				DrawDebugCone(World, Origin, GetCommandedBeamDirection(), Range, HalfAngle, HalfAngle,
+					16, FColor::Orange, false, Lifetime, 0, 1.5f);
 			}
 		}
-		else
+		if (!UsesPhysicalPlateBeam()) return;
+	}
+	else if (RadarMode == ERadarOperatingMode::Spotlight)
+	{
+		if (bDrawScanVolume && bHasSpotlightPoint)
 		{
-			FVector AcquisitionDirection = RadarRotation.Vector();
-			float ConeHalfAngle = ACMBoresightConeAngle;
-
-			if (ACMSubMode == ERadarACMSubMode::SlewAcquisition)
-			{
-				const FRotator SlewRotator(ScanCenterElevation, ScanCenterAzimuth, 0.0f);
-				AcquisitionDirection = (RadarRotation.Quaternion() * SlewRotator.Quaternion()).GetForwardVector();
-				ConeHalfAngle = 10.0f;
-			}
-			else if (ACMSubMode == ERadarACMSubMode::HelmetCue && !HelmetLookDirection.IsNearlyZero())
-			{
-				AcquisitionDirection = HelmetLookDirection;
-			}
-
-			const float ConeAngleRad = FMath::DegreesToRadians(ConeHalfAngle);
-			DrawDebugCone(World, RadarPosition, AcquisitionDirection, DebugDrawDist, ConeAngleRad, ConeAngleRad, 16, FColor::Orange, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
+			const FColor Color = bSpotlightGimbalExceeded || bSpotlightInBlindCone ? FColor::Red : FColor::Yellow;
+			DrawDebugCircle(World, SpotlightTargetLocation, SpotlightPatchRadius, 32, Color, false,
+				Lifetime, 0, 2.0f, FVector(1, 0, 0), FVector(0, 1, 0), false);
+			DrawDebugCrosshairs(World, SpotlightTargetLocation, FRotator::ZeroRotator, 150.0f, Color, false, Lifetime, 0);
 		}
-		return;
+	}
+	else if (RadarMode != ERadarOperatingMode::SingleTargetTrack && bDrawScanVolume)
+	{
+		FAircraftCombatDebug::DrawRadarFrustum(World, Origin, PlateRotation, AzimuthScanWidth,
+			ElevationScanHeight, ScanCenterAzimuth, ScanCenterElevation, ElevationBars,
+			ScanDrive == ERadarScanDrive::MSA ? CurrentScanBar : -1, VisualRange,
+			FColor(0, 220, 100), ScanDrive != ERadarScanDrive::MSA);
 	}
 
-	// 2. Single Target Track (STT) mode visualization: continuous pencil illumination beam
-	if (RadarMode == ERadarOperatingMode::SingleTargetTrack)
+	if (!bDrawAntennaBeam) return;
+	// Render captured footprints (all AESA visits, including MSA sweep segments), never an invented target ray.
+	for (const FRadarBeamSample& Beam : ActiveSampleBeams)
 	{
-		if (bDrawAntennaBeam && STTLockedTrackID >= 0)
-		{
-			const int32 TrackIdx = FindTrackIndex(STTLockedTrackID);
-			if (TrackIdx != INDEX_NONE && Tracks[TrackIdx].TrackedActor.IsValid())
-			{
-				const FVector TargetLoc = Tracks[TrackIdx].TrackedActor->GetActorLocation();
-				const FVector BeamDir = (TargetLoc - RadarPosition).GetSafeNormal();
-				const float TargetDist = FVector::Dist(RadarPosition, TargetLoc);
-
-				// Draw high-intensity continuous pencil illumination beam to STT target
-				DrawDebugLine(World, RadarPosition, TargetLoc, FColor::Red, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 2.5f);
-				DrawDebugCone(World, RadarPosition, BeamDir, FMath::Min(TargetDist, 300000.0f), FMath::DegreesToRadians(2.0f), FMath::DegreesToRadians(2.0f), 12, FColor::Red, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.0f);
-			}
-		}
-		return;
-	}
-
-	// 3. Spotlight SAR mode visualization: ground stare ray, patch footprint wireframe, and dwell progress
-	if (RadarMode == ERadarOperatingMode::Spotlight)
-	{
-		if (bHasSpotlightPoint)
-		{
-			FColor StareColor = FColor::Yellow;
-			if (bSpotlightGimbalExceeded || bSpotlightInBlindCone)
-			{
-				StareColor = FColor::Red;
-			}
-			else if (SpotlightDwellProgress >= 1.0f)
-			{
-				StareColor = FColor::Green;
-			}
-
-			// Stare beam line from aircraft antenna to ground point
-			DrawDebugLine(World, RadarPosition, SpotlightTargetLocation, StareColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 2.0f);
-
-			// Ground patch footprint circle on terrain
-			DrawDebugCircle(World, SpotlightTargetLocation, SpotlightPatchRadius, 32, StareColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 2.0f, FVector(1, 0, 0), FVector(0, 1, 0), false);
-
-			// Inner dwell synthesis progress circle
-			if (SpotlightDwellProgress > 0.01f)
-			{
-				const float DwellRadius = SpotlightPatchRadius * SpotlightDwellProgress;
-				DrawDebugCircle(World, SpotlightTargetLocation, DwellRadius, 24, FColor::Cyan, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f, FVector(1, 0, 0), FVector(0, 1, 0), false);
-			}
-
-			// Center crosshair marker
-			DrawDebugCrosshairs(World, SpotlightTargetLocation, FRotator::ZeroRotator, 150.0f, StareColor, false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0);
-		}
-		return;
-	}
-
-	// 4. Search / TWS / GM / SS modes: volume frustum and sweeping antenna cone
-	const bool bIsAESA = ScanDrive == ERadarScanDrive::AESA;
-	const float VisRange = FMath::Clamp(CurrentDisplayRange * 0.15f, 20000.0f, 300000.0f);
-	FVector ReferenceLocation;
-	FRotator ReferenceRotation;
-	GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
-
-	if (bDrawScanVolume && ScanDrive != ERadarScanDrive::SocketDriven)
-	{
-		FAircraftCombatDebug::DrawRadarFrustum(
-			World,
-			RadarPosition,
-			ReferenceRotation,
-			AzimuthScanWidth,
-			ElevationScanHeight,
-			ScanCenterAzimuth,
-			ScanCenterElevation,
-			ElevationBars,
-			bIsAESA ? -1 : CurrentScanBar,
-			VisRange
-		);
-	}
-
-	if (bDrawAntennaBeam)
-	{
-		const float ElevationStep = (ElevationBars > 1) ? ElevationScanHeight / static_cast<float>(ElevationBars - 1) : 0.0f;
-		const float CurrentBarElevation = ElevationBars > 1
-			? ScanCenterElevation - (ElevationScanHeight * 0.5f) + (ElevationStep * CurrentScanBar)
-			: ScanCenterElevation;
-
-		FAircraftCombatDebug::DrawAntennaBeam(
-			World,
-			RadarPosition,
-			ScanDrive == ERadarScanDrive::SocketDriven ? RadarRotation : ReferenceRotation,
-			ScanDrive == ERadarScanDrive::SocketDriven ? 0.0f : CurrentScanAzimuth,
-			ScanDrive == ERadarScanDrive::SocketDriven ? 0.0f : CurrentBarElevation,
-			BeamAzimuthWidth * 0.5f,
-			BeamElevationWidth * 0.5f,
-			VisRange,
-			true
-		);
+		FAircraftCombatDebug::DrawRadarFrustum(World, Beam.Origin, Beam.PlateRotation,
+			2.0f * (Beam.HalfWidths.X + Beam.SweepHalfWidths.X),
+			2.0f * (Beam.HalfWidths.Y + Beam.SweepHalfWidths.Y), Beam.Angles.X, Beam.Angles.Y,
+			0, -1, VisualRange, FColor::Cyan);
+		FAircraftCombatDebug::DrawAntennaBeam(World, Beam.Origin, Beam.PlateRotation,
+			Beam.Angles.X, Beam.Angles.Y, Beam.HalfWidths.X, Beam.HalfWidths.Y, VisualRange, false, FColor::Cyan);
 	}
 }
 

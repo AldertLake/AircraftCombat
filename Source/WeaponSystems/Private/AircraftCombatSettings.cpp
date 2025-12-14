@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftCombatSettings.h"
@@ -64,7 +63,7 @@ ERadarTargetDomain UAircraftCombatSettings::ResolveTargetDomain(const AActor* Ca
 		}
 	}
 
-	// 1. Check for Missile tags
+	// Check tags in priority order: Missile -> Sea -> Ground -> Air
 	for (const FName& Tag : CandidateTags)
 	{
 		if (MissileIdentificationTags.Contains(Tag))
@@ -73,7 +72,6 @@ ERadarTargetDomain UAircraftCombatSettings::ResolveTargetDomain(const AActor* Ca
 		}
 	}
 
-	// 2. Check for Sea / Maritime tags
 	for (const FName& Tag : CandidateTags)
 	{
 		if (SeaIdentificationTags.Contains(Tag))
@@ -82,7 +80,6 @@ ERadarTargetDomain UAircraftCombatSettings::ResolveTargetDomain(const AActor* Ca
 		}
 	}
 
-	// 3. Check for Ground tags
 	for (const FName& Tag : CandidateTags)
 	{
 		if (GroundIdentificationTags.Contains(Tag))
@@ -91,7 +88,6 @@ ERadarTargetDomain UAircraftCombatSettings::ResolveTargetDomain(const AActor* Ca
 		}
 	}
 
-	// 4. Check for Air tags
 	for (const FName& Tag : CandidateTags)
 	{
 		if (AirIdentificationTags.Contains(Tag))
@@ -100,6 +96,6 @@ ERadarTargetDomain UAircraftCombatSettings::ResolveTargetDomain(const AActor* Ca
 		}
 	}
 
-	// 5. Default: Untagged candidates default to Air
+	// Default to Air if untagged
 	return ERadarTargetDomain::Air;
 }

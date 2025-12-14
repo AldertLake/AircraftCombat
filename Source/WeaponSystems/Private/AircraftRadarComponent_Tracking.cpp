@@ -1,8 +1,8 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
+
 //
 // AircraftRadarComponent_Tracking.cpp — Track file management, STT/TWS lock logic, ACM acquisition
 //
@@ -108,11 +108,8 @@ void UAircraftRadarComponent::UpdateTrack(int32 TrackIndex, const FRadarTrack& N
 	Track.bIsBeamTarget = bSavedBeamTarget;
 	Track.bIsBugged = (SavedTrackID == BuggedTrackID);
 
-	// Re-classify IFF on each update (team allegiance may change at runtime)
-	if (Track.TrackedActor.IsValid())
-	{
-		Track.IFFResult = ClassifyIFF(Track.TrackedActor.Get());
-	}
+	// IFF result already computed on the candidate return
+	Track.IFFResult = NewDetection.IFFResult;
 
 	// If this track was a Search hit and we're in TWS, promote to Tracked
 	if (Track.Status == ERadarTrackStatus::Search && RadarMode == ERadarOperatingMode::TrackWhileScan)
@@ -149,30 +146,14 @@ void UAircraftRadarComponent::UpdateTrackFiles(float DeltaTime)
 		if (bWasLocked || bWasBugged) OnRadarTrackDeselected.Broadcast(LostTrackID);
 		Tracks.RemoveAt(i);
 		OnRadarContactLost.Broadcast(LostTrackID);
-		if (bWasLocked) BreakLock();
+		if (bWasLocked) ExecuteAuthoritativeBreakLock();
 	}
 }
 
 void UAircraftRadarComponent::PruneStaleTracks(float DeltaTime)
 {
 	// Scale timeout to at least 1.5x full frame sweep time so tracks never drop halfway through a multi-bar scan
-	float ScanFrameTime = 5.0f;
-	if (ScanDrive == ERadarScanDrive::SocketDriven)
-	{
-		ScanFrameTime = FMath::Max(0.1f, SocketExpectedRevisitSeconds);
-	}
-	else if (ScanDrive == ERadarScanDrive::VirtualMechanical && ScanRateDegreesPerSecond > 0.0f)
-	{
-		ScanFrameTime = AzimuthScanWidth * FMath::Max(1, ElevationBars) / ScanRateDegreesPerSecond;
-	}
-	else if (ScanDrive == ERadarScanDrive::PESA || ScanDrive == ERadarScanDrive::AESA)
-	{
-		const int32 AzCells = FMath::Max(1, FMath::CeilToInt(AzimuthScanWidth / FMath::Max(BeamAzimuthWidth, 1.0f)));
-		const int32 Visits = ScanDrive == ERadarScanDrive::AESA ? FMath::Clamp(AESABeamsPerSample, 1, 32) : 1;
-		ScanFrameTime = FMath::CeilToFloat(static_cast<float>(AzCells * FMath::Max(1, ElevationBars)) / Visits) *
-			FMath::Clamp(ScanSampleInterval, 0.016f, 1.0f);
-	}
-	const float EffectiveDropTimeout = FMath::Max(TrackDropTimeout, ScanFrameTime * 1.5f);
+	const float EffectiveDropTimeout = FMath::Max(TrackDropTimeout, CachedScanFrameTime * 1.5f);
 
 	for (int32 i = Tracks.Num() - 1; i >= 0; --i)
 	{
@@ -212,6 +193,8 @@ void UAircraftRadarComponent::PruneStaleTracks(float DeltaTime)
 
 void UAircraftRadarComponent::PerformSTTTracking()
 {
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
 	if (STTLockedTrackID < 0)
 	{
 		// No target locked — revert to scan
@@ -249,35 +232,26 @@ void UAircraftRadarComponent::PerformSTTTracking()
 	}
 
 	// Check antenna gimbal limits (cannot track outside antenna gimbal bounds)
-	const FVector TargetPosition = Track.LastKnownPosition + Track.EstimatedVelocity * FMath::Min(Track.TrackAge, 2.0f);
+	const FVector TargetPosition = Track.TrackedActor->GetActorLocation();
 	float TargetBearing = 0.0f;
 	float TargetElevation = 0.0f;
 	ComputeBearingElevation(TargetPosition, TargetBearing, TargetElevation);
 
 	// Update antenna pointing azimuth to track locked target (for HUD/MFD B-scope rendering)
 	CurrentScanAzimuth = TargetBearing;
+	CurrentScanElevation = TargetElevation;
+	CurrentScanBar = 0;
+	if (UsesPhysicalPlateBeam()) ActiveSampleBeams.Add(MakeBeamSample(0.0f, 0.0f));
 
 	// STT tracking uses physical antenna gimbal limits (e.g. ±60°) unless omnidirectional/ground-turret tracking is enabled
-	if (!bOmnidirectionalTracking)
+	if (!IsWithinAntennaGimbal(TargetBearing, TargetElevation, 1.1f))
 	{
-		const float MaxAz = FMath::Max(MaxAntennaGimbalAzimuth, AzimuthScanWidth * 0.5f);
-		const float MaxEl = FMath::Max(MaxAntennaGimbalElevation, ElevationScanHeight * 0.5f);
-
-		const bool bCheckAz = (MaxAz < 180.0f);
-		const bool bCheckEl = (MaxEl < 90.0f);
-
-		const float AzDiff = bCheckAz ? FMath::Abs(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TargetBearing)) : 0.0f;
-		const float ElDiff = bCheckEl ? FMath::Abs(TargetElevation - ScanCenterElevation) : 0.0f;
-
-		// Allow a 10% gimbal margin before hard break-lock
-		if ((bCheckAz && AzDiff > MaxAz * 1.1f) || (bCheckEl && ElDiff > MaxEl * 1.1f))
-		{
-			Track.Status = ERadarTrackStatus::Lost;
-			Track.bIsBeamTarget = false;
-			BreakLock();
-			return;
-		}
+		Track.Status = ERadarTrackStatus::Lost;
+		Track.bIsBeamTarget = false;
+		BreakLock();
+		return;
 	}
+	if (!UsesPhysicalPlateBeam()) ActiveSampleBeams.Add(MakeBeamSample(TargetBearing, TargetElevation));
 
 	// STT provides continuous high-rate updates — re-evaluate target
 	FRadarTrack RawTrack;
@@ -327,24 +301,32 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 	FVector RadarPosition;
 	FRotator RadarRotation;
 	GetRadarSourceTransform(RadarPosition, RadarRotation);
-	const FVector ForwardDir = RadarRotation.Vector();
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
+	CurrentScanBar = 0;
 
 	// In ACM mode, antenna azimuth reflects the acquisition boresight, slew offset, or helmet cue
 	if (ACMSubMode == ERadarACMSubMode::SlewAcquisition)
 	{
 		CurrentScanAzimuth = ScanCenterAzimuth;
+		CurrentScanElevation = ScanCenterElevation;
 	}
 	else if (ACMSubMode == ERadarACMSubMode::HelmetCue && !HelmetLookDirection.IsNearlyZero())
 	{
 		const FVector LocalHelmet = RadarRotation.UnrotateVector(HelmetLookDirection);
 		CurrentScanAzimuth = LocalHelmet.Rotation().Yaw;
+		CurrentScanElevation = LocalHelmet.Rotation().Pitch;
+		if (LocalHelmet.X <= 0.0f) CurrentScanAzimuth = CurrentScanElevation = 0.0f;
 	}
 	else
 	{
 		CurrentScanAzimuth = 0.0f;
+		CurrentScanElevation = 0.0f;
 	}
+	ActiveSampleBeams.Add(MakeBeamSample(UsesPhysicalPlateBeam() ? 0.0f : CurrentScanAzimuth,
+		UsesPhysicalPlateBeam() ? 0.0f : CurrentScanElevation));
 
-	// 2. Query potential targets via fast spatial registry and fallback physics overlap
+	// Query potential targets via spatial registry or physics overlap
 	TArray<AActor*> CandidateActors;
 	GatherCandidateActors(RadarPosition, ACMAutoLockRange, CandidateActors);
 
@@ -355,6 +337,7 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 
 	// Find closest target within ACM cone
 	AActor* BestTarget = nullptr;
+	FRadarTrack BestRawTrack;
 	float BestRangeSq = TNumericLimits<float>::Max();
 
 	for (AActor* Candidate : CandidateActors)
@@ -395,20 +378,21 @@ void UAircraftRadarComponent::PerformACMAcquisition()
 				continue;
 			}
 
-			BestRangeSq = RangeSq;
-			BestTarget = Candidate;
+			FRadarTrack RawTrack;
+			if (EvaluateCandidate(Candidate, RawTrack))
+			{
+				BestRangeSq = RangeSq;
+				BestTarget = Candidate;
+				BestRawTrack = RawTrack;
+			}
 		}
 	}
 
 	if (BestTarget)
 	{
 		// Auto-lock the first target found in ACM
-		FRadarTrack RawTrack;
-		if (EvaluateCandidate(BestTarget, RawTrack))
-		{
-			const int32 NewTrackID = CreateTrack(BestTarget, RawTrack);
-			CommandLock(NewTrackID);
-		}
+		const int32 NewTrackID = CreateTrack(BestTarget, BestRawTrack);
+		if (NewTrackID != INDEX_NONE) ExecuteAuthoritativeLockTrack(NewTrackID);
 	}
 }
 

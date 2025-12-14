@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "ModularMissionManagement.h"
@@ -13,14 +12,51 @@
 #include "RadarWarningReceiverComponent.h"
 #include "AircraftRadarComponent.h"
 #include "MasterWeaponComponent.h"
+#include "DroppableItemComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Components/SceneComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/MeshComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "DrawDebugHelpers.h"
 #include "AircraftCombatDebug.h"
+
+namespace
+{
+	bool HasInventoryAuthority(const UModularMissionManagement* Mission)
+	{
+		if (UWorld* World = Mission->GetWorld(); World && World->IsGameWorld())
+			return IsValid(Mission->GetOwner()) && Mission->GetOwner()->HasAuthority();
+		return true;
+	}
+	bool IsAvailableStation(const FWeaponStation& Station)
+	{
+		return Station.StoreType != EStoreType::None && Station.GetCurrentAmmo() > 0 &&
+			Station.Status != EStationStatus::Fault && Station.Status != EStationStatus::Jettisoned;
+	}
+	UMasterWeaponComponent* ResolveStoreWeapon(AActor* Actor)
+	{
+		if (!IsValid(Actor)) return nullptr;
+		// Multiple movement/seeker components are ambiguous; reject rather than
+		// picking a component based on actor component order.
+		TInlineComponentArray<UMasterWeaponComponent*> Weapons(Actor);
+		return Weapons.Num() == 1 && IsValid(Weapons[0]) ? Weapons[0] : nullptr;
+	}
+	bool HasRequiredWeaponComponent(EStoreType Type, const UMasterWeaponComponent* Weapon)
+	{
+		switch (Type)
+		{
+		case EStoreType::AirToAirMissile_IR: return Cast<UIRMissileGuidanceComponent>(Weapon) != nullptr;
+		case EStoreType::AirToAirMissile_Radar: return Cast<URadarMissileGuidanceComponent>(Weapon) != nullptr;
+		case EStoreType::AntiRadiationMissile: return Cast<UARMMissileGuidanceComponent>(Weapon) != nullptr;
+		case EStoreType::AirToGroundMissile: return Cast<UMissileGuidanceComponent>(Weapon) != nullptr;
+		case EStoreType::Bomb_Guided: return IsValid(Weapon);
+		default: return true; // Plain physics actors are supported for unguided stores.
+		}
+	}
+}
 
 UModularMissionManagement::UModularMissionManagement()
 {
@@ -46,7 +82,8 @@ void UModularMissionManagement::GetLifetimeReplicatedProps(TArray<FLifetimePrope
 
 	DOREPLIFETIME_CONDITION(UModularMissionManagement, Stations, COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UModularMissionManagement, SelectedStationIndex, COND_OwnerOnly);
-	DOREPLIFETIME_CONDITION(UModularMissionManagement, DesignatedTarget, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UModularMissionManagement, LockedTarget, COND_OwnerOnly);
+	DOREPLIFETIME_CONDITION(UModularMissionManagement, BuggedTarget, COND_OwnerOnly);
 	DOREPLIFETIME_CONDITION(UModularMissionManagement, bInhibitFriendlyFire, COND_OwnerOnly);
 }
 
@@ -62,12 +99,44 @@ void UModularMissionManagement::OnRep_MasterMode()
 
 void UModularMissionManagement::OnRep_Stations()
 {
+	// Ammo/status replication is frequent. Reuse presentation components unless
+	// their mesh, socket, or parent configuration actually changed.
+	USceneComponent* Mesh = ResolveAircraftMesh();
+	int32 PylonIndex = 0;
+	bool bPylonsMatch = true;
+	for (const FWeaponStation& Station : Stations)
+	{
+		for (const FStationPylon& Config : Station.Pylons)
+		{
+			if (!Config.PylonMesh) continue;
+			UStaticMeshComponent* Pylon = LocalPylons.IsValidIndex(PylonIndex) ? LocalPylons[PylonIndex].Get() : nullptr;
+			bPylonsMatch &= IsValid(Pylon) && Pylon->GetStaticMesh() == Config.PylonMesh &&
+				Pylon->GetAttachSocketName() == Config.SocketName && Pylon->GetAttachParent() == Mesh;
+			++PylonIndex;
+		}
+	}
+	bPylonsMatch &= PylonIndex == LocalPylons.Num();
+	if (bPylonsMatch)
+	{
+		PylonIndex = 0;
+		for (FWeaponStation& Station : Stations)
+		{
+			Station.SpawnedPylons.Reset();
+			for (const FStationPylon& Config : Station.Pylons)
+				if (Config.PylonMesh) Station.SpawnedPylons.Add(LocalPylons[PylonIndex++]);
+		}
+	}
+	else SpawnAllPylons();
 	ProgramAllWeaponsIgnoreLists();
+	BindActiveWeaponDelegates();
 	OnStoresInventoryChanged.Broadcast();
 }
 
 void UModularMissionManagement::OnRep_SelectedStationIndex()
 {
+	PilotCuedWeapon.Reset();
+	AutomaticallyCuedWeapon.Reset();
+	BindActiveWeaponDelegates();
 	FWeaponStation StationData;
 	if (GetSelectedStation(StationData))
 	{
@@ -75,62 +144,33 @@ void UModularMissionManagement::OnRep_SelectedStationIndex()
 	}
 }
 
-void UModularMissionManagement::OnRep_DesignatedTarget()
+void UModularMissionManagement::OnRep_LockedTarget()
 {
-	if (IsValid(DesignatedTarget))
+	PilotCuedWeapon.Reset();
+	if (IsValid(LockedTarget))
 	{
-		OnTargetDesignated.Broadcast(DesignatedTarget);
+		OnTargetLocked.Broadcast(LockedTarget);
 	}
 	else
 	{
-		OnTargetCleared.Broadcast();
+		OnLockCleared.Broadcast();
 	}
+	RefreshSelectedWeaponCue();
+}
+
+void UModularMissionManagement::OnRep_BuggedTarget()
+{
+	PilotCuedWeapon.Reset();
+	if (IsValid(BuggedTarget)) OnTargetBugged.Broadcast(BuggedTarget);
+	else OnBugCleared.Broadcast();
+	RefreshSelectedWeaponCue();
 }
 
 void UModularMissionManagement::OnRep_GunFiringState()
 {
-	AActor* OwnerActor = GetOwner();
-	const APawn* OwnerPawn = Cast<APawn>(OwnerActor);
-	const bool bIsLocallyControlled = OwnerPawn ? OwnerPawn->IsLocallyControlled() : false;
-
-	// For remote clients (simulated proxies), trigger Niagara tracer / firing sound events
-	if (!bIsLocallyControlled)
-	{
-		if (GunFiringState.bIsFiring)
-		{
-			OnGunFiringStarted.Broadcast(GunFiringState.StationIndex);
-
-			const int32 ArrayIndex = FindStationArrayIndex(GunFiringState.StationIndex);
-			if (ArrayIndex != INDEX_NONE)
-			{
-				const FWeaponStation& Station = Stations[ArrayIndex];
-				const float SafeRPM = FMath::Max(60.0f, Station.RateOfFireRPM);
-				const float FireInterval = 60.0f / SafeRPM;
-
-				FTimerDelegate TimerDel;
-				TimerDel.BindUObject(this, &UModularMissionManagement::ProcessGunFireCycle, GunFiringState.StationIndex);
-
-				FTimerHandle NewHandle;
-				if (UWorld* World = GetWorld())
-				{
-					World->GetTimerManager().SetTimer(NewHandle, TimerDel, FireInterval, true);
-					ActiveGunTimers.Add(GunFiringState.StationIndex, NewHandle);
-				}
-			}
-		}
-		else
-		{
-			if (FTimerHandle* HandlePtr = ActiveGunTimers.Find(GunFiringState.StationIndex))
-			{
-				if (UWorld* World = GetWorld())
-				{
-					World->GetTimerManager().ClearTimer(*HandlePtr);
-				}
-				ActiveGunTimers.Remove(GunFiringState.StationIndex);
-			}
-			OnGunFiringStopped.Broadcast(GunFiringState.StationIndex);
-		}
-	}
+	// Clients play presentation events only; the server owns every gun timer and round.
+	if (GunFiringState.bIsFiring) OnGunFiringStarted.Broadcast(GunFiringState.StationIndex);
+	else OnGunFiringStopped.Broadcast(GunFiringState.StationIndex);
 }
 
 void UModularMissionManagement::BeginPlay()
@@ -138,21 +178,38 @@ void UModularMissionManagement::BeginPlay()
 	Super::BeginPlay();
 
 	// Auto-discover aircraft radar and RWR if present
-	ResolveRadarComponent();
+	if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
+	{
+		if (GetOwner() && (!GetWorld() || !GetWorld()->IsGameWorld() || GetOwner()->HasAuthority()))
+		{
+			Radar->OnRadarLockAcquired.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarLockAcquired);
+			Radar->OnRadarLockLost.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarLockLost);
+			Radar->OnRadarTrackSelected.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarTrackSelected);
+			Radar->OnRadarTrackDeselected.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarTrackDeselected);
+			if (AActor* Target = Radar->GetSTTLockedActor()) LockActor(Target);
+			FRadarTrack Bug;
+			if (Radar->GetBuggedTrackID() >= 0 && Radar->GetTrackByID(Radar->GetBuggedTrackID(), Bug))
+				BugActor(Bug.TrackedActor.Get());
+		}
+	}
 	ResolveRWRComponent();
 
 	if (bAutoSpawnStoresOnBeginPlay)
 	{
 		InitializeStores();
 	}
+	for (FWeaponStation& Station : Stations)
+	{
+		if (Station.StoreType == EStoreType::InternalCannon) Station.SimulatedAmmo = Station.CurrentAmmo;
+	}
 
 	// Select first available station with ammunition if available
-	if (Stations.Num() > 0)
+	if (Stations.Num() > 0 && HasInventoryAuthority(this))
 	{
 		bool bFoundSelected = false;
 		for (const FWeaponStation& Station : Stations)
 		{
-			if (Station.GetCurrentAmmo() > 0 && Station.StoreType != EStoreType::None)
+			if (IsAvailableStation(Station))
 			{
 				SelectStation(Station.StationIndex);
 				bFoundSelected = true;
@@ -187,6 +244,8 @@ void UModularMissionManagement::TickComponent(float DeltaTime, ELevelTick TickTy
 
 void UModularMissionManagement::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	bStoreReleaseInProgress = false;
+	UnbindActiveWeaponDelegates();
 	ActiveTracedBullets.Empty();
 	if (UWorld* World = GetWorld())
 	{
@@ -198,13 +257,25 @@ void UModularMissionManagement::EndPlay(const EEndPlayReason::Type EndPlayReason
 	ActiveGunTimers.Empty();
 	GunMuzzleIndices.Empty();
 
-	if (IsValid(DesignatedTarget))
+	if (IsValid(LockedTarget))
 	{
-		DesignatedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleDesignatedTargetDestroyed);
+		LockedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
 	}
-	DesignatedTarget = nullptr;
+	LockedTarget = nullptr;
+	if (IsValid(BuggedTarget))
+		BuggedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
+	BuggedTarget = nullptr;
+	if (UAircraftRadarComponent* Radar = CachedRadarComponent; IsValid(Radar))
+	{
+		Radar->OnRadarLockAcquired.RemoveDynamic(this, &UModularMissionManagement::HandleRadarLockAcquired);
+		Radar->OnRadarLockLost.RemoveDynamic(this, &UModularMissionManagement::HandleRadarLockLost);
+		Radar->OnRadarTrackSelected.RemoveDynamic(this, &UModularMissionManagement::HandleRadarTrackSelected);
+		Radar->OnRadarTrackDeselected.RemoveDynamic(this, &UModularMissionManagement::HandleRadarTrackDeselected);
+	}
 
 	CachedRadarComponent = nullptr;
+	CachedRWRComponent = nullptr;
+	if (HasInventoryAuthority(this)) DestroyMountedStores();
 
 	DestroyAllPylons();
 	Super::EndPlay(EndPlayReason);
@@ -212,38 +283,36 @@ void UModularMissionManagement::EndPlay(const EEndPlayReason::Type EndPlayReason
 
 USceneComponent* UModularMissionManagement::ResolveAircraftMesh() const
 {
-	if (CachedAircraftMesh)
-	{
-		return CachedAircraftMesh;
-	}
-
+	if (IsValid(CachedAircraftMesh)) return CachedAircraftMesh;
 	const AActor* OwnerActor = GetOwner();
-	if (!OwnerActor)
+	if (!IsValid(OwnerActor)) return nullptr;
+	TInlineComponentArray<USceneComponent*> Components(OwnerActor);
+	// Explicit selection wins over cosmetic meshes and generated pylons.
+	for (USceneComponent* Component : Components)
 	{
-		return nullptr;
-	}
-
-	// Look for a PrimitiveComponent / Mesh on the owning actor
-	TArray<USceneComponent*> SceneComponents;
-	OwnerActor->GetComponents<USceneComponent>(SceneComponents);
-
-	for (USceneComponent* Comp : SceneComponents)
-	{
-		if (Comp && (Comp->ComponentHasTag(FName(TEXT("AircraftMesh"))) || Comp->GetName().Contains(TEXT("Mesh"))))
+		if (IsValid(Component) && Component->ComponentHasTag(TEXT("AircraftMesh")))
 		{
-			CachedAircraftMesh = Comp;
-			return CachedAircraftMesh;
+			CachedAircraftMesh = Component;
+			return Component;
 		}
 	}
-
-	// Fallback to Owner Root Component
-	CachedAircraftMesh = OwnerActor->GetRootComponent();
-	return CachedAircraftMesh;
+	for (USceneComponent* Component : Components)
+	{
+		if (IsValid(Component) && Component->IsA<UMeshComponent>() &&
+			!Component->GetName().StartsWith(TEXT("Pylon_Sta")))
+		{
+			CachedAircraftMesh = Component;
+			return Component;
+		}
+	}
+	// Do not pin the fallback: a mesh may be added after this first query.
+	return OwnerActor->GetRootComponent();
 }
 
 void UModularMissionManagement::InitializeStores(USceneComponent* InAircraftMesh)
 {
-	if (InAircraftMesh)
+	if (bStoreReleaseInProgress) return;
+	if (IsValid(InAircraftMesh) && InAircraftMesh->GetOwner() == GetOwner())
 	{
 		CachedAircraftMesh = InAircraftMesh;
 	}
@@ -259,6 +328,7 @@ void UModularMissionManagement::InitializeStores(USceneComponent* InAircraftMesh
 
 void UModularMissionManagement::SpawnStoreForStation(int32 StationIndex)
 {
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return;
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
@@ -282,7 +352,7 @@ void UModularMissionManagement::SpawnStoreForStation(int32 StationIndex)
 
 	UWorld* World = GetWorld();
 	AActor* OwnerActor = GetOwner();
-	if (!World || !OwnerActor || !OwnerActor->HasAuthority())
+	if (!World || !OwnerActor || (World->IsGameWorld() && !OwnerActor->HasAuthority()))
 	{
 		return;
 	}
@@ -347,7 +417,7 @@ void UModularMissionManagement::SpawnStoreForStation(int32 StationIndex)
 		SetupStoreCollisionIgnores(SpawnedActor);
 
 		// Initialize weapon component owner reference
-		if (UMasterWeaponComponent* WeaponComp = SpawnedActor->FindComponentByClass<UMasterWeaponComponent>())
+		if (UMasterWeaponComponent* WeaponComp = ResolveStoreWeapon(SpawnedActor))
 		{
 			WeaponComp->InitializeWeapon(Cast<APawn>(OwnerActor));
 
@@ -365,7 +435,9 @@ void UModularMissionManagement::SpawnStoreForStation(int32 StationIndex)
 		}
 	}
 
-	Station.Status = (Station.StationIndex == SelectedStationIndex) ? EStationStatus::Selected : EStationStatus::Ready;
+	if (Station.Status != EStationStatus::Fault && Station.Status != EStationStatus::Jettisoned)
+		Station.Status = Station.GetCurrentAmmo() > 0 ?
+			((Station.StationIndex == SelectedStationIndex) ? EStationStatus::Selected : EStationStatus::Ready) : EStationStatus::Empty;
 }
 
 void UModularMissionManagement::SpawnAllPylons()
@@ -377,26 +449,18 @@ void UModularMissionManagement::SpawnAllPylons()
 	{
 		return;
 	}
+	DestroyAllPylons();
 
 	for (FWeaponStation& Station : Stations)
 	{
-		// Destroy previously spawned pylon components
-		for (UStaticMeshComponent* PylonComp : Station.SpawnedPylons)
-		{
-			if (IsValid(PylonComp))
-			{
-				PylonComp->DestroyComponent();
-			}
-		}
-		Station.SpawnedPylons.Empty();
-
 		for (int32 PylonIdx = 0; PylonIdx < Station.Pylons.Num(); ++PylonIdx)
 		{
 			const FStationPylon& PylonData = Station.Pylons[PylonIdx];
 			if (PylonData.PylonMesh)
 			{
 				FString CompName = FString::Printf(TEXT("Pylon_Sta%d_%d"), Station.StationIndex, PylonIdx);
-				UStaticMeshComponent* PylonComp = NewObject<UStaticMeshComponent>(OwnerActor, FName(*CompName));
+				const FName UniqueName = MakeUniqueObjectName(OwnerActor, UStaticMeshComponent::StaticClass(), FName(*CompName));
+				UStaticMeshComponent* PylonComp = NewObject<UStaticMeshComponent>(OwnerActor, UniqueName);
 				if (PylonComp)
 				{
 					PylonComp->SetStaticMesh(PylonData.PylonMesh);
@@ -405,6 +469,7 @@ void UModularMissionManagement::SpawnAllPylons()
 					PylonComp->AttachToComponent(MeshComp, FAttachmentTransformRules::SnapToTargetNotIncludingScale, PylonData.SocketName);
 					
 					Station.SpawnedPylons.Add(PylonComp);
+					LocalPylons.Add(PylonComp);
 				}
 			}
 		}
@@ -413,6 +478,9 @@ void UModularMissionManagement::SpawnAllPylons()
 
 void UModularMissionManagement::DestroyAllPylons()
 {
+	for (UStaticMeshComponent* Pylon : LocalPylons)
+		if (IsValid(Pylon)) Pylon->DestroyComponent();
+	LocalPylons.Reset();
 	for (FWeaponStation& Station : Stations)
 	{
 		for (UStaticMeshComponent* PylonComp : Station.SpawnedPylons)
@@ -428,11 +496,15 @@ void UModularMissionManagement::DestroyAllPylons()
 
 void UModularMissionManagement::SpawnAllStores()
 {
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return;
+	UnbindActiveWeaponDelegates();
 	for (FWeaponStation& Station : Stations)
 	{
 		SpawnStoreForStation(Station.StationIndex);
 	}
 	ProgramAllWeaponsIgnoreLists();
+	PrepareActiveWeaponOnStation(SelectedStationIndex);
+	BindActiveWeaponDelegates();
 }
 
 void UModularMissionManagement::SetupStoreCollisionIgnores(AActor* StoreActor)
@@ -612,7 +684,7 @@ void UModularMissionManagement::ProgramAllWeaponsIgnoreLists()
 		{
 			if (Store.MountedActor && IsValid(Store.MountedActor))
 			{
-				if (UMasterWeaponComponent* Comp = Store.MountedActor->FindComponentByClass<UMasterWeaponComponent>())
+				if (UMasterWeaponComponent* Comp = ResolveStoreWeapon(Store.MountedActor))
 				{
 					ProgramWeaponIgnoreList(Comp);
 				}
@@ -623,6 +695,8 @@ void UModularMissionManagement::ProgramAllWeaponsIgnoreLists()
 
 void UModularMissionManagement::DestroyMountedStores()
 {
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return;
+	UnbindActiveWeaponDelegates();
 	for (FWeaponStation& Station : Stations)
 	{
 		for (FStationStore& Store : Station.Stores)
@@ -630,8 +704,8 @@ void UModularMissionManagement::DestroyMountedStores()
 			if (IsValid(Store.MountedActor))
 			{
 				Store.MountedActor->Destroy();
-				Store.MountedActor = nullptr;
 			}
+			Store.MountedActor = nullptr;
 		}
 	}
 }
@@ -656,13 +730,24 @@ bool UModularMissionManagement::GetStation(int32 StationIndex, FWeaponStation& O
 		OutStation = Stations[ArrayIndex];
 		return true;
 	}
+	OutStation = FWeaponStation();
 	return false;
 }
 
 bool UModularMissionManagement::GetStationBySocket(FName SocketName, FWeaponStation& OutStation) const
 {
+	OutStation = FWeaponStation();
+	if (SocketName == NAME_None) return false;
 	for (const FWeaponStation& Station : Stations)
 	{
+		for (const FStationPylon& Pylon : Station.Pylons)
+		{
+			if (Pylon.SocketName == SocketName) { OutStation = Station; return true; }
+		}
+		for (const FGunMuzzle& Muzzle : Station.GunMuzzles)
+		{
+			if (Muzzle.MuzzleSocketName == SocketName) { OutStation = Station; return true; }
+		}
 		for (const FStationStore& Store : Station.Stores)
 		{
 			if (Store.SocketName == SocketName)
@@ -720,6 +805,7 @@ bool UModularMissionManagement::SelectStation(int32 StationIndex)
 
 	// If the previously selected station was actively firing a gun, stop it
 	StopFiring(SelectedStationIndex);
+	UnbindActiveWeaponDelegates();
 
 	// Deactivate the currently selected weapon before switching
 	if (UMasterWeaponComponent* OldWeapon = GetActiveWeaponComponent(SelectedStationIndex))
@@ -734,6 +820,7 @@ bool UModularMissionManagement::SelectStation(int32 StationIndex)
 		if (Stations[PrevIdx].Status == EStationStatus::Selected)
 		{
 			Stations[PrevIdx].Status = (Stations[PrevIdx].GetCurrentAmmo() > 0) ? EStationStatus::Ready : EStationStatus::Empty;
+			OnStationStatusChanged.Broadcast(Stations[PrevIdx].StationIndex, Stations[PrevIdx].Status);
 		}
 	}
 
@@ -741,66 +828,18 @@ bool UModularMissionManagement::SelectStation(int32 StationIndex)
 	if (Stations[TargetIdx].Status != EStationStatus::Fault && Stations[TargetIdx].Status != EStationStatus::Jettisoned)
 	{
 		Stations[TargetIdx].Status = EStationStatus::Selected;
+		OnStationStatusChanged.Broadcast(SelectedStationIndex, Stations[TargetIdx].Status);
 	}
 
 	OnStationSelected.Broadcast(SelectedStationIndex, Stations[TargetIdx]);
 
-	// Activate the new weapon if we are in a combat mode
-	if (MasterMode != EAircraftMasterMode::Navigation)
+	// Activate and configure weapon for the newly selected station
+	PrepareActiveWeaponOnStation(SelectedStationIndex);
+	BindActiveWeaponDelegates();
+
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
 	{
-		if (UMasterWeaponComponent* NewWeapon = GetActiveWeaponComponent(SelectedStationIndex))
-		{
-			ProgramWeaponIgnoreList(NewWeapon);
-			NewWeapon->ActivateWeapon(true);
-
-			// Connect radar missiles to parent aircraft radar immediately upon station selection
-			if (URadarMissileGuidanceComponent* RadarGuidance = Cast<URadarMissileGuidanceComponent>(NewWeapon))
-			{
-				if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
-				{
-					RadarGuidance->SetParentRadar(Radar);
-				}
-			}
-
-			// If we already have a designated target, cue or slave the newly selected weapon to it
-			if (IsValid(DesignatedTarget))
-			{
-				if (UIRMissileGuidanceComponent* IRGuidance = Cast<UIRMissileGuidanceComponent>(NewWeapon))
-				{
-					IRGuidance->SlaveToDesignatedTarget(DesignatedTarget);
-				}
-				else if (URadarMissileGuidanceComponent* RadarGuidance = Cast<URadarMissileGuidanceComponent>(NewWeapon))
-				{
-					RadarGuidance->LockMissile(DesignatedTarget);
-					if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
-					{
-						RadarGuidance->SetParentRadar(Radar);
-						FRadarTrack TrackInfo;
-						if (Radar->GetTrackByActor(DesignatedTarget, TrackInfo))
-						{
-							RadarGuidance->SetInertialTarget(TrackInfo.LastKnownPosition, TrackInfo.EstimatedVelocity);
-						}
-						else RadarGuidance->ClearTargetSolution();
-					}
-					else RadarGuidance->ClearTargetSolution();
-				}
-				else if (UARMMissileGuidanceComponent* ARMGuidance = Cast<UARMMissileGuidanceComponent>(NewWeapon))
-				{
-					ARMGuidance->HandoffEmitter(DesignatedTarget);
-				}
-				if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
-				{
-					FRadarTrack Linked;
-					if (Radar->GetSelectedLinkedTrackForActor(DesignatedTarget, Linked))
-						PrepareLinkedRadarWeapon(Linked, Radar->GetLinkedTrackSource(Linked.TrackID));
-				}
-			}
-		}
-	}
-
-	if (AActor* OwnerActor = GetOwner())
-	{
-		if (!OwnerActor->HasAuthority())
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
 		{
 			ServerSelectStation(StationIndex);
 		}
@@ -817,12 +856,12 @@ bool UModularMissionManagement::SelectNextStation()
 	}
 
 	const int32 CurrentIdx = FindStationArrayIndex(SelectedStationIndex);
-	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : 0;
+	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : -1;
 
 	for (int32 i = 1; i <= Stations.Num(); ++i)
 	{
 		const int32 TestIdx = (StartIdx + i) % Stations.Num();
-		if (Stations[TestIdx].GetCurrentAmmo() > 0 && Stations[TestIdx].StoreType != EStoreType::None)
+		if (IsAvailableStation(Stations[TestIdx]))
 		{
 			return SelectStation(Stations[TestIdx].StationIndex);
 		}
@@ -839,7 +878,7 @@ bool UModularMissionManagement::SelectPreviousStation()
 	}
 
 	const int32 CurrentIdx = FindStationArrayIndex(SelectedStationIndex);
-	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : 0;
+	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : Stations.Num();
 
 	for (int32 i = 1; i <= Stations.Num(); ++i)
 	{
@@ -849,7 +888,7 @@ bool UModularMissionManagement::SelectPreviousStation()
 			TestIdx += Stations.Num();
 		}
 
-		if (Stations[TestIdx].GetCurrentAmmo() > 0 && Stations[TestIdx].StoreType != EStoreType::None)
+		if (IsAvailableStation(Stations[TestIdx]))
 		{
 			return SelectStation(Stations[TestIdx].StationIndex);
 		}
@@ -866,12 +905,12 @@ bool UModularMissionManagement::SelectNextStationOfStoreType(EStoreType InStoreT
 	}
 
 	const int32 CurrentIdx = FindStationArrayIndex(SelectedStationIndex);
-	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : 0;
+	const int32 StartIdx = (CurrentIdx != INDEX_NONE) ? CurrentIdx : -1;
 
 	for (int32 i = 1; i <= Stations.Num(); ++i)
 	{
 		const int32 TestIdx = (StartIdx + i) % Stations.Num();
-		if (Stations[TestIdx].StoreType == InStoreType && Stations[TestIdx].GetCurrentAmmo() > 0)
+		if (Stations[TestIdx].StoreType == InStoreType && IsAvailableStation(Stations[TestIdx]))
 		{
 			return SelectStation(Stations[TestIdx].StationIndex);
 		}
@@ -893,7 +932,7 @@ bool UModularMissionManagement::CycleWeaponType()
 	TArray<EStoreType> AvailableTypes;
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.GetCurrentAmmo() > 0 && Station.StoreType != EStoreType::None)
+		if (IsAvailableStation(Station))
 		{
 			AvailableTypes.AddUnique(Station.StoreType);
 		}
@@ -914,7 +953,7 @@ bool UModularMissionManagement::SelectStoreType(EStoreType InStoreType)
 {
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == InStoreType && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == InStoreType && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -947,12 +986,6 @@ bool UModularMissionManagement::GetActiveStoreForStation(int32 StationIndex, FSt
 			}
 		}
 
-		// Fallback: If station uses ammo management and ammo remains, return the primary store definition
-		if (Station.bUsesAmmoManagement && Station.GetCurrentAmmo() > 0 && Station.Stores.Num() > 0)
-		{
-			OutStore = Station.Stores[0];
-			return true;
-		}
 	}
 
 	OutStore = FStationStore();
@@ -961,12 +994,8 @@ bool UModularMissionManagement::GetActiveStoreForStation(int32 StationIndex, FSt
 
 EStoreType UModularMissionManagement::GetSelectedStoreType() const
 {
-	FWeaponStation Station;
-	if (GetSelectedStation(Station))
-	{
-		return Station.StoreType;
-	}
-	return EStoreType::None;
+	const int32 Index = FindStationArrayIndex(SelectedStationIndex);
+	return Index != INDEX_NONE ? Stations[Index].StoreType : EStoreType::None;
 }
 
 AActor* UModularMissionManagement::GetActiveWeaponActor(int32 StationIndex) const
@@ -976,9 +1005,9 @@ AActor* UModularMissionManagement::GetActiveWeaponActor(int32 StationIndex) cons
 	{
 		for (const FStationStore& Store : Stations[ArrayIndex].Stores)
 		{
-			if (Store.Status == EStoreStatus::Ready && IsValid(Store.MountedActor))
+			if (Store.Status == EStoreStatus::Ready)
 			{
-				return Store.MountedActor;
+				return IsValid(Store.MountedActor) ? Store.MountedActor.Get() : nullptr;
 			}
 		}
 	}
@@ -989,15 +1018,68 @@ UMasterWeaponComponent* UModularMissionManagement::GetActiveWeaponComponent(int3
 {
 	if (AActor* WeaponActor = GetActiveWeaponActor(StationIndex))
 	{
-		return WeaponActor->FindComponentByClass<UMasterWeaponComponent>();
+		return ResolveStoreWeapon(WeaponActor);
 	}
 	return nullptr;
+}
+
+void UModularMissionManagement::PrepareActiveWeaponOnStation(int32 StationIndex)
+{
+	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
+	if (ArrayIndex == INDEX_NONE)
+	{
+		return;
+	}
+
+	if (MasterMode == EAircraftMasterMode::Navigation)
+	{
+		return;
+	}
+
+	UMasterWeaponComponent* ActiveWeapon = GetActiveWeaponComponent(StationIndex);
+	if (!ActiveWeapon)
+	{
+		return;
+	}
+
+	ProgramWeaponIgnoreList(ActiveWeapon);
+	ActiveWeapon->ActivateWeapon(true);
+	UAircraftRadarComponent* Radar = ResolveRadarComponent();
+	if (URadarMissileGuidanceComponent* RadarGuidance = Cast<URadarMissileGuidanceComponent>(ActiveWeapon))
+	{
+		if (Radar) RadarGuidance->SetParentRadar(Radar);
+	}
+	if (StationIndex != SelectedStationIndex)
+	{
+		PilotCuedWeapon.Reset();
+		AutomaticallyCuedWeapon.Reset();
+	}
+	RefreshSelectedWeaponCue();
+	if (AActor* CueTarget = GetCueTargetForWeapon(ActiveWeapon); IsValid(CueTarget) && Radar)
+	{
+		FRadarTrack Linked;
+		if (Radar->GetSelectedLinkedTrackForActor(CueTarget, Linked))
+		{
+			PrepareLinkedRadarWeapon(Linked, Radar->GetLinkedTrackSource(Linked.TrackID));
+		}
+	}
 }
 
 void UModularMissionManagement::SetMasterArmMode(EMasterArmMode InMode)
 {
 	if (MasterArmMode != InMode)
 	{
+		TArray<int32> FiringStations;
+		ActiveGunTimers.GetKeys(FiringStations);
+		for (const int32 FiringStation : FiringStations) StopFiring(FiringStation);
+		for (FWeaponStation& Station : Stations)
+		{
+			if (Station.StoreType == EStoreType::InternalCannon)
+			{
+				Station.SimulatedAmmo = Station.CurrentAmmo;
+				OnStationAmmoChanged.Broadcast(Station.StationIndex, Station.CurrentAmmo, Station.MaxAmmo);
+			}
+		}
 		MasterArmMode = InMode;
 		if (MasterArmMode == EMasterArmMode::Safe)
 		{
@@ -1005,9 +1087,9 @@ void UModularMissionManagement::SetMasterArmMode(EMasterArmMode InMode)
 		}
 		OnMasterArmChanged.Broadcast(MasterArmMode);
 
-		if (AActor* OwnerActor = GetOwner())
+		if (UWorld* World = GetWorld(); World && World->IsGameWorld())
 		{
-			if (!OwnerActor->HasAuthority())
+			if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
 			{
 				ServerSetMasterArmMode(InMode);
 			}
@@ -1038,23 +1120,26 @@ void UModularMissionManagement::SetMasterMode(EAircraftMasterMode InMode)
 			}
 		}
 
-		switch (MasterMode)
+		if (bAutoSelectStationOnMasterMode)
 		{
-			case EAircraftMasterMode::Dogfight:
-				SelectDogfightStation();
-				break;
-			case EAircraftMasterMode::MissileOverride:
-				SelectBVRStation();
-				break;
-			default:
-				break;
+			switch (MasterMode)
+			{
+				case EAircraftMasterMode::Dogfight:
+					SelectDogfightStation();
+					break;
+				case EAircraftMasterMode::MissileOverride:
+					SelectBVRStation();
+					break;
+				default:
+					break;
+			}
 		}
 
 		OnMasterModeChanged.Broadcast(MasterMode);
 
-		if (AActor* OwnerActor = GetOwner())
+		if (UWorld* World = GetWorld(); World && World->IsGameWorld())
 		{
-			if (!OwnerActor->HasAuthority())
+			if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
 			{
 				ServerSetMasterMode(InMode);
 			}
@@ -1062,155 +1147,379 @@ void UModularMissionManagement::SetMasterMode(EAircraftMasterMode InMode)
 	}
 }
 
-void UModularMissionManagement::SetDesignatedTarget(AActor* InTarget)
+AActor* UModularMissionManagement::GetLockedActor() const
 {
-	// Validate new target (ensure it exists and is not pending destruction)
+	return IsValid(LockedTarget) ? LockedTarget.Get() : nullptr;
+}
+
+EWeaponComponentType UModularMissionManagement::GetSelectedWeaponComponentType() const
+{
+	const UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex);
+	return Weapon ? Weapon->GetWeaponComponentType() : EWeaponComponentType::Unknown;
+}
+
+UMissileGuidanceComponent* UModularMissionManagement::GetSelectedMissileGuidance() const
+{
+	return Cast<UMissileGuidanceComponent>(GetActiveWeaponComponent(SelectedStationIndex));
+}
+
+UIRMissileGuidanceComponent* UModularMissionManagement::GetSelectedIRMissile() const
+{
+	return Cast<UIRMissileGuidanceComponent>(GetActiveWeaponComponent(SelectedStationIndex));
+}
+
+URadarMissileGuidanceComponent* UModularMissionManagement::GetSelectedRadarMissile() const
+{
+	return Cast<URadarMissileGuidanceComponent>(GetActiveWeaponComponent(SelectedStationIndex));
+}
+
+UARMMissileGuidanceComponent* UModularMissionManagement::GetSelectedARMMissile() const
+{
+	return Cast<UARMMissileGuidanceComponent>(GetActiveWeaponComponent(SelectedStationIndex));
+}
+
+UDroppableItemComponent* UModularMissionManagement::GetSelectedDroppableItem() const
+{
+	return Cast<UDroppableItemComponent>(GetActiveWeaponComponent(SelectedStationIndex));
+}
+
+void UModularMissionManagement::UnbindActiveWeaponDelegates()
+{
+	if (UMasterWeaponComponent* Weapon = SubscribedActiveWeapon.Get())
+	{
+		Weapon->OnSeekerStateChanged.RemoveDynamic(this, &UModularMissionManagement::HandleActiveWeaponSeekerStateChanged);
+		Weapon->OnLockAcquired.RemoveDynamic(this, &UModularMissionManagement::HandleActiveWeaponLockAcquired);
+		Weapon->OnLockLost.RemoveDynamic(this, &UModularMissionManagement::HandleActiveWeaponLockLost);
+		Weapon->OnCageStateChanged.RemoveDynamic(this, &UModularMissionManagement::HandleActiveWeaponCageStateChanged);
+	}
+	SubscribedActiveWeapon.Reset();
+}
+
+void UModularMissionManagement::BindActiveWeaponDelegates()
+{
+	UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex);
+	if (Weapon == SubscribedActiveWeapon.Get()) return;
+	UnbindActiveWeaponDelegates();
+	if (!IsValid(Weapon)) return;
+	SubscribedActiveWeapon = Weapon;
+	Weapon->OnSeekerStateChanged.AddUniqueDynamic(this, &UModularMissionManagement::HandleActiveWeaponSeekerStateChanged);
+	Weapon->OnLockAcquired.AddUniqueDynamic(this, &UModularMissionManagement::HandleActiveWeaponLockAcquired);
+	Weapon->OnLockLost.AddUniqueDynamic(this, &UModularMissionManagement::HandleActiveWeaponLockLost);
+	Weapon->OnCageStateChanged.AddUniqueDynamic(this, &UModularMissionManagement::HandleActiveWeaponCageStateChanged);
+}
+
+void UModularMissionManagement::HandleActiveWeaponSeekerStateChanged(UMasterWeaponComponent* Weapon, EWeaponSeekerState OldState, EWeaponSeekerState NewState)
+{
+	if (IsValid(Weapon) && Weapon == SubscribedActiveWeapon.Get() && !Weapon->IsWeaponFired())
+		OnActiveWeaponSeekerStateChanged.Broadcast(Weapon, OldState, NewState);
+}
+
+void UModularMissionManagement::HandleActiveWeaponLockAcquired(UMasterWeaponComponent* Weapon, AActor* Target)
+{
+	if (IsValid(Weapon) && Weapon == SubscribedActiveWeapon.Get() && !Weapon->IsWeaponFired())
+		OnActiveWeaponLockAcquired.Broadcast(Weapon, Target);
+}
+
+void UModularMissionManagement::HandleActiveWeaponLockLost(UMasterWeaponComponent* Weapon, AActor* Target)
+{
+	if (IsValid(Weapon) && Weapon == SubscribedActiveWeapon.Get() && !Weapon->IsWeaponFired())
+		OnActiveWeaponLockLost.Broadcast(Weapon, Target);
+}
+
+void UModularMissionManagement::HandleActiveWeaponCageStateChanged(UMasterWeaponComponent* Weapon, bool bCaged)
+{
+	if (IsValid(Weapon) && Weapon == SubscribedActiveWeapon.Get() && !Weapon->IsWeaponFired())
+		OnActiveWeaponCageStateChanged.Broadcast(Weapon, bCaged);
+}
+
+bool UModularMissionManagement::SlaveSelectedWeaponToDirection(const FVector& InWorldDirection)
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority())
+		ServerSlaveSelectedWeaponToDirection(InWorldDirection);
+	UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex);
+	if (!Weapon || !Weapon->SlaveToDirection(InWorldDirection)) return false;
+	PilotCuedWeapon = Weapon;
+	AutomaticallyCuedWeapon.Reset();
+	return true;
+}
+
+bool UModularMissionManagement::SlaveSelectedWeaponToLocation(const FVector& InWorldLocation)
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority())
+		ServerSlaveSelectedWeaponToLocation(InWorldLocation);
+	UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex);
+	if (!Weapon || !Weapon->SlaveToLocation(InWorldLocation)) return false;
+	PilotCuedWeapon = Weapon;
+	AutomaticallyCuedWeapon.Reset();
+	return true;
+}
+
+void UModularMissionManagement::SlaveSelectedWeaponToBoresight()
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority())
+		ServerSlaveSelectedWeaponToBoresight();
+	if (UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex))
+	{
+		Weapon->SlaveToBoresight();
+		PilotCuedWeapon = Weapon;
+		AutomaticallyCuedWeapon.Reset();
+	}
+}
+
+void UModularMissionManagement::SetSelectedWeaponCaged(bool bCaged)
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority())
+		ServerSetSelectedWeaponCaged(bCaged);
+	if (UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(SelectedStationIndex))
+	{
+		Weapon->SetSeekerCaged(bCaged);
+		PilotCuedWeapon = Weapon;
+		AutomaticallyCuedWeapon.Reset();
+	}
+}
+
+AActor* UModularMissionManagement::GetCueTargetForWeapon(const UMasterWeaponComponent* Weapon) const
+{
+	if (!Weapon) return nullptr;
+	if (Weapon->FiringRequirement == EWeaponFiringRequirement::HardLock)
+	{
+		AActor* Target = GetLockedActor();
+		if (Cast<UHybridRadarMissileGuidanceComponent>(Weapon) && IsValid(Target))
+		{
+			UAircraftRadarComponent* Radar = GetRadarComponent();
+			if (Radar && Radar->IsContinuousWaveIlluminating(Target)) return Target;
+			FRadarTrack Linked;
+			if (Radar && Radar->GetSelectedLinkedTrackForActor(Target, Linked))
+				if (UAircraftRadarComponent* Source = Radar->GetLinkedTrackSource(Linked.TrackID);
+					IsValid(Source) && Source->IsContinuousWaveIlluminating(Target)) return Target;
+			return nullptr;
+		}
+		return Target;
+	}
+	return GetBuggedActor() ? GetBuggedActor() : GetLockedActor();
+}
+
+bool UModularMissionManagement::IsWeaponReleaseInhibitedByIFF(
+	const UMasterWeaponComponent* Weapon, const AActor* CueTarget) const
+{
+	if (!bInhibitFriendlyFire) return false;
+	if (IsValid(CueTarget) && FCombatTeamUtility::IsFriendly(GetOwner(), CueTarget)) return true;
+	const UIRMissileGuidanceComponent* IR = Cast<UIRMissileGuidanceComponent>(Weapon);
+	const AActor* SeekerTarget = IR ? IR->GetLockedTarget() : nullptr;
+	return IsValid(SeekerTarget) && FCombatTeamUtility::IsFriendly(GetOwner(), SeekerTarget);
+}
+
+void UModularMissionManagement::RefreshSelectedWeaponCue()
+{
+	const int32 ArrayIndex = FindStationArrayIndex(SelectedStationIndex);
+	if (ArrayIndex == INDEX_NONE) return;
+	for (const FStationStore& Store : Stations[ArrayIndex].Stores)
+	{
+		if (Store.Status != EStoreStatus::Ready || !IsValid(Store.MountedActor)) continue;
+		UMissileGuidanceComponent* Guidance = Cast<UMissileGuidanceComponent>(ResolveStoreWeapon(Store.MountedActor));
+		if (!Guidance) break;
+		if (PilotCuedWeapon.Get() == Guidance) break;
+		AActor* CueTarget = GetCueTargetForWeapon(Guidance);
+		if (UIRMissileGuidanceComponent* IR = Cast<UIRMissileGuidanceComponent>(Guidance))
+		{
+			if (IsValid(CueTarget) && IR->SlaveToTarget(CueTarget))
+				AutomaticallyCuedWeapon = Guidance;
+			else if (AutomaticallyCuedWeapon.Get() == Guidance)
+			{
+				IR->SlaveToBoresight();
+				AutomaticallyCuedWeapon.Reset();
+			}
+		}
+		else if (URadarMissileGuidanceComponent* Missile = Cast<URadarMissileGuidanceComponent>(Guidance))
+		{
+			bool bAppliedRadarCue = false;
+			if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
+			{
+				Missile->SetParentRadar(Radar);
+				FRadarTrack Track;
+				if (IsValid(CueTarget) && Missile->SlaveToTarget(CueTarget))
+				{
+					bAppliedRadarCue = true;
+					AutomaticallyCuedWeapon = Guidance;
+					if (Radar->GetTrackByActor(CueTarget, Track))
+						Missile->SetInertialTarget(Track.LastKnownPosition, Track.EstimatedVelocity);
+				}
+			}
+			if (!bAppliedRadarCue && AutomaticallyCuedWeapon.Get() == Guidance)
+			{
+				Missile->SlaveToBoresight();
+				AutomaticallyCuedWeapon.Reset();
+			}
+		}
+		else if (UARMMissileGuidanceComponent* ARM = Cast<UARMMissileGuidanceComponent>(Guidance))
+		{
+			UAircraftRadarComponent* Emitter = IsValid(CueTarget) ?
+				CueTarget->FindComponentByClass<UAircraftRadarComponent>() : nullptr;
+			if (IsValid(Emitter) && Emitter->IsRadarEmitting())
+			{
+				ARM->HandoffEmitter(CueTarget, Emitter);
+				AutomaticallyCuedWeapon = Guidance;
+			}
+			else if (AutomaticallyCuedWeapon.Get() == Guidance)
+			{
+				ARM->HandoffEmitter(nullptr);
+				AutomaticallyCuedWeapon.Reset();
+			}
+		}
+		break;
+	}
+}
+
+void UModularMissionManagement::LockActor(AActor* InTarget)
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
+		{
+			ServerLockActor(InTarget);
+			return;
+		}
+	// Validate target
 	AActor* ValidNewTarget = IsValid(InTarget) ? InTarget : nullptr;
 
-	// If we are already tracking this exact valid target, no update needed
-	if (DesignatedTarget == ValidNewTarget && ValidNewTarget != nullptr)
+	// Ignore if already tracking this target
+	if (LockedTarget == ValidNewTarget)
 	{
 		return;
 	}
-	if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
+	// Unbind previous target delegates
+	if (IsValid(LockedTarget))
 	{
-		Radar->ClearLinkedDesignation();
-		if (URadarMissileGuidanceComponent* Missile = Cast<URadarMissileGuidanceComponent>(
-			GetActiveWeaponComponent(SelectedStationIndex)))
-			Missile->ClearRemoteDataLinkSupport(Radar);
+		LockedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
 	}
 
-	// Safely unbind from previously designated target if and only if it is still valid
-	if (IsValid(DesignatedTarget))
-	{
-		DesignatedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleDesignatedTargetDestroyed);
-	}
+	LockedTarget = ValidNewTarget;
+	PilotCuedWeapon.Reset();
+	if (IsValid(BuggedTarget))
+		BuggedTarget->OnDestroyed.AddUniqueDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
 
-	DesignatedTarget = ValidNewTarget;
-
-	if (DesignatedTarget)
+	if (LockedTarget)
 	{
-		DesignatedTarget->OnDestroyed.AddUniqueDynamic(this, &UModularMissionManagement::HandleDesignatedTargetDestroyed);
-		OnTargetDesignated.Broadcast(DesignatedTarget);
+		LockedTarget->OnDestroyed.AddUniqueDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
+		OnTargetLocked.Broadcast(LockedTarget);
 	}
 	else
 	{
-		OnTargetCleared.Broadcast();
+		OnLockCleared.Broadcast();
 	}
 
 
 
-	// Forward target to missile mounted on currently selected station if present
-	const int32 ArrayIndex = FindStationArrayIndex(SelectedStationIndex);
-	if (ArrayIndex != INDEX_NONE)
-	{
-		for (const FStationStore& Store : Stations[ArrayIndex].Stores)
-		{
-			if (Store.Status == EStoreStatus::Ready && IsValid(Store.MountedActor))
-			{
-				if (UMissileGuidanceComponent* Guidance = Store.MountedActor->FindComponentByClass<UMissileGuidanceComponent>())
-				{
-					if (!DesignatedTarget) Guidance->ClearTargetSolution();
-					if (UIRMissileGuidanceComponent* IRGuidance = Cast<UIRMissileGuidanceComponent>(Guidance))
-					{
-						if (DesignatedTarget)
-						{
-							IRGuidance->SlaveToDesignatedTarget(DesignatedTarget);
-						}
-						else
-						{
-							IRGuidance->LockMissile(nullptr);
-						}
-					}
-					else
-					{
-						Guidance->LockMissile(DesignatedTarget);
-					}
+	RefreshSelectedWeaponCue();
 
-					// If this is a radar missile, cue with initial radar track data
-					if (URadarMissileGuidanceComponent* RadarGuidance = Cast<URadarMissileGuidanceComponent>(Guidance))
-					{
-						RadarGuidance->ClearTargetSolution();
-						if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
-						{
-							RadarGuidance->SetParentRadar(Radar);
-							if (DesignatedTarget)
-							{
-								FRadarTrack TrackInfo;
-								if (Radar->GetTrackByActor(DesignatedTarget, TrackInfo))
-								{
-									RadarGuidance->SetInertialTarget(TrackInfo.LastKnownPosition, TrackInfo.EstimatedVelocity);
-								}
-								else RadarGuidance->ClearTargetSolution();
-							}
-						}
-					}
-					else if (UARMMissileGuidanceComponent* ARMGuidance = Cast<UARMMissileGuidanceComponent>(Guidance))
-					{
-						if (DesignatedTarget)
-						{
-							ARMGuidance->HandoffEmitter(DesignatedTarget);
-						}
-						else if (URadarWarningReceiverComponent* RWR = ResolveRWRComponent())
-						{
-							FRWRThreatEntry HighestThreat;
-							if (RWR->GetHighestThreat(HighestThreat))
-							{
-								ARMGuidance->HandoffFromRWRThreat(HighestThreat);
-							}
-						}
-					}
-				}
-				break;
-			}
-		}
-	}
-
-	if (AActor* OwnerActor = GetOwner())
-	{
-		if (!OwnerActor->HasAuthority())
-		{
-			ServerSetDesignatedTarget(InTarget);
-		}
-	}
 }
 
 void UModularMissionManagement::PrepareLinkedRadarWeapon(const FRadarTrack& LinkedTrack,
 	UAircraftRadarComponent* SourceRadar)
 {
-	if (!GetOwner() || !GetOwner()->HasAuthority() || !IsValid(SourceRadar)) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+		if (!GetOwner() || !GetOwner()->HasAuthority()) return;
+	if (!IsValid(SourceRadar)) return;
 	UAircraftRadarComponent* LauncherRadar = ResolveRadarComponent();
 	if (!LauncherRadar || !LauncherRadar->bAllowRemoteWeaponSupport) return;
 	if (URadarMissileGuidanceComponent* Missile = Cast<URadarMissileGuidanceComponent>(
 		GetActiveWeaponComponent(SelectedStationIndex)))
 	{
-		Missile->LockMissile(DesignatedTarget);
+		const bool bHardLock = Missile->FiringRequirement == EWeaponFiringRequirement::HardLock;
+		if (bHardLock && (!IsValid(LockedTarget) ||
+			!SourceRadar->IsContinuousWaveIlluminating(LockedTarget.Get()))) return;
+		PilotCuedWeapon.Reset();
 		Missile->SetRemoteDataLinkSupport(LauncherRadar, SourceRadar, LinkedTrack.SourceParticipantID);
+		if (AActor* LinkedTarget = LinkedTrack.TrackedActor.Get(); IsValid(LinkedTarget))
+			Missile->SlaveToTarget(LinkedTarget);
 		Missile->SetInertialTarget(LinkedTrack.LastKnownPosition +
 			LinkedTrack.EstimatedVelocity * LinkedTrack.TrackAge, LinkedTrack.EstimatedVelocity);
+		AutomaticallyCuedWeapon = Missile;
 	}
 }
 
-void UModularMissionManagement::ClearDesignatedTarget()
+void UModularMissionManagement::ClearLockedActor()
 {
-	SetDesignatedTarget(nullptr);
+	LockActor(nullptr);
+}
 
-	if (AActor* OwnerActor = GetOwner())
-	{
-		if (!OwnerActor->HasAuthority())
+void UModularMissionManagement::BugActor(AActor* InTarget)
+{
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
 		{
-			ServerClearDesignatedTarget();
+			ServerBugActor(InTarget);
+			return;
 		}
+	AActor* ValidTarget = IsValid(InTarget) ? InTarget : nullptr;
+	if (BuggedTarget == ValidTarget) return;
+	if (IsValid(BuggedTarget))
+		BuggedTarget->OnDestroyed.RemoveDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
+	BuggedTarget = ValidTarget;
+	PilotCuedWeapon.Reset();
+	if (IsValid(LockedTarget))
+		LockedTarget->OnDestroyed.AddUniqueDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
+	if (BuggedTarget)
+	{
+		BuggedTarget->OnDestroyed.AddUniqueDynamic(this, &UModularMissionManagement::HandleCueTargetDestroyed);
+		OnTargetBugged.Broadcast(BuggedTarget);
+	}
+	else OnBugCleared.Broadcast();
+	RefreshSelectedWeaponCue();
+}
+
+void UModularMissionManagement::ClearBuggedActor()
+{
+	BugActor(nullptr);
+}
+
+void UModularMissionManagement::HandleRadarLockAcquired(const FRadarTrack& Track)
+{
+	LockActor(Track.TrackedActor.Get());
+}
+
+void UModularMissionManagement::HandleRadarLockLost(int32 TrackID)
+{
+	(void)TrackID;
+	if (UAircraftRadarComponent* Radar = GetRadarComponent())
+		LockActor(Radar->GetSTTLockedActor());
+	else ClearLockedActor();
+}
+
+void UModularMissionManagement::HandleRadarTrackSelected(const FRadarTrack& Track)
+{
+	if (UAircraftRadarComponent* Radar = GetRadarComponent();
+		Radar && Track.TrackID == Radar->GetBuggedTrackID())
+		BugActor(Track.TrackedActor.Get());
+}
+
+void UModularMissionManagement::HandleRadarTrackDeselected(int32 TrackID)
+{
+	(void)TrackID;
+	if (UAircraftRadarComponent* Radar = GetRadarComponent())
+	{
+		FRadarTrack Bug;
+		BugActor(Radar->GetBuggedTrackID() >= 0 &&
+			Radar->GetTrackByID(Radar->GetBuggedTrackID(), Bug) ? Bug.TrackedActor.Get() : nullptr);
 	}
 }
 
 UAircraftRadarComponent* UModularMissionManagement::ResolveRadarComponent()
 {
-	if (!CachedRadarComponent)
+	if (!IsValid(CachedRadarComponent))
 	{
 		if (AActor* OwnerActor = GetOwner())
 		{
 			CachedRadarComponent = OwnerActor->FindComponentByClass<UAircraftRadarComponent>();
+			if (IsValid(CachedRadarComponent) && HasBegunPlay() && HasInventoryAuthority(this))
+			{
+				CachedRadarComponent->OnRadarLockAcquired.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarLockAcquired);
+				CachedRadarComponent->OnRadarLockLost.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarLockLost);
+				CachedRadarComponent->OnRadarTrackSelected.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarTrackSelected);
+				CachedRadarComponent->OnRadarTrackDeselected.AddUniqueDynamic(this, &UModularMissionManagement::HandleRadarTrackDeselected);
+				LockActor(CachedRadarComponent->GetSTTLockedActor());
+				FRadarTrack Bug;
+				BugActor(CachedRadarComponent->GetTrackByID(CachedRadarComponent->GetBuggedTrackID(), Bug) ? Bug.TrackedActor.Get() : nullptr);
+			}
 		}
 	}
 	return CachedRadarComponent;
@@ -1218,7 +1527,7 @@ UAircraftRadarComponent* UModularMissionManagement::ResolveRadarComponent()
 
 UAircraftRadarComponent* UModularMissionManagement::GetRadarComponent() const
 {
-	if (CachedRadarComponent)
+	if (IsValid(CachedRadarComponent))
 	{
 		return CachedRadarComponent;
 	}
@@ -1233,7 +1542,7 @@ UAircraftRadarComponent* UModularMissionManagement::GetRadarComponent() const
 
 URadarWarningReceiverComponent* UModularMissionManagement::ResolveRWRComponent()
 {
-	if (!CachedRWRComponent)
+	if (!IsValid(CachedRWRComponent))
 	{
 		if (AActor* OwnerActor = GetOwner())
 		{
@@ -1245,7 +1554,7 @@ URadarWarningReceiverComponent* UModularMissionManagement::ResolveRWRComponent()
 
 URadarWarningReceiverComponent* UModularMissionManagement::GetRWRComponent() const
 {
-	if (CachedRWRComponent)
+	if (IsValid(CachedRWRComponent))
 	{
 		return CachedRWRComponent;
 	}
@@ -1264,63 +1573,161 @@ bool UModularMissionManagement::CalculateMissileLaunchZone(int32 StationIndex, f
 	OutRne = 0.0f;
 	OutRmax = 0.0f;
 	OutInShootingEnvelope = false;
+	UMasterWeaponComponent* Weapon = GetActiveWeaponComponent(StationIndex);
+	AActor* Target = GetCueTargetForWeapon(Weapon);
+	if (const UIRMissileGuidanceComponent* IR = Cast<UIRMissileGuidanceComponent>(Weapon);
+		IR && IsValid(IR->GetLockedTarget())) Target = IR->GetLockedTarget();
+	if (!Weapon || !IsValid(Target) || !Weapon->GetDynamicLaunchZone(Target, OutRmin, OutRne, OutRmax)) return false;
+	OutInShootingEnvelope = Weapon->IsTargetInLaunchEnvelope(Target);
+	return true;
+}
 
-	if (!DesignatedTarget)
-	{
-		return false;
-	}
-
-	const AActor* OwnerActor = GetOwner();
-	if (!OwnerActor)
-	{
-		return false;
-	}
-
-	float TargetRange = FVector::Dist(OwnerActor->GetActorLocation(), DesignatedTarget->GetActorLocation());
-	float ClosureRate = 0.0f;
-
+bool UModularMissionManagement::GetPrimaryRadarTarget(FRadarTrack& OutTrack) const
+{
 	if (UAircraftRadarComponent* Radar = GetRadarComponent())
 	{
-		FRadarTrack Track;
-		if (Radar->GetTrackByActor(DesignatedTarget, Track))
+		const int32 STTID = Radar->GetSTTLockedTrackID();
+		if (STTID != INDEX_NONE && Radar->GetTrackByID(STTID, OutTrack))
 		{
-			TargetRange = Track.Range;
-			ClosureRate = Track.ClosureRate;
+			return true;
+		}
+
+		const int32 BugID = Radar->GetBuggedTrackID();
+		if (BugID != INDEX_NONE && Radar->GetTrackByID(BugID, OutTrack))
+		{
+			return true;
+		}
+
+		if (IsValid(BuggedTarget))
+		{
+			if (Radar->GetTrackByActor(BuggedTarget.Get(), OutTrack)) return true;
+		}
+		if (IsValid(LockedTarget))
+		{
+			if (Radar->GetTrackByActor(LockedTarget.Get(), OutTrack))
+			{
+				return true;
+			}
+		}
+	}
+	OutTrack = FRadarTrack();
+	return false;
+}
+
+bool UModularMissionManagement::GetGunLeadSolution(int32 StationIndex, FVector& OutLeadLocation, float& OutTimeOfFlight) const
+{
+	OutLeadLocation = FVector::ZeroVector;
+	OutTimeOfFlight = 0.0f;
+
+	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
+	if (ArrayIndex == INDEX_NONE)
+	{
+		return false;
+	}
+
+	const FWeaponStation& Station = Stations[ArrayIndex];
+	const AActor* OwnerActor = GetOwner();
+	if (!OwnerActor || (Station.StoreType != EStoreType::InternalCannon && Station.StoreType != EStoreType::GunPod))
+	{
+		return false;
+	}
+
+	// Retrieve target kinematics from radar track or locked target
+	FVector TargetPos = FVector::ZeroVector;
+	FVector TargetVel = FVector::ZeroVector;
+	FRadarTrack TargetTrack;
+
+	if (GetPrimaryRadarTarget(TargetTrack))
+	{
+		TargetPos = TargetTrack.LastKnownPosition;
+		TargetVel = TargetTrack.EstimatedVelocity;
+	}
+	else if (AActor* CueTarget = IsValid(BuggedTarget) ? BuggedTarget.Get() : GetLockedActor())
+	{
+		TargetPos = CueTarget->GetActorLocation();
+		TargetVel = CueTarget->GetVelocity();
+	}
+	else
+	{
+		return false;
+	}
+
+	// Determine muzzle exit position and bullet speed
+	FVector MuzzlePos = OwnerActor->GetActorLocation();
+	float BulletSpeed = 105000.0f; // 1050 m/s default (~20mm M61 Vulcan)
+	float GravityScale = 1.0f;
+
+	if (Station.StoreType == EStoreType::InternalCannon && Station.GunMuzzles.Num() > 0)
+	{
+		const FGunMuzzle& Muzzle = Station.GunMuzzles[0];
+		BulletSpeed = Muzzle.BulletSpeed;
+		GravityScale = Muzzle.GravityScale;
+		if (USceneComponent* MeshComp = ResolveAircraftMesh())
+		{
+			if (Muzzle.MuzzleSocketName != NAME_None && MeshComp->DoesSocketExist(Muzzle.MuzzleSocketName))
+			{
+				const FTransform MuzzleTransform = MeshComp->GetSocketTransform(Muzzle.MuzzleSocketName);
+				MuzzlePos = MuzzleTransform.GetLocation();
+			}
+		}
+	}
+	else
+	{
+		FStationStore ActiveStore;
+		if (GetActiveStoreForStation(StationIndex, ActiveStore))
+		{
+			if (USceneComponent* MeshComp = ResolveAircraftMesh())
+			{
+				if (ActiveStore.SocketName != NAME_None && MeshComp->DoesSocketExist(ActiveStore.SocketName))
+				{
+					const FTransform StoreTransform = MeshComp->GetSocketTransform(ActiveStore.SocketName);
+					MuzzlePos = StoreTransform.GetLocation();
+				}
+			}
 		}
 	}
 
-	FStationStore Store;
-	if (!GetActiveStoreForStation(StationIndex, Store))
+	const float Distance = FVector::Dist(MuzzlePos, TargetPos);
+	if (Distance <= KINDA_SMALL_NUMBER || BulletSpeed <= 0.0f)
 	{
 		return false;
 	}
 
-	if (!IsValid(Store.MountedActor))
+	const FVector AircraftVel = OwnerActor->GetVelocity();
+	const FVector RelativeVel = TargetVel - AircraftVel;
+	const FVector Offset = TargetPos - MuzzlePos;
+	const double A = RelativeVel.SizeSquared() - FMath::Square(static_cast<double>(BulletSpeed));
+	const double B = 2.0 * FVector::DotProduct(Offset, RelativeVel);
+	const double C = Offset.SizeSquared();
+	double TOF = -1.0;
+	if (FMath::Abs(A) < 1.e-6)
 	{
-		return false;
+		if (B < -SMALL_NUMBER) TOF = -C / B;
 	}
-
-	float BaseCruiseSpeed = 100000.0f; // 1000 m/s default (~Mach 3)
-	float MotorBurnTime = 5.0f;
-	float MaxFlightTime = 35.0f;
-
-	if (const UMissileGuidanceComponent* Guidance = Store.MountedActor->FindComponentByClass<UMissileGuidanceComponent>())
+	else
 	{
-		BaseCruiseSpeed = Guidance->MaxCruiseSpeed;
-		MaxFlightTime = 40.0f;
+		const double Discriminant = B * B - 4.0 * A * C;
+		if (Discriminant >= 0.0)
+		{
+			const double Root = FMath::Sqrt(Discriminant);
+			const double T1 = (-B - Root) / (2.0 * A);
+			const double T2 = (-B + Root) / (2.0 * A);
+			if (T1 > 0.0) TOF = T1;
+			if (T2 > 0.0 && (TOF <= 0.0 || T2 < TOF)) TOF = T2;
+		}
 	}
+	if (!FMath::IsFinite(TOF) || TOF <= 0.0) return false;
 
-	// Rmin: Minimum arming / motor ignition distance (~1.5 km)
-	OutRmin = FMath::Max(150000.0f, BaseCruiseSpeed * 1.5f);
+	// Gravity compensation (Z-drop)
+	const float GravityZ = GetWorld() ? GetWorld()->GetGravityZ() : -980.665f;
+	const FVector BulletGravityDrop(0.0f, 0.0f, 0.5f * GravityZ * GravityScale * TOF * TOF);
 
-	// Rne (No-Escape): Range against a maneuvering beaming target
-	const float ClosureBoost = ClosureRate * 15.0f;
-	OutRne = FMath::Max(OutRmin * 1.5f, (BaseCruiseSpeed * MotorBurnTime * 2.5f) + (ClosureBoost * 0.5f));
+	// Future predicted target position
+	const FVector FutureTargetPos = TargetPos + (TargetVel * TOF);
 
-	// Rmax (Aerodynamic Max Range): Maximum kinematic glide range
-	OutRmax = FMath::Max(OutRne * 1.3f, (BaseCruiseSpeed * MaxFlightTime * 0.5f) + ClosureBoost);
-
-	OutInShootingEnvelope = (TargetRange >= OutRmin && TargetRange <= OutRmax);
+	// Commanded aim point for lead pipper
+	OutLeadLocation = FutureTargetPos - BulletGravityDrop - (AircraftVel * TOF);
+	OutTimeOfFlight = TOF;
 	return true;
 }
 
@@ -1331,7 +1738,7 @@ bool UModularMissionManagement::SelectDogfightStation()
 	// Priority 1: Internal Cannon
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == EStoreType::InternalCannon && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == EStoreType::InternalCannon && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -1340,7 +1747,7 @@ bool UModularMissionManagement::SelectDogfightStation()
 	// Priority 2: Heat-seeking short-range IR missile (Sidewinder / Archer)
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == EStoreType::AirToAirMissile_IR && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == EStoreType::AirToAirMissile_IR && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -1349,7 +1756,7 @@ bool UModularMissionManagement::SelectDogfightStation()
 	// Priority 3: Gun Pod
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == EStoreType::GunPod && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == EStoreType::GunPod && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -1363,7 +1770,7 @@ bool UModularMissionManagement::SelectBVRStation()
 	// Priority 1: Radar-guided medium/long range missile (AMRAAM / Sparrow)
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == EStoreType::AirToAirMissile_Radar && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == EStoreType::AirToAirMissile_Radar && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -1372,7 +1779,7 @@ bool UModularMissionManagement::SelectBVRStation()
 	// Priority 2: IR missile fallback
 	for (const FWeaponStation& Station : Stations)
 	{
-		if (Station.StoreType == EStoreType::AirToAirMissile_IR && Station.GetCurrentAmmo() > 0)
+		if (Station.StoreType == EStoreType::AirToAirMissile_IR && IsAvailableStation(Station))
 		{
 			return SelectStation(Station.StationIndex);
 		}
@@ -1381,17 +1788,19 @@ bool UModularMissionManagement::SelectBVRStation()
 	return false;
 }
 
-void UModularMissionManagement::HandleDesignatedTargetDestroyed(AActor* DestroyedActor)
+void UModularMissionManagement::HandleCueTargetDestroyed(AActor* DestroyedActor)
 {
-	// Safely clear target if the destroyed actor was our target or our current target is no longer valid
-	if (DestroyedActor == DesignatedTarget || !IsValid(DesignatedTarget))
-	{
-		ClearDesignatedTarget();
-	}
+	if (DestroyedActor == LockedTarget) ClearLockedActor();
+	if (DestroyedActor == BuggedTarget) ClearBuggedActor();
 }
 
 bool UModularMissionManagement::CanFire(int32 StationIndex, EWeaponLaunchFailureReason& OutFailReason) const
 {
+	if (bStoreReleaseInProgress)
+	{
+		OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
 	if (MasterArmMode == EMasterArmMode::Safe)
 	{
 		OutFailReason = EWeaponLaunchFailureReason::MasterArmSafe;
@@ -1405,44 +1814,61 @@ bool UModularMissionManagement::CanFire(int32 StationIndex, EWeaponLaunchFailure
 		return false;
 	}
 
+	if (MasterMode == EAircraftMasterMode::Navigation)
+	{
+		OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
 	const FWeaponStation& Station = Stations[ArrayIndex];
-	if (IsValid(DesignatedTarget))
+	const UMasterWeaponComponent* SelectedWeapon = GetActiveWeaponComponent(StationIndex);
+	AActor* CueTarget = Station.StoreType == EStoreType::InternalCannon ?
+		(GetBuggedActor() ? GetBuggedActor() : GetLockedActor()) : GetCueTargetForWeapon(SelectedWeapon);
+	if (IsValid(CueTarget) && Cast<URadarMissileGuidanceComponent>(SelectedWeapon))
 	{
 		if (UAircraftRadarComponent* Radar = GetRadarComponent())
 		{
 			FRadarTrack Linked;
 			if (Radar->GetSelectedLinkedTrackID() != -1)
 			{
-				if (!Radar->GetSelectedLinkedTrackForActor(DesignatedTarget, Linked))
+				if (!Radar->GetSelectedLinkedTrackForActor(CueTarget, Linked))
 				{
-					OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
+					OutFailReason = EWeaponLaunchFailureReason::DatalinkSupportUnavailable;
 					return false;
 				}
 				UAircraftRadarComponent* Source = Radar->GetLinkedTrackSource(Linked.TrackID);
-				if (!Radar->bAllowRemoteWeaponSupport || !IsValid(Source) ||
-					(Station.StoreType != EStoreType::AirToAirMissile_Radar && Station.StoreType != EStoreType::AirToGroundMissile))
+				if (!Radar->bAllowRemoteWeaponSupport || !IsValid(Source))
 				{
-					OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
+					OutFailReason = EWeaponLaunchFailureReason::DatalinkSupportUnavailable;
+					return false;
+				}
+				if (Station.StoreType != EStoreType::AirToAirMissile_Radar && Station.StoreType != EStoreType::AirToGroundMissile)
+				{
+					OutFailReason = EWeaponLaunchFailureReason::InvalidStoreType;
 					return false;
 				}
 				const URadarMissileGuidanceComponent* Missile = Cast<URadarMissileGuidanceComponent>(
 					GetActiveWeaponComponent(StationIndex));
 				if (!Missile)
 				{
-					OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
+					OutFailReason = EWeaponLaunchFailureReason::NoWeaponConfigured;
 					return false;
 				}
-				if (Missile)
+				if ((Cast<USemiActiveRadarMissileGuidanceComponent>(Missile) ||
+					Cast<UHybridRadarMissileGuidanceComponent>(Missile)) &&
+					!Source->IsContinuousWaveIlluminating(CueTarget))
 				{
-					if ((Cast<USemiActiveRadarMissileGuidanceComponent>(Missile) ||
-						Cast<UHybridRadarMissileGuidanceComponent>(Missile)) &&
-						Source->GetSTTLockedActor() != DesignatedTarget &&
-						!Source->IsContinuousWaveIlluminating(DesignatedTarget.Get()))
-						{
-							OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
-							return false;
-						}
+					OutFailReason = EWeaponLaunchFailureReason::NoContinuousWaveIllumination;
+					return false;
 				}
+			}
+			else if ((Cast<USemiActiveRadarMissileGuidanceComponent>(SelectedWeapon) ||
+				(Cast<UHybridRadarMissileGuidanceComponent>(SelectedWeapon) &&
+				 SelectedWeapon->FiringRequirement == EWeaponFiringRequirement::HardLock)) &&
+				!Radar->IsContinuousWaveIlluminating(CueTarget))
+			{
+				// A retained STT track is insufficient when an animated plate is pointing away.
+				OutFailReason = EWeaponLaunchFailureReason::NoContinuousWaveIllumination;
+				return false;
 			}
 		}
 	}
@@ -1470,7 +1896,9 @@ bool UModularMissionManagement::CanFire(int32 StationIndex, EWeaponLaunchFailure
 		}
 	}
 
-	if (Station.GetCurrentAmmo() <= 0 || Station.Status == EStationStatus::Empty)
+	const int32 AvailableAmmo = Station.StoreType == EStoreType::InternalCannon && MasterArmMode == EMasterArmMode::Simulate
+		? Station.SimulatedAmmo : Station.GetCurrentAmmo();
+	if (AvailableAmmo <= 0 || Station.Status == EStationStatus::Empty)
 	{
 		OutFailReason = EWeaponLaunchFailureReason::AmmoDepleted;
 		return false;
@@ -1490,31 +1918,40 @@ bool UModularMissionManagement::CanFire(int32 StationIndex, EWeaponLaunchFailure
 
 	if (Station.StoreType != EStoreType::InternalCannon)
 	{
-		for (const FStationStore& Store : Station.Stores)
+		FStationStore Store;
+		if (!GetActiveStoreForStation(StationIndex, Store) || Store.Status != EStoreStatus::Ready)
 		{
-			if (Store.Status == EStoreStatus::Ready && IsValid(Store.MountedActor))
+			OutFailReason = EWeaponLaunchFailureReason::AmmoDepleted;
+			return false;
+		}
+		if (!IsValid(Store.MountedActor))
+		{
+			if (!Store.WeaponClass)
 			{
-				if (UMasterWeaponComponent* WeaponComp = Store.MountedActor->FindComponentByClass<UMasterWeaponComponent>())
-				{
-					if (!Cast<UMissileGuidanceComponent>(WeaponComp) && !WeaponComp->CanFireWeapon())
-					{
-						OutFailReason = EWeaponLaunchFailureReason::WeaponNotReady;
-						return false;
-					}
-				}
-				break; // Only check the next ready store
+				OutFailReason = EWeaponLaunchFailureReason::NoWeaponConfigured;
+				return false;
 			}
+			// On-demand actors are checked again before any physical release.
+		}
+		else
+		{
+			TInlineComponentArray<UMasterWeaponComponent*> Weapons(Store.MountedActor.Get());
+			if (Weapons.Num() > 1 || !HasRequiredWeaponComponent(Station.StoreType, SelectedWeapon) ||
+				(Station.bUsesAmmoManagement && (!SelectedWeapon ||
+				 Cast<UMissileGuidanceComponent>(SelectedWeapon) || Cast<UDroppableItemComponent>(SelectedWeapon))))
+			{
+				OutFailReason = EWeaponLaunchFailureReason::NoWeaponConfigured;
+				return false;
+			}
+			if (SelectedWeapon && !SelectedWeapon->CanFireWeapon(OutFailReason)) return false;
 		}
 	}
 
-	// IFF friendly-fire safety: inhibit release when designated target is friendly
-	if (bInhibitFriendlyFire && IsValid(DesignatedTarget))
+	// The IR head can acquire independently of the aircraft's radar designation.
+	if (IsWeaponReleaseInhibitedByIFF(SelectedWeapon, CueTarget))
 	{
-		if (FCombatTeamUtility::IsFriendly(GetOwner(), DesignatedTarget.Get()))
-		{
-			OutFailReason = EWeaponLaunchFailureReason::FriendlyTargetInhibit;
-			return false;
-		}
+		OutFailReason = EWeaponLaunchFailureReason::FriendlyTargetInhibit;
+		return false;
 	}
 
 	OutFailReason = EWeaponLaunchFailureReason::None;
@@ -1524,15 +1961,16 @@ bool UModularMissionManagement::CanFire(int32 StationIndex, EWeaponLaunchFailure
 bool UModularMissionManagement::Fire(int32 StationIndex)
 {
 	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && OwnerActor && !OwnerActor->HasAuthority())
 	{
 		ServerFire(StationIndex);
 		return true; // Request queued; OnWeaponLaunchResult reports the server result.
 	}
 
-	EWeaponLaunchFailureReason FailReason;
+	EWeaponLaunchFailureReason FailReason = EWeaponLaunchFailureReason::None;
 	if (!CanFire(StationIndex, FailReason))
 	{
+		LastLaunchFailureReason = FailReason;
 		OnWeaponLaunchFailed.Broadcast(StationIndex, FailReason);
 		return false;
 	}
@@ -1540,87 +1978,119 @@ bool UModularMissionManagement::Fire(int32 StationIndex)
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
+		LastLaunchFailureReason = EWeaponLaunchFailureReason::StationNotFound;
+		OnWeaponLaunchFailed.Broadcast(StationIndex, LastLaunchFailureReason);
 		return false;
 	}
 
 	FWeaponStation& Station = Stations[ArrayIndex];
-	AActor* TargetToUse = DesignatedTarget.Get();
+	AActor* TargetToUse = GetCueTargetForWeapon(GetActiveWeaponComponent(StationIndex));
 
-	// If station is an internal cannon, execute a single gun burst cycle
+	// Internal cannon single burst cycle
 	if (Station.StoreType == EStoreType::InternalCannon)
 	{
-		ProcessGunFireCycle(StationIndex);
-		OnWeaponFired.Broadcast(StationIndex, nullptr, Station.StoreType, Station.GetCurrentAmmo());
+		if (!ProcessGunFireCycle(StationIndex))
+		{
+			return false;
+		}
+		LastLaunchFailureReason = EWeaponLaunchFailureReason::None;
+		OnWeaponFired.Broadcast(StationIndex, nullptr, Station.StoreType,
+			MasterArmMode == EMasterArmMode::Simulate ? Station.SimulatedAmmo : Station.CurrentAmmo);
 		return true;
 	}
 
-	// If in SIMULATE mode, execute dry fire without consuming weapon or physics
+	// Dry fire simulation
 	if (MasterArmMode == EMasterArmMode::Simulate)
 	{
+		LastLaunchFailureReason = EWeaponLaunchFailureReason::None;
 		OnWeaponFired.Broadcast(StationIndex, nullptr, Station.StoreType, Station.GetCurrentAmmo());
 		return true;
 	}
 
 	// Live Release
-	AActor* ReleasedActor = ExecuteStoreRelease(Station, TargetToUse);
+	TGuardValue<bool> ReleaseGuard(bStoreReleaseInProgress, true);
+	EWeaponLaunchFailureReason ReleaseFailReason = EWeaponLaunchFailureReason::None;
+	if (SelectedStationIndex == StationIndex) UnbindActiveWeaponDelegates();
+	AActor* ReleasedActor = ExecuteStoreRelease(Station, TargetToUse, ReleaseFailReason);
 	if (!IsValid(ReleasedActor))
 	{
-		OnWeaponLaunchFailed.Broadcast(StationIndex, EWeaponLaunchFailureReason::WeaponNotReady);
+		BindActiveWeaponDelegates();
+		LastLaunchFailureReason = (ReleaseFailReason != EWeaponLaunchFailureReason::None) ? ReleaseFailReason : EWeaponLaunchFailureReason::ReleaseMechanismFailed;
+		OnWeaponLaunchFailed.Broadcast(StationIndex, LastLaunchFailureReason);
 		return false;
 	}
 
-	if (Station.bUsesAmmoManagement)
-	{
-		Station.CurrentAmmo = FMath::Max(0, Station.CurrentAmmo - 1);
-	}
+	LastLaunchFailureReason = EWeaponLaunchFailureReason::None;
 
-	if (Station.GetCurrentAmmo() == 0)
-	{
-		Station.Status = EStationStatus::Empty;
-	}
+	if (Station.bUsesAmmoManagement) Station.CurrentAmmo = FMath::Max(0, Station.CurrentAmmo - 1);
+	const int32 RemainingAmmo = Station.GetCurrentAmmo();
+	const int32 Capacity = Station.GetMaxAmmo();
+	const EStoreType FiredType = Station.StoreType;
+	const int32 SymmetricStation = Station.SymmetricStationIndex;
+	if (RemainingAmmo == 0) Station.Status = EStationStatus::Empty;
+	OnStationAmmoChanged.Broadcast(StationIndex, RemainingAmmo, Capacity);
+	if (RemainingAmmo == 0) OnStationStatusChanged.Broadcast(StationIndex, EStationStatus::Empty);
+
+	// Report the actual release before auto-stepping to its symmetric partner (e.g. 7 -> 5).
+	OnWeaponFired.Broadcast(StationIndex, ReleasedActor, FiredType, RemainingAmmo);
 
 	// Auto-step station logic to maintain balance
-	if (bAutoStepStationOnFire)
+	if (bAutoStepStationOnFire && SelectedStationIndex == StationIndex)
 	{
-		if (Station.SymmetricStationIndex > 0)
+		if (SymmetricStation > 0)
 		{
 			FWeaponStation SymStation;
-			if (GetStation(Station.SymmetricStationIndex, SymStation) && SymStation.GetCurrentAmmo() > 0)
+			if (GetStation(SymmetricStation, SymStation) &&
+				SymStation.StoreType == FiredType && IsAvailableStation(SymStation))
 			{
-				SelectStation(Station.SymmetricStationIndex);
+				SelectStation(SymmetricStation);
 			}
 			else
 			{
-				SelectNextStationOfStoreType(Station.StoreType);
+				SelectNextStationOfStoreType(FiredType);
 			}
 		}
 		else
 		{
-			SelectNextStationOfStoreType(Station.StoreType);
+			SelectNextStationOfStoreType(FiredType);
 		}
 	}
-	else
+	else if (SelectedStationIndex == StationIndex)
 	{
-		// If we didn't change stations, ensure the next weapon on this same rack is activated
-		if (MasterMode != EAircraftMasterMode::Navigation)
-		{
-			if (UMasterWeaponComponent* NextWeapon = GetActiveWeaponComponent(SelectedStationIndex))
-			{
-				ProgramWeaponIgnoreList(NextWeapon);
-				NextWeapon->ActivateWeapon(true);
-			}
-		}
+		// If we didn't change stations, prepare the next weapon on this same rack.
+		PrepareActiveWeaponOnStation(SelectedStationIndex);
 	}
 
-	// Broadcast events after all state changes and auto-stepping are complete
-	OnWeaponFired.Broadcast(StationIndex, ReleasedActor, Station.StoreType, Station.GetCurrentAmmo());
 	OnStoresInventoryChanged.Broadcast();
+	BindActiveWeaponDelegates();
 
 	return true;
 }
 
+bool UModularMissionManagement::FireMountedWeapon(const UMasterWeaponComponent* Weapon)
+{
+	if (!IsValid(Weapon) || !IsValid(Weapon->GetOwner())) return false;
+	for (const FWeaponStation& Station : Stations)
+	{
+		if (Station.StoreType == EStoreType::InternalCannon) continue;
+		if (GetActiveWeaponComponent(Station.StationIndex) == Weapon)
+		{
+			return Fire(Station.StationIndex);
+		}
+	}
+	return false;
+}
+
 void UModularMissionManagement::StartFiring(int32 StationIndex)
 {
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+	{
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
+		{
+			ServerStartFiring(StationIndex);
+			return;
+		}
+	}
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
@@ -1631,14 +2101,12 @@ void UModularMissionManagement::StartFiring(int32 StationIndex)
 	FWeaponStation& Station = Stations[ArrayIndex];
 	if (Station.StoreType != EStoreType::InternalCannon)
 	{
-		// Safely abort if called on non-cannon stations
 		UE_LOG(LogTemp, Warning, TEXT("UModularMissionManagement::StartFiring: Station %d is not configured as an InternalCannon! Aborting."), StationIndex);
 		return;
 	}
 
 	if (ActiveGunTimers.Contains(StationIndex))
 	{
-		// Already firing on this station
 		return;
 	}
 
@@ -1649,24 +2117,25 @@ void UModularMissionManagement::StartFiring(int32 StationIndex)
 		return;
 	}
 
-	AActor* OwnerActor = GetOwner();
-	const bool bHasAuthority = OwnerActor ? OwnerActor->HasAuthority() : true;
-
-	// Calculate fire interval from RPM
 	const float SafeRPM = FMath::Max(60.0f, Station.RateOfFireRPM);
 	const float FireInterval = 60.0f / SafeRPM;
 
-	// Broadcast lightweight trigger start event
+	// Broadcast trigger start
 	OnGunFiringStarted.Broadcast(StationIndex);
 
-	// Fire initial shot immediately
-	ProcessGunFireCycle(StationIndex);
+	if (!ProcessGunFireCycle(StationIndex))
+	{
+		OnGunFiringStopped.Broadcast(StationIndex);
+		return;
+	}
 
-	// Set recurring timer for continuous fire if still has ammo
-	if (Station.CurrentAmmo > 0)
+	// Recurring timer for continuous fire
+	FWeaponStation CurrentStation;
+	EWeaponLaunchFailureReason CurrentReason;
+	if (GetStation(StationIndex, CurrentStation) && CanFire(StationIndex, CurrentReason))
 	{
 		FTimerDelegate TimerDel;
-		TimerDel.BindUObject(this, &UModularMissionManagement::ProcessGunFireCycle, StationIndex);
+		TimerDel.BindUObject(this, &UModularMissionManagement::HandleGunFireTimerTick, StationIndex);
 
 		FTimerHandle NewHandle;
 		if (UWorld* World = GetWorld())
@@ -1675,16 +2144,13 @@ void UModularMissionManagement::StartFiring(int32 StationIndex)
 			ActiveGunTimers.Add(StationIndex, NewHandle);
 		}
 	}
-
-	if (!bHasAuthority)
-	{
-		ServerStartFiring(StationIndex);
-	}
 	else
 	{
-		GunFiringState.StationIndex = StationIndex;
-		GunFiringState.bIsFiring = true;
+		OnGunFiringStopped.Broadcast(StationIndex);
 	}
+
+	GunFiringState.StationIndex = StationIndex;
+	GunFiringState.bIsFiring = ActiveGunTimers.Contains(StationIndex);
 }
 
 void UModularMissionManagement::StopFiring(int32 StationIndex)
@@ -1700,7 +2166,7 @@ void UModularMissionManagement::StopFiring(int32 StationIndex)
 	}
 
 	AActor* OwnerActor = GetOwner();
-	const bool bHasAuthority = OwnerActor ? OwnerActor->HasAuthority() : true;
+	const bool bHasAuthority = !GetWorld() || !GetWorld()->IsGameWorld() || !OwnerActor || OwnerActor->HasAuthority();
 
 	if (!bHasAuthority)
 	{
@@ -1727,52 +2193,57 @@ void UModularMissionManagement::StopFiringActive()
 
 bool UModularMissionManagement::IsStationFiring(int32 StationIndex) const
 {
-	return ActiveGunTimers.Contains(StationIndex);
+	return ActiveGunTimers.Contains(StationIndex) ||
+		(GunFiringState.bIsFiring && GunFiringState.StationIndex == StationIndex);
 }
 
 bool UModularMissionManagement::IsAnyGunFiring() const
 {
-	return ActiveGunTimers.Num() > 0;
+	return ActiveGunTimers.Num() > 0 || GunFiringState.bIsFiring;
 }
 
-void UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
+bool UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
 {
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+	{
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority()) return false;
+	}
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
 		StopFiring(StationIndex);
-		return;
+		return false;
 	}
 
 	FWeaponStation& Station = Stations[ArrayIndex];
 	if (Station.StoreType != EStoreType::InternalCannon)
 	{
 		StopFiring(StationIndex);
-		return;
+		return false;
 	}
 
-	// Verify Master Arm
-	if (MasterArmMode == EMasterArmMode::Safe)
+	EWeaponLaunchFailureReason GateReason;
+	if (!CanFire(StationIndex, GateReason))
 	{
 		StopFiring(StationIndex);
-		OnWeaponLaunchFailed.Broadcast(StationIndex, EWeaponLaunchFailureReason::MasterArmSafe);
-		return;
+		LastLaunchFailureReason = GateReason;
+		OnWeaponLaunchFailed.Broadcast(StationIndex, GateReason);
+		return false;
 	}
 
-	if (Station.Status == EStationStatus::Fault)
+	const bool bSimulatedFire = MasterArmMode == EMasterArmMode::Simulate;
+	if ((bSimulatedFire ? Station.SimulatedAmmo : Station.CurrentAmmo) <= 0 || Station.GunMuzzles.Num() == 0)
 	{
 		StopFiring(StationIndex);
-		OnWeaponLaunchFailed.Broadcast(StationIndex, EWeaponLaunchFailureReason::StationFault);
-		return;
-	}
-
-	if (Station.CurrentAmmo <= 0 || Station.GunMuzzles.Num() == 0)
-	{
-		StopFiring(StationIndex);
-		Station.Status = EStationStatus::Empty;
-		OnWeaponLaunchFailed.Broadcast(StationIndex, EWeaponLaunchFailureReason::AmmoDepleted);
-		OnStoresInventoryChanged.Broadcast();
-		return;
+		if (!bSimulatedFire) Station.Status = EStationStatus::Empty;
+		LastLaunchFailureReason = EWeaponLaunchFailureReason::AmmoDepleted;
+		OnWeaponLaunchFailed.Broadcast(StationIndex, LastLaunchFailureReason);
+		if (!bSimulatedFire)
+		{
+			OnStationStatusChanged.Broadcast(StationIndex, EStationStatus::Empty);
+			OnStoresInventoryChanged.Broadcast();
+		}
+		return false;
 	}
 
 	UWorld* World = GetWorld();
@@ -1780,7 +2251,7 @@ void UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
 	if (!World || !OwnerActor)
 	{
 		StopFiring(StationIndex);
-		return;
+		return false;
 	}
 
 	USceneComponent* MeshComp = ResolveAircraftMesh();
@@ -1809,13 +2280,15 @@ void UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
 	if (MuzzlesToFire.Num() == 0)
 	{
 		StopFiring(StationIndex);
-		OnWeaponLaunchFailed.Broadcast(StationIndex, EWeaponLaunchFailureReason::NoWeaponConfigured);
-		return;
+		LastLaunchFailureReason = EWeaponLaunchFailureReason::NoWeaponConfigured;
+		OnWeaponLaunchFailed.Broadcast(StationIndex, LastLaunchFailureReason);
+		return false;
 	}
 
+	int32 RoundsFiredThisCycle = 0;
 	for (int32 MuzzleIdx : MuzzlesToFire)
 	{
-		if (Station.CurrentAmmo <= 0)
+		if ((bSimulatedFire ? Station.SimulatedAmmo : Station.CurrentAmmo) <= 0)
 		{
 			break;
 		}
@@ -1838,7 +2311,7 @@ void UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
 		}
 
 		// In SIMULATE mode, do not register physical ballistic bullets
-		if (MasterArmMode != EMasterArmMode::Simulate)
+		if (!bSimulatedFire)
 		{
 			FActiveTracedBullet NewBullet;
 			NewBullet.CurrentPosition = MuzzleTransform.GetLocation();
@@ -1860,19 +2333,32 @@ void UModularMissionManagement::ProcessGunFireCycle(int32 StationIndex)
 			}
 		}
 
-		Station.CurrentAmmo = FMath::Max(0, Station.CurrentAmmo - 1);
+		if (bSimulatedFire) Station.SimulatedAmmo = FMath::Max(0, Station.SimulatedAmmo - 1);
+		else Station.CurrentAmmo = FMath::Max(0, Station.CurrentAmmo - 1);
+		RoundsFiredThisCycle++;
 	}
 
-	if (Station.CurrentAmmo == 0)
+	const int32 RemainingAmmo = bSimulatedFire ? Station.SimulatedAmmo : Station.CurrentAmmo;
+	const int32 Capacity = Station.GetMaxAmmo();
+	const bool bEmpty = RemainingAmmo == 0;
+	if (bEmpty && !bSimulatedFire) Station.Status = EStationStatus::Empty;
+	if (RoundsFiredThisCycle > 0) OnStationAmmoChanged.Broadcast(StationIndex, RemainingAmmo, Capacity);
+	if (bEmpty)
 	{
-		Station.Status = EStationStatus::Empty;
 		StopFiring(StationIndex);
-		OnStoresInventoryChanged.Broadcast();
+		if (!bSimulatedFire)
+		{
+			OnStationStatusChanged.Broadcast(StationIndex, EStationStatus::Empty);
+			OnStoresInventoryChanged.Broadcast();
+		}
 	}
+
+	return RoundsFiredThisCycle > 0;
 }
 
 void UModularMissionManagement::SimulateTracedBullets(float DeltaTime)
 {
+	if (!FMath::IsFinite(DeltaTime) || DeltaTime <= 0.0f) return;
 	UWorld* World = GetWorld();
 	AActor* OwnerActor = GetOwner();
 	if (!World || !OwnerActor)
@@ -1892,32 +2378,40 @@ void UModularMissionManagement::SimulateTracedBullets(float DeltaTime)
 		QueryParams.AddIgnoredActor(InstigatorPawn);
 	}
 
+	struct FPendingGunHit { int32 Station; int32 Muzzle; FHitResult Hit; };
+	TArray<FPendingGunHit> PendingHits;
 	for (int32 i = ActiveTracedBullets.Num() - 1; i >= 0; --i)
 	{
 		FActiveTracedBullet& Bullet = ActiveTracedBullets[i];
-		Bullet.RemainingLifetime -= DeltaTime;
 		if (Bullet.RemainingLifetime <= 0.0f)
 		{
 			ActiveTracedBullets.RemoveAtSwap(i);
 			continue;
 		}
+		const float Step = FMath::Min(DeltaTime, Bullet.RemainingLifetime);
+		Bullet.RemainingLifetime -= Step;
+		FVector Travel = Bullet.Velocity * Step;
 
 		// Apply aerodynamic drag deceleration: a = -v_hat * (v^2 * Cd)
 		if (Bullet.DragCoefficient > 0.0f)
 		{
-			const float SpeedSq = Bullet.Velocity.SizeSquared();
-			const FVector DragForce = -Bullet.Velocity.GetSafeNormal() * (SpeedSq * Bullet.DragCoefficient);
-			Bullet.Velocity += DragForce * DeltaTime;
+			const float Speed = Bullet.Velocity.Size();
+			const float DragStep = Speed * Bullet.DragCoefficient * Step;
+			// Exact quadratic-drag step: finite hitches cannot reverse a bullet.
+			if (DragStep > SMALL_NUMBER)
+				Travel *= FMath::Loge(1.0f + DragStep) / DragStep;
+			Bullet.Velocity /= 1.0f + DragStep;
 		}
 
 		// Apply gravity drop
 		if (Bullet.GravityScale > 0.0f)
 		{
-			const FVector GravityAccel(0.0f, 0.0f, -980.0f * Bullet.GravityScale);
-			Bullet.Velocity += GravityAccel * DeltaTime;
+			const FVector GravityAccel(0.0f, 0.0f, World->GetGravityZ() * Bullet.GravityScale);
+			Travel += GravityAccel * (0.5f * Step * Step);
+			Bullet.Velocity += GravityAccel * Step;
 		}
 
-		const FVector NextPosition = Bullet.CurrentPosition + (Bullet.Velocity * DeltaTime);
+		const FVector NextPosition = Bullet.CurrentPosition + Travel;
 
 		FHitResult HitResult;
 		bool bHit = false;
@@ -1953,12 +2447,7 @@ void UModularMissionManagement::SimulateTracedBullets(float DeltaTime)
 				FAircraftCombatDebug::DrawBulletImpact(World, HitResult.ImpactPoint, HitResult.ImpactNormal);
 			}
 
-			// Broadcast hit result to user logic (Server Authoritative)
-			if (OwnerActor->HasAuthority())
-			{
-				OnGunBulletHit.Broadcast(Bullet.StationIndex, Bullet.MuzzleIndex, HitResult);
-			}
-
+			PendingHits.Add({Bullet.StationIndex, Bullet.MuzzleIndex, HitResult});
 			ActiveTracedBullets.RemoveAtSwap(i);
 		}
 		else
@@ -1969,12 +2458,22 @@ void UModularMissionManagement::SimulateTracedBullets(float DeltaTime)
 			}
 
 			Bullet.CurrentPosition = NextPosition;
+			if (Bullet.RemainingLifetime <= 0.0f) ActiveTracedBullets.RemoveAtSwap(i);
 		}
+	}
+	// Dispatch after simulation: callbacks may fire again, reload, or destroy the
+	// carrier, and must never invalidate an in-flight array reference.
+	for (const FPendingGunHit& Pending : PendingHits)
+	{
+		if (!IsValid(OwnerActor) || OwnerActor->IsActorBeingDestroyed()) break;
+		if (!World->IsGameWorld() || OwnerActor->HasAuthority())
+			OnGunBulletHit.Broadcast(Pending.Station, Pending.Muzzle, Pending.Hit);
 	}
 }
 
-AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, AActor* TargetActor)
+AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, AActor* TargetActor, EWeaponLaunchFailureReason& OutFailReason)
 {
+	OutFailReason = EWeaponLaunchFailureReason::None;
 	AActor* FiredActor = nullptr;
 	FStationStore* ActiveStore = nullptr;
 	bool bSpawnedForRelease = false;
@@ -1991,6 +2490,7 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 
 	if (!ActiveStore)
 	{
+		OutFailReason = EWeaponLaunchFailureReason::AmmoDepleted;
 		return nullptr;
 	}
 
@@ -2015,30 +2515,56 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 
 			FiredActor = World->SpawnActor<AActor>(ActiveStore->WeaponClass, SpawnTransform, SpawnParams);
 			bSpawnedForRelease = IsValid(FiredActor);
+			if (bSpawnedForRelease)
+			{
+				if (MeshComp) FiredActor->AttachToComponent(MeshComp, FAttachmentTransformRules::SnapToTargetNotIncludingScale, ActiveStore->SocketName);
+				else FiredActor->AttachToActor(OwnerActor, FAttachmentTransformRules::KeepWorldTransform);
+				if (AWeapon* Weapon = Cast<AWeapon>(FiredActor)) Weapon->SetMounted(true, OwnerActor);
+			}
 		}
 	}
 
 	if (!IsValid(FiredActor))
 	{
+		OutFailReason = EWeaponLaunchFailureReason::StoreSpawnFailed;
 		return nullptr;
 	}
 
 	USceneComponent* MeshComp = ResolveAircraftMesh();
-	auto RejectRelease = [&]() -> AActor*
+	auto RejectRelease = [&](EWeaponLaunchFailureReason Reason) -> AActor*
 	{
-		if (bSpawnedForRelease && IsValid(FiredActor)) FiredActor->Destroy();
+		OutFailReason = Reason;
+		if (bSpawnedForRelease && IsValid(FiredActor))
+		{
+			FiredActor->Destroy();
+		}
 		return nullptr;
 	};
 
-	if (UMasterWeaponComponent* WeaponComp = FiredActor->FindComponentByClass<UMasterWeaponComponent>())
+	TInlineComponentArray<UMasterWeaponComponent*> ReleaseComponents(FiredActor);
+	if (ReleaseComponents.Num() > 1 || !HasRequiredWeaponComponent(Station.StoreType, ResolveStoreWeapon(FiredActor)))
+		return RejectRelease(EWeaponLaunchFailureReason::NoWeaponConfigured);
+	UMasterWeaponComponent* WeaponComp = ResolveStoreWeapon(FiredActor);
+	if (Station.bUsesAmmoManagement && (!WeaponComp ||
+		Cast<UMissileGuidanceComponent>(WeaponComp) || Cast<UDroppableItemComponent>(WeaponComp)))
+		return RejectRelease(EWeaponLaunchFailureReason::InvalidStoreType);
+	if (bSpawnedForRelease) TargetActor = GetCueTargetForWeapon(WeaponComp);
+
+	if (WeaponComp)
 	{
 		WeaponComp->InitializeWeapon(Cast<APawn>(GetOwner()));
 		ProgramWeaponIgnoreList(WeaponComp);
+
 		if (UMissileGuidanceComponent* Guidance = Cast<UMissileGuidanceComponent>(WeaponComp))
 		{
 			FMissileLaunchConfiguration Launch;
 			Launch.Carrier = Cast<APawn>(GetOwner());
 			Launch.Target = Guidance->GetTargetSolution();
+			Launch.bMadDog = !IsValid(TargetActor) && !IsValid(Guidance->GetLockedTarget());
+			if (!IsValid(TargetActor) &&
+				(Cast<URadarMissileGuidanceComponent>(Guidance) || Cast<UIRMissileGuidanceComponent>(Guidance)))
+				Launch.Target = FMissileTargetSolution();
+
 			if (IsValid(TargetActor) && !Cast<URadarMissileGuidanceComponent>(Guidance))
 			{
 				Launch.Target.bValid = true;
@@ -2048,30 +2574,43 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 				Launch.Target.Velocity = TargetActor->GetVelocity();
 				Launch.Target.MeasurementTimeSeconds = GetWorld()->GetTimeSeconds();
 			}
+
 			if (URadarMissileGuidanceComponent* RadarGuidance = Cast<URadarMissileGuidanceComponent>(Guidance))
 			{
-				if (IsValid(TargetActor)) Launch.Target.TargetActor = TargetActor;
+				if (IsValid(TargetActor))
+				{
+					Launch.Target.TargetActor = TargetActor;
+				}
+
 				if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
 				{
 					Launch.LaunchRadar = Radar;
 					Launch.Uplink = Radar;
 					Launch.Illuminator = Radar;
+
 					FRadarTrack Track;
 					Track.TrackID = INDEX_NONE;
-					const bool bRemote = IsValid(TargetActor) &&
-						Radar->GetSelectedLinkedTrackForActor(TargetActor, Track);
+					const bool bRemote = IsValid(TargetActor) && Radar->GetSelectedLinkedTrackForActor(TargetActor, Track);
+
 					if (bRemote)
 					{
 						Launch.Illuminator = Radar->GetLinkedTrackSource(Track.TrackID);
-						if (!IsValid(Launch.Illuminator)) return RejectRelease();
+						if (!IsValid(Launch.Illuminator))
+						{
+							return RejectRelease(EWeaponLaunchFailureReason::DatalinkSupportUnavailable);
+						}
 					}
 					else if (IsValid(TargetActor) && !Radar->GetTrackByActor(TargetActor, Track))
 					{
 						Track.TrackID = INDEX_NONE;
 					}
+
 					if (!bRemote && Track.TrackID != INDEX_NONE &&
-						(Track.Status == ERadarTrackStatus::Lost ||
-						Track.TrackAge > Radar->LocalCorrelationFreshnessSeconds)) Track.TrackID = INDEX_NONE;
+						(Track.Status == ERadarTrackStatus::Lost || Track.TrackAge > Radar->LocalCorrelationFreshnessSeconds))
+					{
+						Track.TrackID = INDEX_NONE;
+					}
+
 					if (IsValid(TargetActor) && Track.TrackID != INDEX_NONE)
 					{
 						Launch.LaunchTrackID = Track.TrackID;
@@ -2084,7 +2623,10 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 						Launch.Target.SourceParticipantID = bRemote ? Track.SourceParticipantID : 0;
 						Launch.Target.SourceTrackID = bRemote ? Track.SourceTrackID : Track.TrackID;
 					}
-					else if (IsValid(TargetActor)) Launch.Target.bValid = false;
+					else if (IsValid(TargetActor))
+					{
+						Launch.Target.bValid = false;
+					}
 				}
 			}
 			else if (UARMMissileGuidanceComponent* ARM = Cast<UARMMissileGuidanceComponent>(Guidance))
@@ -2094,74 +2636,113 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 					if (URadarWarningReceiverComponent* RWR = ResolveRWRComponent())
 					{
 						FRWRThreatEntry Threat;
-						if (RWR->GetHighestThreat(Threat)) ARM->HandoffFromRWRThreat(Threat);
+						if (RWR->GetHighestThreat(Threat))
+						{
+							ARM->HandoffFromRWRThreat(Threat);
+						}
 					}
 				}
 			}
-			if (!Guidance->PrepareLaunch(Launch)) return RejectRelease();
-		}
-		WeaponComp->ActivateWeapon(true);
-		if (!WeaponComp->CanFireWeapon() || !WeaponComp->FireWeapon())
-			return RejectRelease();
-		if (!Station.bUsesAmmoManagement)
-			FiredActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
-		SetupStoreCollisionIgnores(FiredActor);
-		if (AWeapon* Weapon = Cast<AWeapon>(FiredActor))
-			Weapon->SetMounted(false, GetOwner());
-		FTransform ReleaseTransform = GetOwner()->GetActorTransform();
-		if (MeshComp && ActiveStore->SocketName != NAME_None && MeshComp->DoesSocketExist(ActiveStore->SocketName))
-			ReleaseTransform = MeshComp->GetSocketTransform(ActiveStore->SocketName);
-		WeaponComp->ApplyEjectionImpulse(ReleaseTransform.TransformVector(Station.EjectionImpulse));
-	}
-	else if (!Station.bUsesAmmoManagement)
-	{
-		// Non-guided ordnance or ballistic bomb release
-		SetupStoreCollisionIgnores(FiredActor);
 
-		if (AWeapon* Weapon = Cast<AWeapon>(FiredActor))
-		{
-			Weapon->SetMounted(false, GetOwner());
-		}
-
-		FTransform ReleaseTransform = GetOwner()->GetActorTransform();
-		if (MeshComp && ActiveStore->SocketName != NAME_None && MeshComp->DoesSocketExist(ActiveStore->SocketName))
-		{
-			ReleaseTransform = MeshComp->GetSocketTransform(ActiveStore->SocketName);
-		}
-		const FVector WorldImpulse = ReleaseTransform.TransformVector(Station.EjectionImpulse);
-
-		UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(FiredActor->GetRootComponent());
-		if (RootPrim)
-		{
-			RootPrim->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			RootPrim->SetSimulatePhysics(true);
-
-			const APawn* OwnerPawn = Cast<APawn>(GetOwner());
-			if (OwnerPawn)
+			if (!Guidance->PrepareLaunch(Launch))
 			{
-				if (const UPrimitiveComponent* OwnerPrim = Cast<UPrimitiveComponent>(OwnerPawn->GetRootComponent()))
-				{
-					FVector PtVel = OwnerPrim->IsSimulatingPhysics() ? OwnerPrim->GetPhysicsLinearVelocityAtPoint(FiredActor->GetActorLocation()) : OwnerPrim->GetPhysicsLinearVelocity();
-					if (PtVel.IsNearlyZero())
-					{
-						PtVel = OwnerPawn->GetVelocity();
-					}
-					RootPrim->SetPhysicsLinearVelocity(PtVel);
-				}
-				else
-				{
-					RootPrim->SetPhysicsLinearVelocity(OwnerPawn->GetVelocity());
-				}
+				return RejectRelease(EWeaponLaunchFailureReason::TargetOutOfEnvelope);
 			}
+		}
 
-			RootPrim->AddImpulse(WorldImpulse, NAME_None, true);
+		WeaponComp->ActivateWeapon(true);
+
+		EWeaponLaunchFailureReason WeaponCheckReason = EWeaponLaunchFailureReason::None;
+		if (!WeaponComp->CanFireWeapon(WeaponCheckReason))
+		{
+			return RejectRelease(WeaponCheckReason);
+		}
+		if (IsWeaponReleaseInhibitedByIFF(WeaponComp, TargetActor))
+		{
+			return RejectRelease(EWeaponLaunchFailureReason::FriendlyTargetInhibit);
+		}
+
+		bool bWeaponFired = false;
+		{
+			TGuardValue<bool> MissionAuthorization(WeaponComp->bMissionReleaseAuthorized, true);
+			bWeaponFired = WeaponComp->FireWeapon();
+		}
+		if (!bWeaponFired || !IsValid(FiredActor) || !IsValid(GetOwner()))
+		{
+			return RejectRelease(EWeaponLaunchFailureReason::ReleaseMechanismFailed);
 		}
 	}
 
+	if (bSpawnedForRelease && Station.bUsesAmmoManagement) ActiveStore->MountedActor = FiredActor;
+
+	// Physical Detachment & Kinematics
 	if (!Station.bUsesAmmoManagement)
 	{
+		// Detach store from carrier aircraft
+		FiredActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+		if (FiredActor->GetAttachParentActor() != nullptr)
+		{
+			return RejectRelease(EWeaponLaunchFailureReason::ReleaseMechanismFailed);
+		}
+
+		SetupStoreCollisionIgnores(FiredActor);
+
+		if (AWeapon* Weapon = Cast<AWeapon>(FiredActor))
+		{
+			Weapon->SetMounted(false, GetOwner());
+		}
+
+		FTransform ReleaseTransform = GetOwner()->GetActorTransform();
+		if (MeshComp && ActiveStore->SocketName != NAME_None && MeshComp->DoesSocketExist(ActiveStore->SocketName))
+		{
+			ReleaseTransform = MeshComp->GetSocketTransform(ActiveStore->SocketName);
+		}
+		const FVector WorldImpulse = ReleaseTransform.TransformVectorNoScale(Station.EjectionImpulse);
+
+		if (WeaponComp)
+		{
+			WeaponComp->ApplyEjectionImpulse(WorldImpulse);
+		}
+		else
+		{
+			// Non-guided ordnance or ballistic bomb release
+			UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(FiredActor->GetRootComponent());
+			if (RootPrim)
+			{
+				RootPrim->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+				RootPrim->SetSimulatePhysics(true);
+
+				const APawn* OwnerPawn = Cast<APawn>(GetOwner());
+				if (OwnerPawn)
+				{
+					if (const UPrimitiveComponent* OwnerPrim = Cast<UPrimitiveComponent>(OwnerPawn->GetRootComponent()))
+					{
+						FVector PtVel = OwnerPrim->IsSimulatingPhysics() ? OwnerPrim->GetPhysicsLinearVelocityAtPoint(FiredActor->GetActorLocation()) : OwnerPrim->GetPhysicsLinearVelocity();
+						if (PtVel.IsNearlyZero())
+						{
+							PtVel = OwnerPawn->GetVelocity();
+						}
+						RootPrim->SetPhysicsLinearVelocity(PtVel);
+					}
+					else
+					{
+						RootPrim->SetPhysicsLinearVelocity(OwnerPawn->GetVelocity());
+					}
+				}
+
+				RootPrim->AddImpulse(WorldImpulse, NAME_None, true);
+			}
+		}
+
 		ActiveStore->MountedActor = nullptr;
 		ActiveStore->Status = EStoreStatus::Fired;
+	}
+	else
+	{
+		// Persistent launcher / pod station (e.g. Gun Pod, Rocket Pod)
+		// Store remains mounted to the aircraft hardpoint.
+		SetupStoreCollisionIgnores(FiredActor);
 	}
 
 	return FiredActor;
@@ -2172,7 +2753,7 @@ AActor* UModularMissionManagement::ExecuteStoreRelease(FWeaponStation& Station, 
 int32 UModularMissionManagement::EmergencyJettisonAll()
 {
 	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && OwnerActor && !OwnerActor->HasAuthority())
 	{
 		ServerEmergencyJettisonAll();
 		return 0;
@@ -2182,7 +2763,7 @@ int32 UModularMissionManagement::EmergencyJettisonAll()
 
 	for (FWeaponStation& Station : Stations)
 	{
-		if (Station.bCanJettison && Station.GetCurrentAmmo() > 0)
+		if (Station.bCanJettison && Station.StoreType != EStoreType::InternalCannon)
 		{
 			if (SelectiveJettisonStation(Station.StationIndex))
 			{
@@ -2196,6 +2777,7 @@ int32 UModularMissionManagement::EmergencyJettisonAll()
 
 bool UModularMissionManagement::SelectiveJettisonStation(int32 StationIndex)
 {
+	if (bStoreReleaseInProgress) return false;
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
@@ -2209,7 +2791,7 @@ bool UModularMissionManagement::SelectiveJettisonStation(int32 StationIndex)
 	}
 
 	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && OwnerActor && !OwnerActor->HasAuthority())
 	{
 		ServerSelectiveJettisonStation(StationIndex);
 		return true;
@@ -2217,6 +2799,7 @@ bool UModularMissionManagement::SelectiveJettisonStation(int32 StationIndex)
 
 	USceneComponent* MeshComp = ResolveAircraftMesh();
 	bool bJettisonedAny = false;
+	if (SelectedStationIndex == StationIndex) UnbindActiveWeaponDelegates();
 
 	for (FStationStore& Store : Station.Stores)
 	{
@@ -2237,12 +2820,33 @@ bool UModularMissionManagement::SelectiveJettisonStation(int32 StationIndex)
 			{
 				JettisonTransform = MeshComp->GetSocketTransform(Store.SocketName);
 			}
-			const FVector WorldImpulse = JettisonTransform.TransformVector(Station.EjectionImpulse);
+			const FVector WorldImpulse = JettisonTransform.TransformVectorNoScale(Station.EjectionImpulse);
 
-			if (UMasterWeaponComponent* WeaponComp = StoreActor->FindComponentByClass<UMasterWeaponComponent>())
+			if (UMasterWeaponComponent* WeaponComp = ResolveStoreWeapon(StoreActor))
 			{
-				WeaponComp->ApplyEjectionImpulse(WorldImpulse);
-				WeaponComp->DetachWeapon();
+				WeaponComp->InitializeWeapon(Cast<APawn>(GetOwner()));
+				if (UMissileGuidanceComponent* Missile = Cast<UMissileGuidanceComponent>(WeaponComp))
+				{
+					Missile->JettisonInert(WorldImpulse);
+				}
+				else if (UDroppableItemComponent* Drop = Cast<UDroppableItemComponent>(WeaponComp))
+				{
+					Drop->ApplyEjectionImpulse(WorldImpulse);
+					Drop->DetachWeapon();
+				}
+				else
+				{
+					// Empty persistent pods still need inert ballistic movement.
+					WeaponComp->ActivateWeapon(false);
+					WeaponComp->DetachWeapon();
+					WeaponComp->SetUpdatedComponent(StoreActor->GetRootComponent());
+					WeaponComp->Velocity = (GetOwner() ? GetOwner()->GetVelocity() : FVector::ZeroVector) + WorldImpulse;
+					WeaponComp->ProjectileGravityScale = 1.0f;
+					WeaponComp->MaxSpeed = 0.0f;
+					WeaponComp->SetActive(true);
+					WeaponComp->SetComponentTickEnabled(true);
+					WeaponComp->UpdateComponentVelocity();
+				}
 			}
 			else if (UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(StoreActor->GetRootComponent()))
 			{
@@ -2266,13 +2870,19 @@ bool UModularMissionManagement::SelectiveJettisonStation(int32 StationIndex)
 
 	if (!bJettisonedAny)
 	{
+		BindActiveWeaponDelegates();
 		return false;
 	}
 
+	Station.CurrentAmmo = 0;
+	Station.SimulatedAmmo = 0;
 	Station.Status = EStationStatus::Jettisoned;
 
+	OnStationStatusChanged.Broadcast(StationIndex, EStationStatus::Jettisoned);
+	OnStationAmmoChanged.Broadcast(StationIndex, 0, Station.GetMaxAmmo());
 	OnWeaponJettisoned.Broadcast(StationIndex, Station.StoreType);
 	OnStoresInventoryChanged.Broadcast();
+	BindActiveWeaponDelegates();
 
 	return true;
 }
@@ -2297,12 +2907,18 @@ int32 UModularMissionManagement::JettisonByType(EStoreType InStoreType)
 
 bool UModularMissionManagement::ConfigureStation(int32 StationIndex, const FWeaponStation& NewStationConfig)
 {
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return false;
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
 		return false;
 	}
+	StopFiring(StationIndex);
+	GunMuzzleIndices.Remove(StationIndex);
+	if (SelectedStationIndex == StationIndex) UnbindActiveWeaponDelegates();
 
+	for (UStaticMeshComponent* Pylon : Stations[ArrayIndex].SpawnedPylons)
+		if (IsValid(Pylon)) Pylon->DestroyComponent();
 	for (FStationStore& Store : Stations[ArrayIndex].Stores)
 	{
 		if (IsValid(Store.MountedActor))
@@ -2314,25 +2930,43 @@ bool UModularMissionManagement::ConfigureStation(int32 StationIndex, const FWeap
 
 	Stations[ArrayIndex] = NewStationConfig;
 	Stations[ArrayIndex].StationIndex = StationIndex;
-
+	Stations[ArrayIndex].SpawnedPylons.Reset();
+	for (FStationStore& Store : Stations[ArrayIndex].Stores)
+	{
+		Store.MountedActor = nullptr;
+		Store.Status = EStoreStatus::Ready;
+	}
+	Stations[ArrayIndex].CurrentAmmo = FMath::Clamp(NewStationConfig.CurrentAmmo, 0, FMath::Max(0, NewStationConfig.MaxAmmo));
+	Stations[ArrayIndex].SimulatedAmmo = Stations[ArrayIndex].CurrentAmmo;
+	Stations[ArrayIndex].Status = EStationStatus::Ready;
+	SpawnAllPylons();
 	SpawnStoreForStation(StationIndex);
+	ProgramAllWeaponsIgnoreLists();
+	if (SelectedStationIndex == StationIndex) PrepareActiveWeaponOnStation(StationIndex);
+	BindActiveWeaponDelegates();
 	OnStoresInventoryChanged.Broadcast();
 	return true;
 }
 
 bool UModularMissionManagement::ReloadStation(int32 StationIndex, int32 AmmoCount)
 {
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return false;
 	const int32 ArrayIndex = FindStationArrayIndex(StationIndex);
 	if (ArrayIndex == INDEX_NONE)
 	{
 		return false;
 	}
+	StopFiring(StationIndex);
+	GunMuzzleIndices.Remove(StationIndex);
+	if (SelectedStationIndex == StationIndex) UnbindActiveWeaponDelegates();
 
 	FWeaponStation& Station = Stations[ArrayIndex];
 	
 	if (Station.StoreType == EStoreType::InternalCannon || Station.bUsesAmmoManagement)
 	{
-		Station.CurrentAmmo = FMath::Clamp(AmmoCount, 0, Station.MaxAmmo);
+		Station.CurrentAmmo = FMath::Clamp(AmmoCount, 0, FMath::Max(0, Station.MaxAmmo));
+		if (Station.StoreType == EStoreType::InternalCannon) Station.SimulatedAmmo = Station.CurrentAmmo;
+		for (FStationStore& Store : Station.Stores) Store.Status = EStoreStatus::Ready;
 	}
 	else
 	{
@@ -2344,6 +2978,8 @@ bool UModularMissionManagement::ReloadStation(int32 StationIndex, int32 AmmoCoun
 			}
 			else
 			{
+				if (IsValid(Station.Stores[i].MountedActor)) Station.Stores[i].MountedActor->Destroy();
+				Station.Stores[i].MountedActor = nullptr;
 				Station.Stores[i].Status = EStoreStatus::Fired;
 			}
 		}
@@ -2351,32 +2987,26 @@ bool UModularMissionManagement::ReloadStation(int32 StationIndex, int32 AmmoCoun
 
 	Station.Status = (Station.GetCurrentAmmo() > 0) ? ((Station.StationIndex == SelectedStationIndex) ? EStationStatus::Selected : EStationStatus::Ready) : EStationStatus::Empty;
 	SpawnStoreForStation(StationIndex);
+	ProgramAllWeaponsIgnoreLists();
+	if (SelectedStationIndex == StationIndex) PrepareActiveWeaponOnStation(StationIndex);
+	BindActiveWeaponDelegates();
 
+	OnStationAmmoChanged.Broadcast(StationIndex, Station.GetCurrentAmmo(), Station.GetMaxAmmo());
+	OnStationStatusChanged.Broadcast(StationIndex, Station.Status);
 	OnStoresInventoryChanged.Broadcast();
 	return true;
 }
 
 void UModularMissionManagement::ReloadAllStations()
 {
-	for (FWeaponStation& Station : Stations)
+	if (bStoreReleaseInProgress || !HasInventoryAuthority(this)) return;
+	TArray<int32> StationIDs;
+	for (const FWeaponStation& Station : Stations) StationIDs.Add(Station.StationIndex);
+	for (int32 ID : StationIDs)
 	{
-		if (Station.StoreType == EStoreType::InternalCannon || Station.bUsesAmmoManagement)
-		{
-			Station.CurrentAmmo = Station.MaxAmmo;
-		}
-		else
-		{
-			for (int32 i = 0; i < Station.Stores.Num(); i++)
-			{
-				Station.Stores[i].Status = EStoreStatus::Ready;
-			}
-		}
-		
-		Station.Status = (Station.StationIndex == SelectedStationIndex) ? EStationStatus::Selected : EStationStatus::Ready;
-		SpawnStoreForStation(Station.StationIndex);
+		FWeaponStation Station;
+		if (GetStation(ID, Station)) ReloadStation(ID, Station.GetMaxAmmo());
 	}
-
-	OnStoresInventoryChanged.Broadcast();
 }
 
 void UModularMissionManagement::ServerSetMasterArmMode_Implementation(EMasterArmMode InMode)
@@ -2409,26 +3039,81 @@ void UModularMissionManagement::ServerSelectNextStationOfStoreType_Implementatio
 	SelectNextStationOfStoreType(InStoreType);
 }
 
-void UModularMissionManagement::ServerSetDesignatedTarget_Implementation(AActor* InTarget)
+void UModularMissionManagement::ServerSlaveSelectedWeaponToDirection_Implementation(FVector InWorldDirection)
 {
-	SetDesignatedTarget(InTarget);
+	SlaveSelectedWeaponToDirection(InWorldDirection);
 }
 
-void UModularMissionManagement::ServerClearDesignatedTarget_Implementation()
+void UModularMissionManagement::ServerSlaveSelectedWeaponToLocation_Implementation(FVector InWorldLocation)
 {
-	ClearDesignatedTarget();
+	SlaveSelectedWeaponToLocation(InWorldLocation);
+}
+
+void UModularMissionManagement::ServerSlaveSelectedWeaponToBoresight_Implementation()
+{
+	SlaveSelectedWeaponToBoresight();
+}
+
+void UModularMissionManagement::ServerSetSelectedWeaponCaged_Implementation(bool bCaged)
+{
+	SetSelectedWeaponCaged(bCaged);
+}
+
+void UModularMissionManagement::ServerLockActor_Implementation(AActor* InTarget)
+{
+	if (!IsValid(InTarget))
+	{
+		ClearLockedActor();
+		return;
+	}
+	UAircraftRadarComponent* Radar = ResolveRadarComponent();
+	if (!Radar) return;
+	if (Radar->IsSTTLocked() && Radar->GetSTTLockedActor() == InTarget)
+	{
+		LockActor(InTarget);
+		return;
+	}
+	FRadarTrack Linked;
+	if (Radar->GetSelectedLinkedTrackForActor(InTarget, Linked))
+	{
+		UAircraftRadarComponent* Source = Radar->GetLinkedTrackSource(Linked.TrackID);
+		if (IsValid(Source) && Source->IsContinuousWaveIlluminating(InTarget))
+			LockActor(InTarget);
+	}
+}
+
+void UModularMissionManagement::ServerBugActor_Implementation(AActor* InTarget)
+{
+	if (!IsValid(InTarget))
+	{
+		ClearBuggedActor();
+		return;
+	}
+	if (InTarget == GetOwner()) return;
+	if (UAircraftRadarComponent* Radar = ResolveRadarComponent())
+	{
+		FRadarTrack Bug;
+		FRadarTrack Linked;
+		const bool bLocalBug = Radar->GetBuggedTrackID() >= 0 &&
+			Radar->GetTrackByID(Radar->GetBuggedTrackID(), Bug) && Bug.TrackedActor.Get() == InTarget;
+		if (!bLocalBug && !Radar->GetSelectedLinkedTrackForActor(InTarget, Linked)) return;
+	}
+	BugActor(InTarget);
 }
 
 void UModularMissionManagement::ServerFire_Implementation(int32 StationIndex)
 {
-	const bool bSucceeded = Fire(StationIndex);
-	EWeaponLaunchFailureReason Reason = EWeaponLaunchFailureReason::None;
-	if (!bSucceeded)
+	EWeaponLaunchFailureReason PreCheckReason = EWeaponLaunchFailureReason::None;
+	if (!CanFire(StationIndex, PreCheckReason))
 	{
-		if (CanFire(StationIndex, Reason))
-			Reason = EWeaponLaunchFailureReason::WeaponNotReady;
+		LastLaunchFailureReason = PreCheckReason;
+		ClientFireResult(StationIndex, false, PreCheckReason);
+		return;
 	}
-	ClientFireResult(StationIndex, bSucceeded, Reason);
+
+	const bool bSucceeded = Fire(StationIndex);
+	const EWeaponLaunchFailureReason FinalReason = bSucceeded ? EWeaponLaunchFailureReason::None : LastLaunchFailureReason;
+	ClientFireResult(StationIndex, bSucceeded, FinalReason);
 }
 
 void UModularMissionManagement::ClientFireResult_Implementation(int32 StationIndex,

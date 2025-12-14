@@ -75,9 +75,10 @@ DerivedDataCache/*
 
 # Don't ignore batch files
 !*.bat
-
-# Agent documentation if you add ai to help you with the plugin.
-AGENTS.md
+*.md
 
 # Documentation folder
 Documentation/
+
+# Automation tests
+Source/WeaponSystems/Private/Tests/

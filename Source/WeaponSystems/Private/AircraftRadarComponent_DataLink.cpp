@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftRadarComponent.h"
@@ -13,7 +12,7 @@
 
 int32 UAircraftRadarComponent::AssignContactID(AActor* Actor)
 {
-	if (ActorContactIDs.Num() > 256)
+	if (ActorContactIDs.Num() > MaxTrackedContactIDs)
 	{
 		for (auto It = ActorContactIDs.CreateIterator(); It; ++It)
 			if (!It.Key().IsValid()) It.RemoveCurrent();
@@ -57,7 +56,10 @@ void UAircraftRadarComponent::RefreshCorrelatedSelection()
 		SelectedContactID = 0;
 		SelectedLinkedTrackID = -1;
 		if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
-			Mission->ClearDesignatedTarget();
+		{
+			Mission->ClearBuggedActor();
+			if (!IsSTTLocked()) Mission->ClearLockedActor();
+		}
 		return;
 	}
 	if (Best.Source != ERadarTrackSource::Local)
@@ -79,6 +81,17 @@ void UAircraftRadarComponent::RefreshCorrelatedSelection()
 	if (SelectedLinkedTrackID == NewLinkedID) return;
 	SelectedLinkedTrackID = NewLinkedID;
 	OnRadarTrackSelected.Broadcast(Best);
+	if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
+	{
+		Mission->BugActor(Best.TrackedActor.Get());
+		if (Best.Source != ERadarTrackSource::Local)
+		{
+			UAircraftRadarComponent* Source = GetLinkedTrackSource(Best.TrackID);
+			if (IsValid(Source) && Source->IsContinuousWaveIlluminating(Best.TrackedActor.Get()))
+				Mission->LockActor(Best.TrackedActor.Get());
+			else if (!IsSTTLocked()) Mission->ClearLockedActor();
+		}
+	}
 }
 
 bool UAircraftRadarComponent::GetBestWeaponSupportTrackForActor(const AActor* Actor,
@@ -106,9 +119,12 @@ void UAircraftRadarComponent::SetDataLinkNetworkID(FName NewNetworkID)
 		SelectedContactID = 0;
 		if (bHadLinkedSelection)
 			if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
-				Mission->ClearDesignatedTarget();
+			{
+				Mission->ClearBuggedActor();
+				if (!IsSTTLocked()) Mission->ClearLockedActor();
+			}
 	}
-	LastDataLinkReceptionTime = -1000000.0f;
+	LastDataLinkReceptionTime = -1.0f;
 }
 
 void UAircraftRadarComponent::SetDataLinkContributionEnabled(bool bEnabled)
@@ -132,9 +148,12 @@ void UAircraftRadarComponent::SetDataLinkReceptionEnabled(bool bEnabled)
 			SelectedContactID = 0;
 			if (bHadLinkedSelection)
 				if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
-					Mission->ClearDesignatedTarget();
+				{
+					Mission->ClearBuggedActor();
+					if (!IsSTTLocked()) Mission->ClearLockedActor();
+				}
 		}
-		LastDataLinkReceptionTime = -1000000.0f;
+		LastDataLinkReceptionTime = -1.0f;
 	}
 }
 
@@ -143,7 +162,7 @@ void UAircraftRadarComponent::SetDataLinkRadioInhibited(bool bTransmitInhibited,
 	if (!GetOwner() || !GetOwner()->HasAuthority()) return;
 	bDataLinkTransmitInhibited = bTransmitInhibited;
 	bDataLinkReceiveInhibited = bReceiveInhibited;
-	if (bReceiveInhibited) LastDataLinkReceptionTime = -1000000.0f;
+	if (bReceiveInhibited) LastDataLinkReceptionTime = -1.0f;
 }
 
 bool UAircraftRadarComponent::CanDataLinkTransmit() const
@@ -167,6 +186,7 @@ bool UAircraftRadarComponent::IsDataLinkConnected() const
 {
 	if (GetOwner() && !GetOwner()->HasAuthority()) return bClientDataLinkConnected;
 	return bEnableDataLink && bReceiveDataLinkTracks && !bDataLinkReceiveInhibited && GetWorld() &&
+		LastDataLinkReceptionTime >= 0.0f &&
 		GetWorld()->GetTimeSeconds() - LastDataLinkReceptionTime <= FMath::Max(0.1f, DataLinkDesyncSeconds);
 }
 
@@ -247,16 +267,20 @@ void UAircraftRadarComponent::ReceiveDataLinkReport(const FRadarTrack& Report,
 	OnRadarContactNew.Broadcast(Linked);
 }
 
-void UAircraftRadarComponent::PruneLinkedTracks(float WorldTime)
+void UAircraftRadarComponent::RefreshDataLinkEligibility()
 {
-	(void)WorldTime;
+	PruneLinkedTracks(0.0f);
+}
+
+void UAircraftRadarComponent::PruneLinkedTracks(float DeltaTime)
+{
 	const UIFFTransponderComponent* Transponder = GetOwner()
 		? GetOwner()->FindComponentByClass<UIFFTransponderComponent>() : nullptr;
 	for (int32 Index = LinkedTracks.Num() - 1; Index >= 0; --Index)
 	{
 		FRadarTrack& Track = LinkedTracks[Index];
 		UAircraftRadarComponent* Source = LinkedTrackSources.FindRef(Track.TrackID).Get();
-		Track.TrackAge += GetWorld()->GetDeltaSeconds();
+		Track.TrackAge += DeltaTime;
 		if (Track.TrackedActor.Get() == GetOwner() ||
 			!bEnableDataLink || !bReceiveDataLinkTracks || bDataLinkReceiveInhibited ||
 			Track.TrackAge > FMath::Max(0.1f, DataLinkTrackExpirySeconds) ||
@@ -282,7 +306,10 @@ void UAircraftRadarComponent::PruneLinkedTracks(float WorldTime)
 				{
 					SelectedContactID = 0;
 					if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
-						Mission->ClearDesignatedTarget();
+					{
+						Mission->ClearBuggedActor();
+						if (!IsSTTLocked()) Mission->ClearLockedActor();
+					}
 				}
 			}
 			OnRadarContactLost.Broadcast(RemovedID);
@@ -378,7 +405,7 @@ bool UAircraftRadarComponent::GetSelectedLinkedTrackForActor(const AActor* Actor
 	return GetFreshLinkedTrackForActor(Actor, OutTrack.SourceParticipantID, OutTrack);
 }
 
-bool UAircraftRadarComponent::DesignateLinkedTrack(int32 TrackID)
+bool UAircraftRadarComponent::ExecuteAuthoritativeDesignateLinkedTrack(int32 TrackID)
 {
 	if (!GetOwner() || !GetOwner()->HasAuthority()) return false;
 	FRadarTrack Track;
@@ -390,10 +417,10 @@ bool UAircraftRadarComponent::DesignateLinkedTrack(int32 TrackID)
 			if (Local.ContactID != Track.ContactID ||
 				Local.Status == ERadarTrackStatus::Lost ||
 				Local.TrackAge > LocalCorrelationFreshnessSeconds) continue;
-			const bool bSelected = CommandBugTrack(Local.TrackID);
+			const bool bSelected = ExecuteAuthoritativeBugTrack(Local.TrackID);
 			if (bSelected)
 				if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
-					Mission->SetDesignatedTarget(Local.TrackedActor.Get());
+					Mission->BugActor(Local.TrackedActor.Get());
 			return bSelected;
 		}
 	}
@@ -408,14 +435,19 @@ bool UAircraftRadarComponent::DesignateLinkedTrack(int32 TrackID)
 	float CueElevation = 0.0f;
 	ComputeBearingElevation(Fresh.LastKnownPosition + Fresh.EstimatedVelocity * Fresh.TrackAge,
 		CueBearing, CueElevation);
-	OffsetScanCenter(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, CueBearing),
+	ExecuteAuthoritativeOffsetScanCenter(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, CueBearing),
 		CueElevation - ScanCenterElevation);
 	if (UModularMissionManagement* Mission = GetOwner()->FindComponentByClass<UModularMissionManagement>())
 	{
-		Mission->SetDesignatedTarget(Track.TrackedActor.Get());
+		Mission->BugActor(Track.TrackedActor.Get());
 		SelectedLinkedTrackID = TrackID;
 		SelectedContactID = Track.ContactID;
-		Mission->PrepareLinkedRadarWeapon(Fresh, GetLinkedTrackSource(TrackID));
+		UAircraftRadarComponent* SourceRadar = GetLinkedTrackSource(TrackID);
+		if (IsValid(SourceRadar) && SourceRadar->IsContinuousWaveIlluminating(Track.TrackedActor.Get()))
+			Mission->LockActor(Track.TrackedActor.Get());
+		else if (!IsSTTLocked())
+			Mission->ClearLockedActor();
+		Mission->PrepareLinkedRadarWeapon(Fresh, SourceRadar);
 	}
 	return true;
 }

@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "RadarMissileGuidanceComponent.h"
@@ -18,6 +17,7 @@
 URadarMissileGuidanceComponent::URadarMissileGuidanceComponent()
 {
 	TargetTrackingSocket = NAME_None;
+	WeaponComponentType = EWeaponComponentType::RadarMissile;
 	SetIsReplicatedByDefault(true);
 }
 
@@ -69,7 +69,7 @@ bool URadarMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfigura
 	LaunchContactID = TargetSolution.TargetContactID;
 	ResolveLaunchTrackIdentity();
 	bMadDogLaunch = LaunchTrackID == -1 && !TargetSolution.bValid &&
-		(Configuration.bMadDog || (bHasActiveSeeker && !bNeedsIllumination));
+		(Configuration.bMadDog || bHasActiveSeeker);
 	LastExternalGuidanceRadar = bNeedsIllumination ? Illuminator.Get() :
 		(TargetSolution.bMeasured ? ResolveExternalRadarForSolution(TargetSolution) : nullptr);
 	LastExternalUpdateWorldTime = LastExternalGuidanceRadar.IsValid() && GetWorld() ?
@@ -79,11 +79,12 @@ bool URadarMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfigura
 	TimeSinceLastDataLink = 0.0f;
 	bDataLinkTimeoutNotified = false;
 	ObservedChaff.Reset();
-	if (bNeedsIllumination && !IsValid(GetLockedTarget()) && IsValid(Illuminator.Get()))
+	if (TargetSolution.bValid) bRadarSeekerCaged = false;
+	if (bIsWeaponActivated)
 	{
-		AActor* Illuminated = Illuminator->GetSTTLockedActor();
-		if (!IsValid(Illuminated)) Illuminated = Illuminator->GetContinuousWaveTarget();
-		if (IsValid(Illuminated)) LockMissile(Illuminated);
+		if (IsValid(GetLockedTarget()) && HasVerifiedIllumination())
+			TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+		else TransitionSeekerState(TargetSolution.bValid ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Caged);
 	}
 	return true;
 }
@@ -92,9 +93,172 @@ void URadarMissileGuidanceComponent::ActivateWeapon(bool bActivate)
 {
 	const bool bWasFired = bWeaponFired;
 	Super::ActivateWeapon(bActivate);
+	if (bActivate && !bWeaponFired)
+	{
+		if (IsValid(GetLockedTarget()) && HasVerifiedIllumination())
+			TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+		else if (TargetSolution.bValid || !RadarSlavedDirection.IsNearlyZero())
+			TransitionSeekerState(EWeaponSeekerState::Slaved);
+	}
 	if (!bActivate && bWasFired)
 		if (UAircraftRadarComponent* Radar = LaunchRadar.Get())
 			Radar->UnregisterLaunchedRadarMissile(this);
+}
+
+void URadarMissileGuidanceComponent::LockMissile(AActor* InTargetActor)
+{
+	Super::LockMissile(InTargetActor);
+	if (!bIsWeaponActivated) return;
+	if (IsValid(InTargetActor) &&
+		((bNeedsIllumination && HasVerifiedIlluminationFrom(Illuminator.Get(), InTargetActor)) ||
+			(bSeekerTransmitting && FlightPhase == ERadarMissileFlightPhase::TerminalTrack)))
+	{
+		TransitionSeekerState(EWeaponSeekerState::Tracking, InTargetActor);
+	}
+	else if (SeekerState == EWeaponSeekerState::Tracking)
+	{
+		TransitionSeekerState(EWeaponSeekerState::Lost);
+	}
+}
+
+bool URadarMissileGuidanceComponent::SlaveToDirection(const FVector& InWorldDirection)
+{
+	if (bWeaponFired || InWorldDirection.IsNearlyZero()) return false;
+	RadarSlavedDirection = InWorldDirection.GetSafeNormal();
+	bRadarSeekerCaged = false;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	return true;
+}
+
+bool URadarMissileGuidanceComponent::SlaveToLocation(const FVector& InWorldLocation)
+{
+	if (bWeaponFired || !IsValid(GetOwner()) ||
+		InWorldLocation.Equals(GetOwner()->GetActorLocation())) return false;
+	SetInertialTarget(InWorldLocation, FVector::ZeroVector);
+	RadarSlavedDirection = (InWorldLocation - GetOwner()->GetActorLocation()).GetSafeNormal();
+	bRadarSeekerCaged = false;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	return true;
+}
+
+bool URadarMissileGuidanceComponent::SlaveToTarget(AActor* InTarget)
+{
+	if (bWeaponFired || !IsValid(InTarget) || !AcceptCandidate(InTarget)) return false;
+	TargetSolution.bValid = true;
+	TargetSolution.bMeasured = false;
+	TargetSolution.TargetActor = InTarget;
+	TargetSolution.Position = GetTargetTrackingLocation(InTarget);
+	TargetSolution.Velocity = InTarget->GetVelocity();
+	TargetSolution.MeasurementTimeSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+	RadarSlavedDirection = (TargetSolution.Position - (GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector)).GetSafeNormal();
+	bRadarSeekerCaged = false;
+	if (bNeedsIllumination && HasVerifiedIlluminationFrom(Illuminator.Get(), InTarget))
+	{
+		LockMissile(InTarget);
+		TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Tracking : EWeaponSeekerState::Standby,
+			bIsWeaponActivated ? InTarget : nullptr);
+	}
+	else
+	{
+		LockMissile(nullptr);
+		TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	}
+	return true;
+}
+
+void URadarMissileGuidanceComponent::SlaveToBoresight()
+{
+	if (bWeaponFired) return;
+	TargetSolution = FMissileTargetSolution();
+	RadarSlavedDirection = FVector::ZeroVector;
+	LockMissile(nullptr);
+	bRadarSeekerCaged = true;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Caged : EWeaponSeekerState::Standby);
+}
+
+void URadarMissileGuidanceComponent::SetSeekerCaged(bool bCaged)
+{
+	if (bCaged) { SlaveToBoresight(); return; }
+	if (bWeaponFired) return;
+	bRadarSeekerCaged = false;
+	TransitionSeekerState(!bIsWeaponActivated ? EWeaponSeekerState::Standby :
+		TargetSolution.bValid || !RadarSlavedDirection.IsNearlyZero() ?
+		EWeaponSeekerState::Slaved : EWeaponSeekerState::Lost);
+}
+
+FVector URadarMissileGuidanceComponent::GetSeekerLookDirection() const
+{
+	const FVector Origin = GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector;
+	if (IsValid(GetLockedTarget())) return (GetTargetTrackingLocation(GetLockedTarget()) - Origin).GetSafeNormal();
+	if (TargetSolution.bValid) return (TargetSolution.Position - Origin).GetSafeNormal();
+	return RadarSlavedDirection.IsNearlyZero() ? Super::GetSeekerLookDirection() : RadarSlavedDirection;
+}
+
+FVector2D URadarMissileGuidanceComponent::GetSeekerGimbalAngles() const
+{
+	FVector Origin; FRotator Rotation;
+	GetSeekerTransform(Origin, Rotation);
+	const FRotator Relative = Rotation.UnrotateVector(GetSeekerLookDirection()).Rotation();
+	return FVector2D(Relative.Pitch, Relative.Yaw);
+}
+
+EWeaponAudioTone URadarMissileGuidanceComponent::GetSeekerAudioTone() const
+{
+	if (!bIsWeaponActivated) return EWeaponAudioTone::Silent;
+	if (SeekerState == EWeaponSeekerState::Tracking) return EWeaponAudioTone::Locked;
+	return SeekerState == EWeaponSeekerState::Slaved ? EWeaponAudioTone::Searching : EWeaponAudioTone::Silent;
+}
+
+float URadarMissileGuidanceComponent::GetSeekerSignalStrength() const
+{
+	if (!bIsWeaponActivated || SeekerState != EWeaponSeekerState::Tracking) return 0.0f;
+	if (bNeedsIllumination && HasVerifiedIllumination()) return 1.0f;
+	if (!IsValid(GetLockedTarget()) || ActiveSeekerMaxRange <= 0.0f) return 0.0f;
+	return FMath::Clamp(1.0f - GetEstimatedTargetRange() / ActiveSeekerMaxRange, 0.0f, 1.0f);
+}
+
+bool URadarMissileGuidanceComponent::GetDynamicLaunchZone(const AActor* Target,
+	float& OutRmin, float& OutRne, float& OutRmax) const
+{
+	if (!Super::GetDynamicLaunchZone(Target, OutRmin, OutRne, OutRmax)) return false;
+	// A semi-active shot depends on continuous illumination; keep its no-escape estimate conservative.
+	if (bNeedsIllumination) OutRne = FMath::Clamp(OutRne * 0.8f, OutRmin, OutRmax);
+	return true;
+}
+
+float URadarMissileGuidanceComponent::GetEstimatedTimeToImpact(const AActor* Target) const
+{
+	if (bWeaponFired && FlightPhase == ERadarMissileFlightPhase::Unguided) return 0.0f;
+	if (bWeaponFired && (!IsValid(Target) || Target == GetLockedTarget() || Target == TargetSolution.TargetActor))
+	{
+		FRadarLaunchedMissileStatus Status;
+		FillLaunchedMissileStatus(Status);
+		return FMath::Max(0.0f, Status.EstimatedTimeToImpactSeconds);
+	}
+	const AActor* EffectiveTarget = IsValid(Target) ? Target : TargetSolution.TargetActor.Get();
+	return Super::GetEstimatedTimeToImpact(EffectiveTarget);
+}
+
+float URadarMissileGuidanceComponent::GetEstimatedTimeToActive(const AActor* Target) const
+{
+	if (!bHasActiveSeeker || bSeekerTransmitting || FlightPhase == ERadarMissileFlightPhase::Unguided) return 0.0f;
+	if (const UActiveRadarMissileGuidanceComponent* Active = Cast<UActiveRadarMissileGuidanceComponent>(this);
+		Active && Active->SeekerActivation == EActiveSeekerActivation::Immediate) return 0.0f;
+	if (bWeaponFired && (!IsValid(Target) || Target == GetLockedTarget() || Target == TargetSolution.TargetActor))
+	{
+		FRadarLaunchedMissileStatus Status;
+		FillLaunchedMissileStatus(Status);
+		return FMath::Max(0.0f, Status.TimeToActiveSeconds);
+	}
+	const AActor* EffectiveTarget = IsValid(Target) ? Target : TargetSolution.TargetActor.Get();
+	if (!IsValid(EffectiveTarget) || !IsValid(GetOwner()) || ActiveSeekerRange <= 0.0f) return 0.0f;
+	const FVector ToTarget = EffectiveTarget->GetActorLocation() - GetOwner()->GetActorLocation();
+	const float Range = ToTarget.Size();
+	if (Range <= ActiveSeekerRange) return 0.0f;
+	const FVector SourceVelocity = bWeaponFired ? Velocity :
+		(ToTarget / Range) * MaxCruiseSpeed + (IsValid(PlayerAircraft) ? PlayerAircraft->GetVelocity() : FVector::ZeroVector);
+	const float Closure = FVector::DotProduct(SourceVelocity - EffectiveTarget->GetVelocity(), ToTarget / Range);
+	return Closure > 100.0f ? (Range - ActiveSeekerRange) / Closure : 0.0f;
 }
 
 void URadarMissileGuidanceComponent::HandleProximityFuzeTriggered(AActor* TriggeringActor)
@@ -103,21 +267,71 @@ void URadarMissileGuidanceComponent::HandleProximityFuzeTriggered(AActor* Trigge
 	if (UAircraftRadarComponent* Radar = LaunchRadar.Get())
 		Radar->UnregisterLaunchedRadarMissile(this);
 }
-bool URadarMissileGuidanceComponent::CanFireWeapon() const
+bool URadarMissileGuidanceComponent::CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const
 {
-	if (!bIsWeaponActivated || bWeaponFired) return false;
-	if (bNeedsIllumination) return IsValid(GetLockedTarget()) && HasVerifiedIllumination();
-	return !bRequireLockToFire || TargetSolution.bValid;
+	if (!bIsWeaponActivated)
+	{
+		OutReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
+	if (bWeaponFired)
+	{
+		OutReason = EWeaponLaunchFailureReason::AmmoDepleted;
+		return false;
+	}
+	if (bNeedsIllumination)
+	{
+		if (!IsValid(GetLockedTarget()))
+		{
+			if (bHasActiveSeeker)
+			{
+				OutReason = EWeaponLaunchFailureReason::None;
+				return true;
+			}
+			OutReason = EWeaponLaunchFailureReason::TargetLockRequired;
+			return false;
+		}
+		if (!HasVerifiedIllumination())
+		{
+			if (bHasActiveSeeker)
+			{
+				OutReason = EWeaponLaunchFailureReason::None;
+				return true;
+			}
+			OutReason = EWeaponLaunchFailureReason::NoContinuousWaveIllumination;
+			return false;
+		}
+		OutReason = EWeaponLaunchFailureReason::None;
+		return true;
+	}
+	if (FiringRequirement == EWeaponFiringRequirement::HardLock &&
+		!TargetSolution.bValid && !IsValid(GetLockedTarget()))
+	{
+		OutReason = EWeaponLaunchFailureReason::TargetLockRequired;
+		return false;
+	}
+	OutReason = EWeaponLaunchFailureReason::None;
+	return true;
 }
 
 bool URadarMissileGuidanceComponent::FireWeapon()
 {
-	if (!bNeedsIllumination && bHasActiveSeeker) LockedTarget = nullptr;
+	if (!IsDirectFirePermitted()) return false;
+	if (bNeedsIllumination && bHasActiveSeeker &&
+		(!IsValid(GetLockedTarget()) || !HasVerifiedIllumination()))
+	{
+		LockMissile(nullptr);
+		TargetSolution = FMissileTargetSolution();
+		LaunchTrackID = -1;
+		LaunchContactID = 0;
+		bMadDogLaunch = true;
+	}
+	if (!bNeedsIllumination && bHasActiveSeeker) LockMissile(nullptr);
 	if (!CanFireWeapon() || !Super::FireWeapon()) return false;
 	// Runtime-added guidance components may launch before their BeginPlay registration.
 	if (UAircraftCombatSubsystem* Registry = UAircraftCombatSubsystem::Get(this))
 		Registry->RegisterMissileSeeker(this);
-	if (bNeedsIllumination)
+	if (bNeedsIllumination && !bMadDogLaunch)
 	{
 		FRadarTrack Track;
 		if (UAircraftRadarComponent* Radar = Illuminator.Get())
@@ -145,6 +359,7 @@ bool URadarMissileGuidanceComponent::FireWeapon()
 	else
 	{
 		SetFlightPhase(ERadarMissileFlightPhase::MidCourse);
+		if (bNeedsIllumination && bHasActiveSeeker) ActivateOnboardSeeker();
 	}
 	if (!LaunchRadar.IsValid()) LaunchRadar = Uplink.IsValid() ? Uplink.Get() :
 		(IsValid(GetPlayerAircraft()) ? GetPlayerAircraft()->FindComponentByClass<UAircraftRadarComponent>() : nullptr);
@@ -163,7 +378,7 @@ bool URadarMissileGuidanceComponent::FireWeapon()
 
 void URadarMissileGuidanceComponent::ReceiveMidCourseUpdate(const FMissileTargetSolution& NewSolution)
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	if (bWeaponFired && (bSeekerTransmitting || FlightPhase == ERadarMissileFlightPhase::Unguided)) return;
 	if (!NewSolution.bValid || !NewSolution.bMeasured ||
 		!FMath::IsFinite(NewSolution.MeasurementTimeSeconds) ||
@@ -201,17 +416,23 @@ void URadarMissileGuidanceComponent::ReceiveMidCourseUpdate(const FMissileTarget
 
 void URadarMissileGuidanceComponent::SetInertialTarget(FVector InPosition, FVector InVelocity)
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	TargetSolution.bValid = true;
 	TargetSolution.bMeasured = !InVelocity.IsNearlyZero();
 	TargetSolution.Position = InPosition;
 	TargetSolution.Velocity = InVelocity;
 	TargetSolution.MeasurementTimeSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+	if (!bWeaponFired && bIsWeaponActivated && SeekerState != EWeaponSeekerState::Tracking)
+	{
+		bRadarSeekerCaged = false;
+		RadarSlavedDirection = (InPosition - (GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector)).GetSafeNormal();
+		TransitionSeekerState(EWeaponSeekerState::Slaved);
+	}
 }
 
 void URadarMissileGuidanceComponent::SetParentRadar(UAircraftRadarComponent* Radar)
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	if (bWeaponFired) return;
 	Uplink = Radar;
 	bHadUplink = IsValid(Radar);
@@ -221,7 +442,7 @@ void URadarMissileGuidanceComponent::SetParentRadar(UAircraftRadarComponent* Rad
 void URadarMissileGuidanceComponent::SetRemoteDataLinkSupport(UAircraftRadarComponent* LauncherRadar,
 	UAircraftRadarComponent* SourceRadar, int32 SourceParticipantID)
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	if (bWeaponFired) return;
 	Uplink = LauncherRadar;
 	bHadUplink = IsValid(LauncherRadar);
@@ -231,7 +452,7 @@ void URadarMissileGuidanceComponent::SetRemoteDataLinkSupport(UAircraftRadarComp
 
 void URadarMissileGuidanceComponent::ClearRemoteDataLinkSupport(UAircraftRadarComponent* LauncherRadar)
 {
-	if (GetOwner() && !GetOwner()->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld() && GetOwner() && !GetOwner()->HasAuthority()) return;
 	if (bWeaponFired) return;
 	Uplink = LauncherRadar;
 	bHadUplink = IsValid(LauncherRadar);
@@ -271,9 +492,6 @@ bool URadarMissileGuidanceComponent::HasVerifiedIlluminationFrom(
 {
 	if (!IsValid(Radar) || !IsValid(Target) || !Radar->IsRadarEmitting() ||
 		!Radar->IsContinuousWaveIlluminating(Target)) return false;
-	FRadarTrack Track;
-	if (!Radar->GetTrackByActor(Target, Track) || Track.Status == ERadarTrackStatus::Lost ||
-		Track.TrackAge > 1.5f) return false;
 	return HasLineOfSight(Radar->GetRadarLocation(), Target, Radar->GetOwner()) &&
 		HasLineOfSight(UpdatedComponent ? UpdatedComponent->GetComponentLocation() :
 			(GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector), Target);
@@ -422,7 +640,22 @@ void URadarMissileGuidanceComponent::FillLaunchedMissileStatus(
 
 void URadarMissileGuidanceComponent::SetFlightPhase(ERadarMissileFlightPhase NewPhase)
 {
+	if (FlightPhase == NewPhase) return;
 	FlightPhase = NewPhase;
+	if (NewPhase != ERadarMissileFlightPhase::PreLaunch) bRadarSeekerCaged = false;
+	switch (NewPhase)
+	{
+	case ERadarMissileFlightPhase::SemiActive:
+	case ERadarMissileFlightPhase::TerminalTrack:
+		TransitionSeekerState(IsValid(GetLockedTarget()) ? EWeaponSeekerState::Tracking : EWeaponSeekerState::Lost, GetLockedTarget());
+		break;
+	case ERadarMissileFlightPhase::Unguided:
+		TransitionSeekerState(EWeaponSeekerState::Lost);
+		break;
+	default:
+		TransitionSeekerState(EWeaponSeekerState::Slaved);
+		break;
+	}
 }
 
 void URadarMissileGuidanceComponent::ActivateOnboardSeeker()
@@ -460,7 +693,6 @@ void URadarMissileGuidanceComponent::ScanActiveSeeker(float DeltaTime)
 	TArray<AActor*> Candidates;
 	if (UAircraftCombatSubsystem* Registry = UAircraftCombatSubsystem::Get(this))
 		Registry->GetCombatActorsInVolume(SeekerPosition, ActiveSeekerMaxRange, Candidates);
-	if (Candidates.IsEmpty())
 	{
 		TArray<FOverlapResult> Overlaps;
 		FCollisionObjectQueryParams Objects;
@@ -533,12 +765,12 @@ void URadarMissileGuidanceComponent::ScanActiveSeeker(float DeltaTime)
 	if (Best != GetLockedTarget())
 	{
 		LockMissile(Best);
-		if (!Best) OnRadarLockLost.Broadcast();
 	}
 	if (IsValid(GetLockedTarget()))
 	{
 		ActiveSearchElapsedSeconds = 0.0f;
 		SetFlightPhase(ERadarMissileFlightPhase::TerminalTrack);
+		TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
 	}
 	else
 	{
@@ -674,7 +906,6 @@ void URadarMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 				LockMissile(nullptr);
 				if (UAircraftRadarComponent* Radar = Illuminator.Get())
 					Radar->UnregisterGuidingMissile(this);
-				OnRadarLockLost.Broadcast();
 			}
 		}
 	}
@@ -688,6 +919,7 @@ void URadarMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 UActiveRadarMissileGuidanceComponent::UActiveRadarMissileGuidanceComponent()
 {
 	bHasActiveSeeker = true;
+	FiringRequirement = EWeaponFiringRequirement::Bugging;
 }
 
 bool UActiveRadarMissileGuidanceComponent::FireWeapon()
@@ -710,6 +942,7 @@ void UActiveRadarMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 USemiActiveRadarMissileGuidanceComponent::USemiActiveRadarMissileGuidanceComponent()
 {
 	bNeedsIllumination = true;
+	FiringRequirement = EWeaponFiringRequirement::HardLock;
 	bUseMidCourseDataLink = false;
 }
 
@@ -717,12 +950,14 @@ UHybridRadarMissileGuidanceComponent::UHybridRadarMissileGuidanceComponent()
 {
 	bHasActiveSeeker = true;
 	bNeedsIllumination = true;
+	FiringRequirement = EWeaponFiringRequirement::HardLock;
 	bUseMidCourseDataLink = false;
 }
 
 UAntiShipMissileGuidanceComponent::UAntiShipMissileGuidanceComponent()
 {
 	bHasActiveSeeker = true;
+	FiringRequirement = EWeaponFiringRequirement::Bugging;
 	bSeaTargetsOnly = true;
 	NotchFilterVelocity = 0.0f;
 }

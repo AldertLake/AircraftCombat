@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -17,22 +16,7 @@ enum class ERadarDisplayGeometry : uint8
 	PPI UMETA(DisplayName = "PPI (Plan Position)")
 };
 
-/** MFD window over the full radar map. PPI offset is kilometers (right, forward);
- * B-scope offset is azimuth degrees and range kilometers. */
-USTRUCT(BlueprintType)
-struct WEAPONSYSTEMS_API FRadarDisplayWindow
-{
-	GENERATED_BODY()
 
-	/** 1 shows the full map; 2 shows half its width and height. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection", meta = (ClampMin = "1.0", ClampMax = "16.0"))
-	float ZoomFactor = 1.0f;
-
-	/** Signed map displacement. +X moves the viewed area right, +Y forward/farther.
-	 * PPI: X/Y in km. B-scope: X in degrees, Y in km. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
-	FVector2D ViewCenterOffset = FVector2D::ZeroVector;
-};
 
 USTRUCT(BlueprintType)
 struct WEAPONSYSTEMS_API FRadarDisplayView
@@ -42,11 +26,7 @@ struct WEAPONSYSTEMS_API FRadarDisplayView
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
 	ERadarDisplayGeometry ActiveGeometry = ERadarDisplayGeometry::BScope;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
-	FRadarDisplayWindow BScope;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
-	FRadarDisplayWindow PPI;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
 	bool bHeadingUp = true;
@@ -91,8 +71,6 @@ struct WEAPONSYSTEMS_API FRadarDisplayProjection
 	bool bHeadingUp = true;
 
 	/** Advanced API: use the radar's display view for ordinary widgets. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Display Projection")
-	FRadarDisplayWindow Window;
 };
 
 /** Shared physical TDC position. It is independent of widget size and resolution. */
@@ -118,7 +96,6 @@ struct WEAPONSYSTEMS_API FRadarCursorState
 /** Pure projection math, shared by the radar component and AircraftDisplay. */
 struct WEAPONSYSTEMS_API FRadarDisplayGeometryMath
 {
-	static FRadarDisplayWindow ClampWindow(const FRadarDisplayWindow& Window);
 	static bool Project(const FVector& WorldLocation, const FRadarDisplayProjection& Projection, FVector2D& OutWidgetPosition);
 	static bool Unproject(const FVector2D& WidgetPosition, const FRadarDisplayProjection& Projection, FVector& OutWorldLocation);
 	static FVector CursorToWorld(const FRadarCursorState& Cursor, const FRadarDisplayProjection& Projection);

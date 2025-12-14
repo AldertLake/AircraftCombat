@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "ARMMissileGuidanceComponent.h"
@@ -21,7 +20,7 @@ UARMMissileGuidanceComponent::UARMMissileGuidanceComponent()
 	PrimaryComponentTick.bCanEverTick = true;
 	SetIsReplicatedByDefault(true);
 
-	// SEAD anti-radiation kinematic defaults (high speed kinetic energy)
+	// High-speed kinematics for anti-radiation flight
 	MaxCruiseSpeed = 42000.0f;          // ~Mach 3.5 at sea level (~1200 m/s)
 	MotorAcceleration = 8000.0f;        // Rapid acceleration
 	MotorIgnitionDelay = 0.25f;
@@ -32,6 +31,8 @@ UARMMissileGuidanceComponent::UARMMissileGuidanceComponent()
 	TerminalDeadbandRange = 100.0f;
 	ProximityFuzeRadius = 600.0f;
 	bEnableProximityFuze = true;
+	FiringRequirement = EWeaponFiringRequirement::Nothing;
+	WeaponComponentType = EWeaponComponentType::AntiRadiationMissile;
 }
 
 void UARMMissileGuidanceComponent::BeginPlay()
@@ -49,6 +50,14 @@ void UARMMissileGuidanceComponent::EndPlay(const EEndPlayReason::Type EndPlayRea
 	Super::EndPlay(EndPlayReason);
 }
 
+void UARMMissileGuidanceComponent::ActivateWeapon(bool bActivate)
+{
+	Super::ActivateWeapon(bActivate);
+	if (!bActivate) return;
+	if (IsTrackingActiveEmission()) TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+	else if (!bPassiveSeekerCaged) TransitionSeekerState(EWeaponSeekerState::Slaved);
+}
+
 void UARMMissileGuidanceComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
@@ -62,45 +71,74 @@ void UARMMissileGuidanceComponent::GetLifetimeReplicatedProps(TArray<FLifetimePr
 
 bool UARMMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfiguration& Configuration)
 {
+	FMissileLaunchConfiguration PassiveConfiguration = Configuration;
+	AActor* ExistingEmitter = IsTrackingActiveEmission() ? GetLockedTarget() : nullptr;
 	UAircraftRadarComponent* CuedEmitter = nullptr;
 	if (IsValid(Configuration.Target.TargetActor))
 	{
 		CuedEmitter = Configuration.Target.TargetActor->FindComponentByClass<UAircraftRadarComponent>();
-		if (!IsValid(CuedEmitter) || !CuedEmitter->IsRadarEmitting()) return false;
+		if (!IsValid(CuedEmitter) || !CuedEmitter->IsRadarEmitting())
+		{
+			CuedEmitter = nullptr;
+			PassiveConfiguration.Target = FMissileTargetSolution();
+		}
 	}
-	if (!Super::PrepareLaunch(Configuration)) return false;
+	if (!Super::PrepareLaunch(PassiveConfiguration)) return false;
 	if (IsValid(CuedEmitter)) HandoffEmitter(Configuration.Target.TargetActor, CuedEmitter);
+	else if (IsValid(ExistingEmitter)) HandoffEmitter(ExistingEmitter);
 	else if (Configuration.Target.bValid && GuidanceMode == EARMGuidanceMode::PreBriefed)
 		SetPreBriefedTargetLocation(Configuration.Target.Position);
+	else HandoffEmitter(nullptr);
 	return true;
 }
 
-bool UARMMissileGuidanceComponent::CanFireWeapon() const
+bool UARMMissileGuidanceComponent::CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const
 {
-	if (!bIsWeaponActivated || bWeaponFired)
+	if (!bIsWeaponActivated)
 	{
+		OutReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
+	if (bWeaponFired)
+	{
+		OutReason = EWeaponLaunchFailureReason::AmmoDepleted;
 		return false;
 	}
 
-	if (!bRequireLockToFire)
+	if (FiringRequirement == EWeaponFiringRequirement::Nothing)
 	{
+		OutReason = EWeaponLaunchFailureReason::None;
 		return true;
 	}
 
+	bool bHasLock = false;
 	switch (GuidanceMode)
 	{
 		case EARMGuidanceMode::TargetOfOpportunity:
-			return IsTrackingActiveEmission();
+			bHasLock = IsTrackingActiveEmission();
+			break;
 
 		case EARMGuidanceMode::PreBriefed:
-			return bHasPreBriefedTarget || IsTrackingActiveEmission();
+			bHasLock = bHasPreBriefedTarget || IsTrackingActiveEmission();
+			break;
 
 		case EARMGuidanceMode::SelfProtect:
-			return IsTrackingActiveEmission() && HandoffThreatID != INDEX_NONE;
+			bHasLock = IsTrackingActiveEmission() && HandoffThreatID != INDEX_NONE;
+			break;
 
 		default:
-			return IsValid(GetLockedTarget());
+			bHasLock = IsValid(GetLockedTarget());
+			break;
 	}
+
+	if (!bHasLock)
+	{
+		OutReason = EWeaponLaunchFailureReason::TargetLockRequired;
+		return false;
+	}
+
+	OutReason = EWeaponLaunchFailureReason::None;
+	return true;
 }
 
 bool UARMMissileGuidanceComponent::FireWeapon()
@@ -154,8 +192,76 @@ void UARMMissileGuidanceComponent::TransitionToPhase(EARMFlightPhase NewPhase)
 	if (FlightPhase != NewPhase)
 	{
 		FlightPhase = NewPhase;
-		OnPhaseChanged.Broadcast(NewPhase);
+		if (NewPhase == EARMFlightPhase::DeadReckoning || NewPhase == EARMFlightPhase::MemoryTimeout)
+			TransitionSeekerState(EWeaponSeekerState::Lost);
+		else if (NewPhase == EARMFlightPhase::TerminalTracking && IsTrackingActiveEmission())
+			TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+		OnARMPhaseChanged.Broadcast(NewPhase);
 	}
+}
+
+bool UARMMissileGuidanceComponent::SlaveToDirection(const FVector& InWorldDirection)
+{
+	if (InWorldDirection.IsNearlyZero() || bWeaponFired) return false;
+	FVector Position; FRotator Rotation;
+	GetSeekerTransform(Position, Rotation);
+	const FVector Direction = InWorldDirection.GetSafeNormal();
+	const float Angle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(
+		FVector::DotProduct(Rotation.Vector(), Direction), -1.0f, 1.0f)));
+	if (Angle > GimbalLimitAngle) return false;
+	PassiveScanDirection = Direction;
+	bPassiveSeekerCaged = false;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	return true;
+}
+
+void UARMMissileGuidanceComponent::SlaveToBoresight()
+{
+	if (bWeaponFired) return;
+	PassiveScanDirection = FVector::ZeroVector;
+	bPassiveSeekerCaged = true;
+	HandoffEmitter(nullptr);
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Caged : EWeaponSeekerState::Standby);
+}
+
+void UARMMissileGuidanceComponent::SetSeekerCaged(bool bCaged)
+{
+	if (bCaged) { SlaveToBoresight(); return; }
+	bPassiveSeekerCaged = false;
+	if (!bIsWeaponActivated) return;
+	TransitionSeekerState(IsTrackingActiveEmission() ? EWeaponSeekerState::Tracking :
+		EWeaponSeekerState::Slaved, GetLockedTarget());
+}
+
+FVector UARMMissileGuidanceComponent::GetSeekerLookDirection() const
+{
+	if (IsTrackingActiveEmission() && IsValid(GetLockedTarget()) && IsValid(GetOwner()))
+		return (GetLockedTarget()->GetActorLocation() - GetOwner()->GetActorLocation()).GetSafeNormal();
+	if (!bPassiveSeekerCaged && bHasPreBriefedTarget && IsValid(GetOwner()))
+		return (PreBriefedTargetLocation - GetOwner()->GetActorLocation()).GetSafeNormal();
+	return PassiveScanDirection.IsNearlyZero() ? Super::GetSeekerLookDirection() : PassiveScanDirection;
+}
+
+FVector2D UARMMissileGuidanceComponent::GetSeekerGimbalAngles() const
+{
+	FVector Position; FRotator Rotation;
+	GetSeekerTransform(Position, Rotation);
+	const FRotator Relative = Rotation.UnrotateVector(GetSeekerLookDirection()).Rotation();
+	return FVector2D(Relative.Pitch, Relative.Yaw);
+}
+
+EWeaponAudioTone UARMMissileGuidanceComponent::GetSeekerAudioTone() const
+{
+	if (!bIsWeaponActivated) return EWeaponAudioTone::Silent;
+	return IsTrackingActiveEmission() ? EWeaponAudioTone::Locked :
+		(SeekerState == EWeaponSeekerState::Slaved ? EWeaponAudioTone::Searching : EWeaponAudioTone::Silent);
+}
+
+float UARMMissileGuidanceComponent::GetSeekerSignalStrength() const
+{
+	if (!IsTrackingActiveEmission() || !IsValid(GetOwner()) || PassiveSeekerMaxRange <= 0.0f) return 0.0f;
+	return FMath::Clamp(1.0f - FVector::Dist(GetOwner()->GetActorLocation(),
+		GetLockedTarget()->GetActorLocation()) / PassiveSeekerMaxRange, 0.0f, 1.0f);
 }
 
 bool UARMMissileGuidanceComponent::IsTrackingActiveEmission() const
@@ -184,6 +290,16 @@ void UARMMissileGuidanceComponent::HandoffEmitter(AActor* InEmitterActor, UAircr
 	{
 		TargetRadarComponent.Reset();
 		LockMissile(nullptr);
+		TransitionSeekerState(!bIsWeaponActivated ? EWeaponSeekerState::Standby :
+			bPassiveSeekerCaged ? EWeaponSeekerState::Caged :
+			bHasPreBriefedTarget ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Lost);
+		HandoffThreatID = INDEX_NONE;
+		bHasEmitterMemory = bHasPreBriefedTarget;
+		if (bHasPreBriefedTarget)
+		{
+			LastKnownEmitterLocation = PreBriefedTargetLocation;
+			LastKnownEmitterVelocity = FVector::ZeroVector;
+		}
 		return;
 	}
 
@@ -193,8 +309,12 @@ void UARMMissileGuidanceComponent::HandoffEmitter(AActor* InEmitterActor, UAircr
 		Radar = InEmitterActor->FindComponentByClass<UAircraftRadarComponent>();
 	}
 
+	const bool bNewEmitter = GetLockedTarget() != InEmitterActor || !IsTrackingActiveEmission();
 	TargetRadarComponent = Radar;
 	LockMissile(InEmitterActor);
+	bPassiveSeekerCaged = false;
+	if (bIsWeaponActivated && IsTrackingActiveEmission())
+		TransitionSeekerState(EWeaponSeekerState::Tracking, InEmitterActor);
 
 	LastKnownEmitterLocation = InEmitterActor->GetActorLocation();
 	bHasEmitterMemory = true;
@@ -202,7 +322,7 @@ void UARMMissileGuidanceComponent::HandoffEmitter(AActor* InEmitterActor, UAircr
 	TimeSinceEmissionLost = 0.0f;
 	DeadReckoningElapsedTime = 0.0f;
 
-	OnEmitterAcquired.Broadcast(InEmitterActor, Radar);
+	if (bNewEmitter && IsTrackingActiveEmission()) OnEmitterAcquired.Broadcast(InEmitterActor, Radar);
 }
 
 bool UARMMissileGuidanceComponent::HandoffFromRWR(URadarWarningReceiverComponent* InRWR, int32 ThreatID)
@@ -248,6 +368,8 @@ void UARMMissileGuidanceComponent::SetPreBriefedTargetLocation(const FVector& In
 	bHasEmitterMemory = true;
 	LastKnownEmitterLocation = InLocation;
 	LastKnownEmitterVelocity = FVector::ZeroVector;
+	bPassiveSeekerCaged = false;
+	if (bIsWeaponActivated && !IsTrackingActiveEmission()) TransitionSeekerState(EWeaponSeekerState::Slaved);
 }
 
 bool UARMMissileGuidanceComponent::IsRadarCandidateEligible(UAircraftRadarComponent* Candidate, float& OutAngleDeg, float& OutDistCm) const
@@ -298,13 +420,15 @@ bool UARMMissileGuidanceComponent::IsRadarCandidateEligible(UAircraftRadarCompon
 	}
 
 	const FVector DirToEmitter = ToEmitter / OutDistCm;
-	const FVector SeekerFwd = SeekerRot.Vector();
+	const FVector SeekerFwd = PassiveScanDirection.IsNearlyZero() ? SeekerRot.Vector() : PassiveScanDirection.GetSafeNormal();
 
 	const float Dot = FVector::DotProduct(SeekerFwd, DirToEmitter);
 	OutAngleDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0f, 1.0f)));
 
 	// Check against maximum gimbal limit and passive seeker cone
-	if (OutAngleDeg > GimbalLimitAngle)
+	const float BoresightAngleDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(
+		FVector::DotProduct(SeekerRot.Vector(), DirToEmitter), -1.0f, 1.0f)));
+	if (OutAngleDeg > PassiveSeekerConeAngle || BoresightAngleDeg > GimbalLimitAngle)
 	{
 		return false;
 	}
@@ -519,7 +643,12 @@ void UARMMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 
 		case EARMFlightPhase::TerminalTracking:
 		{
-			// Live RF tracking — check if enemy shuts down transmitter
+			if (!IsTrackingActiveEmission() && !bHasEmitterMemory)
+			{
+				PerformPassiveSeekerScan();
+				break;
+			}
+			// Check emitter status during live tracking
 			VerifyCurrentEmitterEmission(DeltaTime);
 			break;
 		}
@@ -531,10 +660,10 @@ void UARMMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 			// Extrapolate position using last known emitter velocity
 			LastKnownEmitterLocation += LastKnownEmitterVelocity * DeltaTime;
 
-			// Reacquisition attempt if enemy radar resumes radiating
+			// Attempt reacquisition if radar resumes radiating
 			if (bCanReacquireIfEmitterResumes)
 			{
-				// Check if original target resumed
+				// Check if original emitter resumed
 				if (IsValid(GetLockedTarget()) && IsTrackingActiveEmission())
 				{
 					TransitionToPhase(EARMFlightPhase::TerminalTracking);

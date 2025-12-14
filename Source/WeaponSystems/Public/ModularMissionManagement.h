@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -10,6 +9,8 @@
 #include "Components/ActorComponent.h"
 #include "Templates/SubclassOf.h"
 #include "CombatTeamUtility.h"
+#include "AircraftCombatCommonTypes.h"
+#include "MasterWeaponComponent.h"
 #include "Net/UnrealNetwork.h"
 #include "ModularMissionManagement.generated.h"
 
@@ -22,6 +23,7 @@ class UMissileGuidanceComponent;
 class URadarMissileGuidanceComponent;
 class UIRMissileGuidanceComponent;
 class UARMMissileGuidanceComponent;
+class UDroppableItemComponent;
 class URadarWarningReceiverComponent;
 struct FRadarTrack;
 
@@ -94,23 +96,6 @@ enum class EAircraftMasterMode : uint8
 	Dogfight UMETA(DisplayName = "Dogfight Mode"),
 	MissileOverride UMETA(DisplayName = "Missile Override Mode"),
 	Emergency UMETA(DisplayName = "Emergency")
-};
-
-/**
- * Reason for weapon launch failure
- */
-UENUM(BlueprintType)
-enum class EWeaponLaunchFailureReason : uint8
-{
-	None UMETA(DisplayName = "None / Success"),
-	MasterArmSafe UMETA(DisplayName = "Master Arm is SAFE"),
-	StationNotFound UMETA(DisplayName = "Station Not Found"),
-	NoWeaponConfigured UMETA(DisplayName = "No Weapon Configured"),
-	AmmoDepleted UMETA(DisplayName = "Station Ammunition Depleted"),
-	StationFault UMETA(DisplayName = "Station Fault / Damaged"),
-	StationJettisoned UMETA(DisplayName = "Station Jettisoned"),
-	WeaponNotReady UMETA(DisplayName = "Weapon System Not Ready"),
-	FriendlyTargetInhibit UMETA(DisplayName = "Friendly Target - Release Inhibited")
 };
 
 /**
@@ -270,7 +255,7 @@ struct WEAPONSYSTEMS_API FWeaponStation
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Station|Runtime")
 	EStationStatus Status = EStationStatus::Ready;
 
-	/** If true, this station acts as a single weapon with multiple rounds (e.g., Gun Pod) instead of a rack of disposable weapons. */
+	/** If true, this station acts as a persistent launcher/pod (e.g. Gun Pod, Rocket Pod) where the mounted store remains attached and fires internal ammunition rounds. If false, each round is a discrete physical store (e.g. missile, bomb, drop tank) that detaches upon release. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Store", meta = (EditCondition = "StoreType != EStoreType::None && StoreType != EStoreType::InternalCannon", EditConditionHides))
 	bool bUsesAmmoManagement = false;
 
@@ -285,6 +270,10 @@ struct WEAPONSYSTEMS_API FWeaponStation
 	/** Current ammunition count for ammo-based weapons */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Store", meta = (EditCondition = "(StoreType == EStoreType::InternalCannon) || (StoreType != EStoreType::None && bUsesAmmoManagement)", EditConditionHides, ClampMin = "0"))
 	int32 CurrentAmmo = 1;
+
+	/** Dry-fire rounds remaining in Simulate mode; live ammunition is never consumed by simulation. */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Cannon|Runtime")
+	int32 SimulatedAmmo = 1;
 
 	/** List of gun muzzles/barrels configured for this built-in cannon station */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Cannon", meta = (EditCondition = "StoreType == EStoreType::InternalCannon", EditConditionHides))
@@ -305,9 +294,10 @@ struct WEAPONSYSTEMS_API FWeaponStation
 	/** Helper to count remaining ready stores or ammo */
 	int32 GetCurrentAmmo() const
 	{
+		if (StoreType == EStoreType::None || Status == EStationStatus::Jettisoned) return 0;
 		if (StoreType == EStoreType::InternalCannon || bUsesAmmoManagement)
 		{
-			return CurrentAmmo;
+			return FMath::Max(0, CurrentAmmo);
 		}
 
 		int32 Count = 0;
@@ -323,7 +313,7 @@ struct WEAPONSYSTEMS_API FWeaponStation
 	{
 		if (StoreType == EStoreType::InternalCannon || bUsesAmmoManagement)
 		{
-			return MaxAmmo;
+			return FMath::Max(0, MaxAmmo);
 		}
 		return Stores.Num();
 	}
@@ -345,7 +335,7 @@ struct WEAPONSYSTEMS_API FWeaponStation
 	TArray<FStationPylon> Pylons;
 
 	/** Transient references to the spawned pylon static mesh components */
-	UPROPERTY(Transient)
+	UPROPERTY(Transient, NotReplicated)
 	TArray<TObjectPtr<UStaticMeshComponent>> SpawnedPylons;
 };
 
@@ -371,10 +361,14 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnStationSelectedSignature, int32,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FOnStationWeaponFiredSignature, int32, StationIndex, AActor*, SpawnedWeapon, EStoreType, StoreType, int32, RemainingAmmo);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponJettisonedSignature, int32, StationIndex, EStoreType, StoreType);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnStoresInventoryChangedSignature);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnStationAmmoChangedSignature, int32, StationIndex, int32, NewAmmo, int32, MaxAmmo);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnStationStatusChangedSignature, int32, StationIndex, EStationStatus, NewStatus);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponLaunchFailedSignature, int32, StationIndex, EWeaponLaunchFailureReason, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnWeaponLaunchResultSignature, int32, StationIndex, bool, bSucceeded, EWeaponLaunchFailureReason, Reason);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTargetDesignatedSignature, AActor*, TargetActor);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTargetClearedSignature);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMissionTargetLockedSignature, AActor*, TargetActor);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMissionLockClearedSignature);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnMissionTargetBuggedSignature, AActor*, TargetActor);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnMissionBugClearedSignature);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGunFiringStartedSignature, int32, StationIndex);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnGunFiringStoppedSignature, int32, StationIndex);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnGunBulletHitSignature, int32, StationIndex, int32, MuzzleIndex, const FHitResult&, HitResult);
@@ -425,6 +419,14 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
 	FOnStoresInventoryChangedSignature OnStoresInventoryChanged;
 
+	/** Event triggered when an individual station's ammunition count changes */
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnStationAmmoChangedSignature OnStationAmmoChanged;
+
+	/** Event triggered when an individual station's operational status changes (Ready, Selected, Fault, Empty, Jettisoned) */
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnStationStatusChangedSignature OnStationStatusChanged;
+
 	/** Event triggered when a launch attempt fails safety or prerequisite checks */
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
 	FOnWeaponLaunchFailedSignature OnWeaponLaunchFailed;
@@ -433,13 +435,17 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
 	FOnWeaponLaunchResultSignature OnWeaponLaunchResult;
 
-	/** Event triggered when a new target is designated */
+	/** Event triggered when a hard lock is assigned */
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
-	FOnTargetDesignatedSignature OnTargetDesignated;
+	FOnMissionTargetLockedSignature OnTargetLocked;
 
-	/** Event triggered when the designated target is cleared/deselected */
+	/** Event triggered when the locked target is cleared/deselected */
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
-	FOnTargetClearedSignature OnTargetCleared;
+	FOnMissionLockClearedSignature OnLockCleared;
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnMissionTargetBuggedSignature OnTargetBugged;
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnMissionBugClearedSignature OnBugCleared;
 
 	/** Event triggered when a continuous gun begins firing */
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
@@ -453,6 +459,15 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
 	FOnGunBulletHitSignature OnGunBulletHit;
 
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnWeaponSeekerStateChangedSignature OnActiveWeaponSeekerStateChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnWeaponLockAcquiredSignature OnActiveWeaponLockAcquired;
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnWeaponLockLostSignature OnActiveWeaponLockLost;
+	UPROPERTY(BlueprintAssignable, Category = "Mission Management|Events")
+	FOnWeaponCageStateChangedSignature OnActiveWeaponCageStateChanged;
+
 	/** Array of hardpoint weapon stations configured on this aircraft */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_Stations, Category = "Mission Management|Stations")
 	TArray<FWeaponStation> Stations;
@@ -465,6 +480,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, ReplicatedUsing = OnRep_MasterMode, Category = "Mission Management|Control")
 	EAircraftMasterMode MasterMode = EAircraftMasterMode::AirToAir;
 
+	/** If true, switching master combat mode automatically selects the primary station for that mode (e.g. Dogfight -> Cannon, MissileOverride -> BVR) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mission Management|Control")
+	bool bAutoSelectStationOnMasterMode = true;
+
+
 	/** If true, automatically spawns and attaches store visual actors to aircraft mesh sockets at BeginPlay */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mission Management|Initialization")
 	bool bAutoSpawnStoresOnBeginPlay = true;
@@ -473,7 +493,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mission Management|Control")
 	bool bAutoStepStationOnFire = true;
 
-	/** If true, weapon release is inhibited when the designated target is classified as Friendly via IGenericTeamAgentInterface */
+	/** If true, weapon release is inhibited when its cue or the IR seeker's own lock is Friendly */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated, Category = "Mission Management|Safety")
 	bool bInhibitFriendlyFire = false;
 
@@ -645,6 +665,28 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mission Management|Selection")
 	class UMasterWeaponComponent* GetActiveWeaponComponent(int32 StationIndex) const;
 
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	EWeaponComponentType GetSelectedWeaponComponentType() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	UMissileGuidanceComponent* GetSelectedMissileGuidance() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	UIRMissileGuidanceComponent* GetSelectedIRMissile() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	URadarMissileGuidanceComponent* GetSelectedRadarMissile() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	UARMMissileGuidanceComponent* GetSelectedARMMissile() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Weapons")
+	UDroppableItemComponent* GetSelectedDroppableItem() const;
+
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Weapons")
+	bool SlaveSelectedWeaponToDirection(const FVector& InWorldDirection);
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Weapons")
+	bool SlaveSelectedWeaponToLocation(const FVector& InWorldLocation);
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Weapons")
+	void SlaveSelectedWeaponToBoresight();
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Weapons")
+	void SetSelectedWeaponCaged(bool bCaged);
+
 	/** Sets Master Arm mode (Safe / Arm / Simulate) */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Control")
 	void SetMasterArmMode(EMasterArmMode InMode);
@@ -665,19 +707,28 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mission Management|Control")
 	FORCEINLINE EAircraftMasterMode GetMasterMode() const { return MasterMode; }
 
-	/** Assigns the designated sensor/radar target for weapon handoff */
+	/** Assigns the hard-locked radar target for weapon handoff */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Targeting")
-	void SetDesignatedTarget(AActor* InTarget);
-	/** Called by the radar after a server-validated linked designation. */
+	void LockActor(AActor* InTarget);
+	/** Called by the radar after a server-validated linked track selection. */
 	void PrepareLinkedRadarWeapon(const FRadarTrack& LinkedTrack, UAircraftRadarComponent* SourceRadar);
 
-	/** Returns the currently designated target actor (or nullptr if invalid/destroyed) */
+	/** Returns the currently locked target actor (or nullptr if invalid/destroyed) */
 	UFUNCTION(BlueprintPure, Category = "Mission Management|Targeting")
-	FORCEINLINE AActor* GetDesignatedTarget() const { return IsValid(DesignatedTarget) ? DesignatedTarget.Get() : nullptr; }
+	AActor* GetLockedActor() const;
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Release")
+	EWeaponLaunchFailureReason GetLastLaunchFailureReason() const { return LastLaunchFailureReason; }
 
-	/** Clears the designated target */
+	/** Clears the locked target */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Targeting")
-	void ClearDesignatedTarget();
+	void ClearLockedActor();
+	/** Assigns the TWS priority target used for seeker cueing. This does not imply illumination. */
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Targeting")
+	void BugActor(AActor* InTarget);
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Targeting")
+	AActor* GetBuggedActor() const { return IsValid(BuggedTarget) ? BuggedTarget.Get() : nullptr; }
+	UFUNCTION(BlueprintCallable, Category = "Mission Management|Targeting")
+	void ClearBuggedActor();
 
 	/** Auto-discovers and caches the UAircraftRadarComponent on the owner pawn */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Radar")
@@ -695,9 +746,30 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Mission Management|RWR")
 	URadarWarningReceiverComponent* GetRWRComponent() const;
 
-	/** Calculates the Dynamic Launch Zone (DLZ: Rmin, Rne, Rmax) for the missile on the specified station against the designated radar target */
+	/** Calculates the Dynamic Launch Zone (DLZ: Rmin, Rne, Rmax) against the selected weapon cue */
 	UFUNCTION(BlueprintPure, Category = "Mission Management|Radar")
 	bool CalculateMissileLaunchZone(int32 StationIndex, float& OutRmin, float& OutRne, float& OutRmax, bool& OutInShootingEnvelope) const;
+
+	/**
+	 * Computes a radar-integrated firing lead solution for internal cannons or rocket stations.
+	 * Uses filtered radar track distance, closure rate, and target velocity combined with muzzle ballistics.
+	 *
+	 * @param StationIndex Station index of the weapon (must be InternalCannon or RocketPod)
+	 * @param OutLeadLocation World space aim location for HUD lead pipper
+	 * @param OutTimeOfFlight Calculated bullet time of flight in seconds
+	 * @return True if a valid firing solution was computed
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Radar")
+	bool GetGunLeadSolution(int32 StationIndex, FVector& OutLeadLocation, float& OutTimeOfFlight) const;
+
+	/**
+	 * Returns the primary radar target track (STT lock or priority TWS bug) if available.
+	 *
+	 * @param OutTrack Target track information populated from radar
+	 * @return True if a valid locked or bugged track was found
+	 */
+	UFUNCTION(BlueprintPure, Category = "Mission Management|Radar")
+	bool GetPrimaryRadarTarget(FRadarTrack& OutTrack) const;
 
 	/** Automatically selects the best dogfight station (Internal Cannon or Short-Range AAM) */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Stations")
@@ -725,6 +797,9 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Mission Management|Release")
 	bool Fire(int32 StationIndex);
+
+	/** Routes a mounted weapon's direct request through its actual station safety checks. */
+	bool FireMountedWeapon(const UMasterWeaponComponent* Weapon);
 
 	/**
 	 * Begins continuous firing for a built-in cannon station.
@@ -815,12 +890,20 @@ public:
 
 	UFUNCTION(Server, Reliable, Category = "Mission Management|Selection")
 	void ServerSelectNextStationOfStoreType(EStoreType InStoreType);
+	UFUNCTION(Server, Reliable, Category = "Mission Management|Weapons")
+	void ServerSlaveSelectedWeaponToDirection(FVector InWorldDirection);
+	UFUNCTION(Server, Reliable, Category = "Mission Management|Weapons")
+	void ServerSlaveSelectedWeaponToLocation(FVector InWorldLocation);
+	UFUNCTION(Server, Reliable, Category = "Mission Management|Weapons")
+	void ServerSlaveSelectedWeaponToBoresight();
+	UFUNCTION(Server, Reliable, Category = "Mission Management|Weapons")
+	void ServerSetSelectedWeaponCaged(bool bCaged);
 
 	UFUNCTION(Server, Reliable, Category = "Mission Management|Targeting")
-	void ServerSetDesignatedTarget(AActor* InTarget);
+	void ServerLockActor(AActor* InTarget);
 
 	UFUNCTION(Server, Reliable, Category = "Mission Management|Targeting")
-	void ServerClearDesignatedTarget();
+	void ServerBugActor(AActor* InTarget);
 
 	UFUNCTION(Server, Reliable, Category = "Mission Management|Release")
 	void ServerFire(int32 StationIndex);
@@ -852,15 +935,35 @@ protected:
 	/** Finds the target scene component / mesh on owner pawn to attach pylons */
 	USceneComponent* ResolveAircraftMesh() const;
 
-	/** Internal helper to release an individual store actor physically */
-	AActor* ExecuteStoreRelease(FWeaponStation& Station, AActor* TargetActor);
+	/** Internal helper to release an individual store actor physically, populating OutFailReason on rejection */
+	AActor* ExecuteStoreRelease(FWeaponStation& Station, AActor* TargetActor, EWeaponLaunchFailureReason& OutFailReason);
 
-	/** Internal callback fired when the designated target actor is destroyed */
+	/** Prepares, activates, and slaves the active weapon on a station to the current target and radar */
+	void PrepareActiveWeaponOnStation(int32 StationIndex);
+	void RefreshSelectedWeaponCue();
+	void BindActiveWeaponDelegates();
+	void UnbindActiveWeaponDelegates();
+	UFUNCTION() void HandleActiveWeaponSeekerStateChanged(UMasterWeaponComponent* Weapon, EWeaponSeekerState OldState, EWeaponSeekerState NewState);
+	UFUNCTION() void HandleActiveWeaponLockAcquired(UMasterWeaponComponent* Weapon, AActor* Target);
+	UFUNCTION() void HandleActiveWeaponLockLost(UMasterWeaponComponent* Weapon, AActor* Target);
+	UFUNCTION() void HandleActiveWeaponCageStateChanged(UMasterWeaponComponent* Weapon, bool bCaged);
+	AActor* GetCueTargetForWeapon(const UMasterWeaponComponent* Weapon) const;
+	bool IsWeaponReleaseInhibitedByIFF(const UMasterWeaponComponent* Weapon, const AActor* CueTarget) const;
+	UFUNCTION() void HandleRadarLockAcquired(const FRadarTrack& Track);
+	UFUNCTION() void HandleRadarLockLost(int32 TrackID);
+	UFUNCTION() void HandleRadarTrackSelected(const FRadarTrack& Track);
+	UFUNCTION() void HandleRadarTrackDeselected(int32 TrackID);
+
+	/** Internal callback fired when the locked target actor is destroyed */
 	UFUNCTION()
-	void HandleDesignatedTargetDestroyed(AActor* DestroyedActor);
+	void HandleCueTargetDestroyed(AActor* DestroyedActor);
 
-	/** Internal method executed on each timer tick to step cannon firing cycles */
-	void ProcessGunFireCycle(int32 StationIndex);
+	/** Internal method executed on each timer tick to step cannon firing cycles. Returns true if round fired. */
+	bool ProcessGunFireCycle(int32 StationIndex);
+
+	/** Timer tick callback for internal cannon fire cycles */
+	UFUNCTION()
+	void HandleGunFireTimerTick(int32 StationIndex) { ProcessGunFireCycle(StationIndex); }
 
 	/** Internal method executed on each frame to advance active swept-trace bullets */
 	void SimulateTracedBullets(float DeltaTime);
@@ -877,6 +980,10 @@ protected:
 	UPROPERTY(Transient)
 	TMap<int32, int32> GunMuzzleIndices;
 
+	/** Recorded launch failure reason from the most recent launch attempt */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Mission Management|Runtime")
+	EWeaponLaunchFailureReason LastLaunchFailureReason = EWeaponLaunchFailureReason::None;
+
 	/** Index of the currently selected station */
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, ReplicatedUsing = OnRep_SelectedStationIndex, Category = "Mission Management|Runtime")
 	int32 SelectedStationIndex = 1;
@@ -884,12 +991,16 @@ protected:
 	UFUNCTION()
 	void OnRep_SelectedStationIndex();
 
-	/** Target actor designated by aircraft radar/sensors */
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_DesignatedTarget, Category = "Mission Management|Runtime")
-	TObjectPtr<AActor> DesignatedTarget = nullptr;
+	/** Target actor held by a hard radar lock */
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_LockedTarget, Category = "Mission Management|Runtime")
+	TObjectPtr<AActor> LockedTarget = nullptr;
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Transient, ReplicatedUsing = OnRep_BuggedTarget, Category = "Mission Management|Runtime")
+	TObjectPtr<AActor> BuggedTarget = nullptr;
 
 	UFUNCTION()
-	void OnRep_DesignatedTarget();
+	void OnRep_LockedTarget();
+	UFUNCTION()
+	void OnRep_BuggedTarget();
 
 	/** Cached pointer to the aircraft mesh component used for sockets */
 	UPROPERTY(Transient)
@@ -904,6 +1015,15 @@ protected:
 	TObjectPtr<URadarWarningReceiverComponent> CachedRWRComponent = nullptr;
 
 private:
+	/** Local presentation components survive inventory replication independently. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> LocalPylons;
+	bool bStoreReleaseInProgress = false;
+	TWeakObjectPtr<UMasterWeaponComponent> SubscribedActiveWeapon;
+	/** Explicit pilot cue takes precedence until the target designation or selected station changes. */
+	TWeakObjectPtr<UMasterWeaponComponent> PilotCuedWeapon;
+	/** Tracks cues applied by the mission system so only those cues are cleared with a designation. */
+	TWeakObjectPtr<UMasterWeaponComponent> AutomaticallyCuedWeapon;
 	/** Finds index in Stations array for given station ID */
 	int32 FindStationArrayIndex(int32 StationIndex) const;
 

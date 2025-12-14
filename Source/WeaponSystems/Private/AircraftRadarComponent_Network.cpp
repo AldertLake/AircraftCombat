@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "AircraftRadarComponent.h"
@@ -10,225 +9,234 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 
-int32 UAircraftRadarComponent::SubmitControlRequest(ERadarCommandType Command, int32 IntValue,
+bool UAircraftRadarComponent::ExecuteOrSubmitCommand(ERadarCommandType Command, int32 IntValue,
 	float ValueA, float ValueB, const FVector& WorldValue, const FRadarCursorState& Cursor,
-	ERadarDisplayGeometry Geometry, APlayerController* RequestingController)
+	ERadarDisplayGeometry Geometry, bool bAuthoritative, APlayerController* Controller)
 {
-	if (GetOwner() && GetOwner()->HasAuthority())
+	const bool bHasAuthority = !GetOwner() || GetOwner()->HasAuthority();
+	const bool bIsGameWorld = GetWorld() && GetWorld()->IsGameWorld();
+
+	if (!bIsGameWorld || (bHasAuthority && bAuthoritative))
 	{
-		int32 TrackID = -1;
-		const bool bAuthorized = IsValid(RequestingController) &&
-			ActiveRadarOperator.Get() == RequestingController;
-		const bool bSuccess = bAuthorized && ExecuteOperatorCommand(Command, IntValue, ValueA, ValueB,
-			WorldValue, Cursor, Geometry, TrackID, DisplayViewRevision);
-		OnRadarCommandResult.Broadcast(0, Command, bSuccess, TrackID);
-		return 0;
+		int32 OutTrackID = -1;
+		const bool bSuccess = ExecuteOperatorCommand(Command, IntValue, ValueA, ValueB, WorldValue, Cursor, Geometry, OutTrackID, DisplayViewRevision);
+		if (bHasAuthority && bIsGameWorld && bSuccess)
+		{
+			PublishOperatorSnapshot();
+		}
+		return bSuccess;
 	}
+
+	if (bHasAuthority)
+	{
+		if (!Controller || ActiveRadarOperator.Get() != Controller)
+		{
+			return false;
+		}
+		int32 OutTrackID = -1;
+		const bool bSuccess = ExecuteOperatorCommand(Command, IntValue, ValueA, ValueB, WorldValue, Cursor, Geometry, OutTrackID, DisplayViewRevision);
+		OnRadarCommandResult.Broadcast(0, Command, bSuccess, OutTrackID);
+		if (bSuccess)
+		{
+			PublishOperatorSnapshot();
+		}
+		return bSuccess;
+	}
+
 	if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
 	{
-		if (RequestingController && Link->GetOwner() != RequestingController) return INDEX_NONE;
-		return Link->SubmitCommand(Command, IntValue, ValueA, ValueB, WorldValue, Cursor,
-			Geometry, DisplayViewRevision);
+		if (Controller && Link->GetOwner() != Controller)
+		{
+			return false;
+		}
+		const int32 RequestID = Link->SubmitCommand(Command, IntValue, ValueA, ValueB, WorldValue, Cursor, Geometry, DisplayViewRevision);
+		return RequestID != INDEX_NONE;
 	}
-	return INDEX_NONE;
+
+	return false;
 }
 
-int32 UAircraftRadarComponent::RequestSetRadarMode(ERadarOperatingMode NewMode, APlayerController* RequestingController)
+bool UAircraftRadarComponent::SetRadarMode(ERadarOperatingMode NewMode, bool bAuthoritative, APlayerController* Controller)
 {
-	return SubmitControlRequest(ERadarCommandType::SetMode, static_cast<int32>(NewMode), 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetMode, static_cast<int32>(NewMode), 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestSetDisplayRange(float NewRangeCm, APlayerController* RequestingController)
+bool UAircraftRadarComponent::SetDisplayRange(float NewRangeCm, bool bAuthoritative, APlayerController* Controller)
 {
-	return SubmitControlRequest(ERadarCommandType::SetRange, 0, NewRangeCm, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetRange, 0, NewRangeCm, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestLockTrack(int32 TrackID, APlayerController* RequestingController)
+bool UAircraftRadarComponent::CycleRangeScale(bool bIncrease, bool bAuthoritative, APlayerController* Controller)
 {
-	return SubmitControlRequest(ERadarCommandType::LockTrack, TrackID, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestBugTrack(int32 TrackID, APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::BugTrack, TrackID, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestBreakLock(APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::BreakLock, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestDesignateCursor(APlayerController* RequestingController)
-{
-	if (!bEnableTargetCursor) return INDEX_NONE;
-	return SubmitControlRequest(ERadarCommandType::DesignateCursor, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestDesignateUnderDisplayCursor(APlayerController* RequestingController)
-{
-	return RequestDesignateCursor(RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestSetDisplayWindow(float ZoomFactor,
-	FVector2D ViewCenterOffset, APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::SetDisplayWindow, 0,
-		ZoomFactor, ViewCenterOffset.X, FVector(ViewCenterOffset.Y, 0.0f, 0.0f),
-		FRadarCursorState(), DisplayView.ActiveGeometry, RequestingController);
-}
-
-bool UAircraftRadarComponent::SetDisplayWindowAuthoritative(ERadarDisplayGeometry Geometry,
-	const FRadarDisplayWindow& Window)
-{
-	if (!GetOwner() || !GetOwner()->HasAuthority() ||
-		(Geometry != ERadarDisplayGeometry::BScope && Geometry != ERadarDisplayGeometry::PPI) ||
-		!FMath::IsFinite(Window.ZoomFactor) || !FMath::IsFinite(Window.ViewCenterOffset.X) ||
-		!FMath::IsFinite(Window.ViewCenterOffset.Y)) return false;
-	FRadarDisplayWindow& Current = Geometry == ERadarDisplayGeometry::BScope
-		? DisplayView.BScope : DisplayView.PPI;
-	FRadarDisplayWindow Clamped = FRadarDisplayGeometryMath::ClampWindow(Window);
-	const float XLimit = Geometry == ERadarDisplayGeometry::PPI
-		? CurrentDisplayRange / 100000.0f : AzimuthScanWidth * 0.5f;
-	const float YLimit = Geometry == ERadarDisplayGeometry::PPI
-		? CurrentDisplayRange / 100000.0f : CurrentDisplayRange / 200000.0f;
-	Clamped.ViewCenterOffset.X = FMath::Clamp(Clamped.ViewCenterOffset.X, -XLimit, XLimit);
-	Clamped.ViewCenterOffset.Y = FMath::Clamp(Clamped.ViewCenterOffset.Y, -YLimit, YLimit);
-	if (!FMath::IsNearlyEqual(Current.ZoomFactor, Clamped.ZoomFactor) ||
-		!Current.ViewCenterOffset.Equals(Clamped.ViewCenterOffset))
+	if (RangeScalePresets.IsEmpty()) return false;
+	int32 CurrentIdx = 0;
+	float BestDiff = TNumericLimits<float>::Max();
+	for (int32 i = 0; i < RangeScalePresets.Num(); ++i)
 	{
-		Current = Clamped;
-		++DisplayViewRevision;
+		const float Diff = FMath::Abs(RangeScalePresets[i] - CurrentDisplayRange);
+		if (Diff < BestDiff)
+		{
+			BestDiff = Diff;
+			CurrentIdx = i;
+		}
 	}
-	return true;
+	const int32 Count = RangeScalePresets.Num();
+	const int32 NextIdx = bIncrease ? (CurrentIdx + 1) % Count : (CurrentIdx - 1 + Count) % Count;
+	return SetDisplayRange(RangeScalePresets[NextIdx], bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestSetDisplayGeometry(ERadarDisplayGeometry Geometry,
-	APlayerController* RequestingController)
+bool UAircraftRadarComponent::SetACMSubMode(ERadarACMSubMode NewSubMode, bool bAuthoritative, APlayerController* Controller)
 {
-	return SubmitControlRequest(ERadarCommandType::SetDisplayGeometry, static_cast<int32>(Geometry),
-		0.0f, 0.0f, FVector::ZeroVector, FRadarCursorState(), Geometry, RequestingController);
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetACMMode, static_cast<int32>(NewSubMode), 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestSetDisplayHeadingUp(bool bHeadingUp,
-	APlayerController* RequestingController)
+bool UAircraftRadarComponent::SetScanVolume(float InAzimuthWidth, float InElevationHeight, int32 InBars, bool bAuthoritative, APlayerController* Controller)
 {
-	return SubmitControlRequest(ERadarCommandType::SetDisplayHeadingUp, bHeadingUp ? 1 : 0,
-		0.0f, 0.0f, FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry,
-		RequestingController);
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetScanVolume, InBars, InAzimuthWidth, InElevationHeight,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestSetCursorFromDisplayPosition(FVector2D WidgetPosition,
-	FVector2D WidgetSize, APlayerController* RequestingController)
+bool UAircraftRadarComponent::ApplyScanSizePreset(ERadarScanSize Preset, bool bAuthoritative, APlayerController* Controller)
 {
-	if (!bEnableTargetCursor) return INDEX_NONE;
+	return ExecuteOrSubmitCommand(ERadarCommandType::ApplyScanPreset, static_cast<int32>(Preset), 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::OffsetScanCenter(float AzimuthDelta, float ElevationDelta, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::OffsetScanCenter, 0, AzimuthDelta, ElevationDelta,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::DesignateSpotlightPoint(const FVector& WorldLocation, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::DesignateSpotlight, 0, 0.0f, 0.0f,
+		WorldLocation, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::DesignateSpotlightActor(AActor* Actor, bool bAuthoritative, APlayerController* Controller)
+{
+	if (!IsValid(Actor)) return false;
+	return DesignateSpotlightPoint(Actor->GetActorLocation(), bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::ClearSpotlightTarget(bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::ClearSpotlight, 0, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::SetHelmetLookDirection(const FVector& WorldDirection, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::HelmetCue, 0, 0.0f, 0.0f,
+		WorldDirection.GetSafeNormal(), FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::LockTrack(int32 TrackID, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::LockTrack, TrackID, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::LockActor(AActor* TargetActor, bool bAuthoritative, APlayerController* Controller)
+{
+	if (!IsValid(TargetActor)) return false;
+	FRadarTrack Track;
+	if (GetTrackByActor(TargetActor, Track))
+	{
+		return LockTrack(Track.TrackID, bAuthoritative, Controller);
+	}
+	if (bAuthoritative)
+	{
+		return AcquireOrLockActor(TargetActor, true);
+	}
+	return false;
+}
+
+bool UAircraftRadarComponent::BugTrack(int32 TrackID, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::BugTrack, TrackID, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::BreakLock(bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::BreakLock, 0, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::ClearBugTrack(bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::ClearBug, 0, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::MoveTDCCursor(FVector2D DeltaAxis, bool bAuthoritative, APlayerController* Controller)
+{
+	if (!bEnableTargetCursor) return false;
+	if (!FMath::IsFinite(DeltaAxis.X) || !FMath::IsFinite(DeltaAxis.Y)) return false;
+
+	const bool bHasAuthority = !GetOwner() || GetOwner()->HasAuthority();
+	const bool bIsGameWorld = GetWorld() && GetWorld()->IsGameWorld();
+
+	if (!bIsGameWorld || (bHasAuthority && bAuthoritative))
+	{
+		return ExecuteAuthoritativeMoveTDCCursor(DeltaAxis);
+	}
+
+	if (bHasAuthority)
+	{
+		if (!Controller || ActiveRadarOperator.Get() != Controller) return false;
+		return ExecuteAuthoritativeMoveTDCCursor(DeltaAxis);
+	}
+
+	if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
+	{
+		if (!Link->CanControl() || (Controller && Link->GetOwner() != Controller)) return false;
+		Link->SubmitCursorInput(DeltaAxis.X, DeltaAxis.Y);
+		return true;
+	}
+
+	return false;
+}
+
+bool UAircraftRadarComponent::SetTDCCursorFromDisplayPosition(const FVector2D& DisplayPosition, const FVector2D& WidgetSize, bool bAuthoritative, APlayerController* Controller)
+{
+	if (!bEnableTargetCursor) return false;
 	const FRadarDisplayProjection Projection = MakeDisplayProjection(FVector2D::ZeroVector, WidgetSize,
 		DisplayView.ActiveGeometry, DisplayView.bHeadingUp);
 	FRadarCursorState Cursor;
-	if (!ResolveDisplayPointToCursor(WidgetPosition + WidgetSize * 0.5f, Projection, Cursor)) return INDEX_NONE;
-	return SubmitControlRequest(ERadarCommandType::SetCursor, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, Cursor, DisplayView.ActiveGeometry, RequestingController);
+	if (!ResolveDisplayPointToCursor(DisplayPosition + WidgetSize * 0.5f, Projection, Cursor)) return false;
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetCursor, 0, 0.0f, 0.0f,
+		FVector::ZeroVector, Cursor, DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
-int32 UAircraftRadarComponent::RequestDesignateLinkedTrack(int32 TrackID, APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::DesignateLinkedTrack, TrackID, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestSetCursorFromWidgetPosition(const FVector2D& WidgetPosition,
-	const FRadarDisplayProjection& Projection, APlayerController* RequestingController)
-{
-	if (!bEnableTargetCursor) return INDEX_NONE;
-	FRadarCursorState Cursor;
-	if (!ResolveDisplayPointToCursor(WidgetPosition, Projection, Cursor)) return INDEX_NONE;
-	return SubmitControlRequest(ERadarCommandType::SetCursor, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, Cursor, Projection.Geometry, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestSetACMSubMode(ERadarACMSubMode NewSubMode,
-	APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::SetACMMode, static_cast<int32>(NewSubMode),
-		0.0f, 0.0f, FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope,
-		RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestSetScanVolume(float AzimuthWidth, float ElevationHeight,
-	int32 Bars, APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::SetScanVolume, Bars, AzimuthWidth, ElevationHeight,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestOffsetScanCenter(float AzimuthDelta, float ElevationDelta,
-	APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::OffsetScanCenter, 0, AzimuthDelta, ElevationDelta,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestApplyScanSizePreset(ERadarScanSize Preset,
-	APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::ApplyScanPreset, static_cast<int32>(Preset),
-		0.0f, 0.0f, FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope,
-		RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestClearBugTrack(APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::ClearBug, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope,
-		RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestDesignateSpotlightPoint(const FVector& WorldLocation,
-	APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::DesignateSpotlight, 0, 0.0f, 0.0f,
-		WorldLocation, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestClearSpotlightTarget(APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::ClearSpotlight, 0, 0.0f, 0.0f,
-		FVector::ZeroVector, FRadarCursorState(), ERadarDisplayGeometry::BScope,
-		RequestingController);
-}
-
-int32 UAircraftRadarComponent::RequestSetHelmetLookDirection(const FVector& WorldDirection,
-	APlayerController* RequestingController)
-{
-	return SubmitControlRequest(ERadarCommandType::HelmetCue, 0, 0.0f, 0.0f,
-		WorldDirection, FRadarCursorState(), ERadarDisplayGeometry::BScope, RequestingController);
-}
-
-bool UAircraftRadarComponent::RequestMoveTDCCursor(float XAxis, float YAxis,
-	APlayerController* RequestingController)
+bool UAircraftRadarComponent::DesignateUnderCursor(bool bAuthoritative, APlayerController* Controller)
 {
 	if (!bEnableTargetCursor) return false;
-	if (!FMath::IsFinite(XAxis) || !FMath::IsFinite(YAxis)) return false;
-	if (GetOwner() && GetOwner()->HasAuthority())
-	{
-		if (!IsValid(RequestingController) || ActiveRadarOperator.Get() != RequestingController)
-			return false;
-		MoveTDCCursor(XAxis, YAxis);
-		return true;
-	}
-	if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-	{
-		if (!Link->CanControl() || (RequestingController && Link->GetOwner() != RequestingController))
-			return false;
-		Link->SubmitCursorInput(XAxis, YAxis);
-		return true;
-	}
-	return false;
+	return ExecuteOrSubmitCommand(ERadarCommandType::DesignateCursor, 0, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::SetDisplayGeometry(ERadarDisplayGeometry Geometry, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetDisplayGeometry, static_cast<int32>(Geometry), 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), Geometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::SetDisplayHeadingUp(bool bHeadingUp, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::SetDisplayHeadingUp, bHeadingUp ? 1 : 0, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
+}
+
+bool UAircraftRadarComponent::DesignateLinkedTrack(int32 TrackID, bool bAuthoritative, APlayerController* Controller)
+{
+	return ExecuteOrSubmitCommand(ERadarCommandType::DesignateLinkedTrack, TrackID, 0.0f, 0.0f,
+		FVector::ZeroVector, FRadarCursorState(), DisplayView.ActiveGeometry, bAuthoritative, Controller);
 }
 
 bool UAircraftRadarComponent::GrantRadarAccess(APlayerController* Controller)
@@ -369,6 +377,9 @@ void UAircraftRadarComponent::PublishOperatorSnapshot()
 	Snapshot.DisplayView = DisplayView;
 	Snapshot.DisplayViewRevision = DisplayViewRevision;
 	Snapshot.ScanAzimuth = CurrentScanAzimuth;
+	Snapshot.ScanElevation = CurrentScanElevation;
+	Snapshot.bVirtuallySweepBeam = bVirtuallySweepBeam;
+	Snapshot.SampleBeams = ActiveSampleBeams;
 	Snapshot.ScanCenterAzimuth = ScanCenterAzimuth;
 	Snapshot.ScanCenterElevation = ScanCenterElevation;
 	Snapshot.AzimuthScanWidth = AzimuthScanWidth;
@@ -443,6 +454,9 @@ void UAircraftRadarComponent::ApplyOperatorSnapshot(const FRadarOperatorSnapshot
 	DisplayView = Snapshot.DisplayView;
 	DisplayViewRevision = Snapshot.DisplayViewRevision;
 	CurrentScanAzimuth = Snapshot.ScanAzimuth;
+	CurrentScanElevation = Snapshot.ScanElevation;
+	bVirtuallySweepBeam = Snapshot.bVirtuallySweepBeam;
+	ActiveSampleBeams = Snapshot.SampleBeams;
 	ScanCenterAzimuth = Snapshot.ScanCenterAzimuth;
 	ScanCenterElevation = Snapshot.ScanCenterElevation;
 	AzimuthScanWidth = Snapshot.AzimuthScanWidth;
@@ -593,14 +607,7 @@ bool UAircraftRadarComponent::ExecuteOperatorCommand(ERadarCommandType Command, 
 		ViewRevision >= 0 && ViewRevision != DisplayViewRevision) return false;
 	switch (Command)
 	{
-	case ERadarCommandType::SetDisplayWindow:
-		if (ValueA < 1.0f || ValueA > 16.0f) return false;
-		{
-			FRadarDisplayWindow Window;
-			Window.ZoomFactor = ValueA;
-			Window.ViewCenterOffset = FVector2D(ValueB, WorldValue.X);
-			return SetDisplayWindowAuthoritative(DisplayView.ActiveGeometry, Window);
-		}
+
 	case ERadarCommandType::SetDisplayGeometry:
 		if (IntValue < 0 || IntValue > static_cast<int32>(ERadarDisplayGeometry::PPI)) return false;
 		if (DisplayView.ActiveGeometry != static_cast<ERadarDisplayGeometry>(IntValue))
@@ -619,29 +626,29 @@ bool UAircraftRadarComponent::ExecuteOperatorCommand(ERadarCommandType Command, 
 		return true;
 	case ERadarCommandType::SetMode:
 		if (IntValue < 0 || IntValue > static_cast<int32>(ERadarOperatingMode::Spotlight)) return false;
-		SetRadarMode(static_cast<ERadarOperatingMode>(IntValue)); return true;
+		return ExecuteAuthoritativeSetRadarMode(static_cast<ERadarOperatingMode>(IntValue));
 	case ERadarCommandType::SetRange:
 		if (ValueA < 1000.0f || ValueA > 100000000.0f) return false;
-		SetRangeScale(ValueA); return true;
+		return ExecuteAuthoritativeSetDisplayRange(ValueA);
 	case ERadarCommandType::SetACMMode:
 		if (IntValue < 0 || IntValue > static_cast<int32>(ERadarACMSubMode::SlewAcquisition)) return false;
-		SetACMSubMode(static_cast<ERadarACMSubMode>(IntValue)); return true;
+		return ExecuteAuthoritativeSetACMSubMode(static_cast<ERadarACMSubMode>(IntValue));
 	case ERadarCommandType::LockTrack:
-		OutTrackID = IntValue; return CommandLock(IntValue);
+		OutTrackID = IntValue; return ExecuteAuthoritativeLockTrack(IntValue);
 	case ERadarCommandType::BugTrack:
-		OutTrackID = IntValue; return CommandBugTrack(IntValue);
+		OutTrackID = IntValue; return ExecuteAuthoritativeBugTrack(IntValue);
 	case ERadarCommandType::DesignateLinkedTrack:
-		OutTrackID = IntValue; return DesignateLinkedTrack(IntValue);
+		OutTrackID = IntValue; return ExecuteAuthoritativeDesignateLinkedTrack(IntValue);
 	case ERadarCommandType::BreakLock:
 		if (!IsSTTLocked()) return false;
-		BreakLock(); return true;
+		return ExecuteAuthoritativeBreakLock();
 	case ERadarCommandType::ClearBug:
 		if (BuggedTrackID < 0) return false;
-		ClearBugTrack(); return true;
+		return ExecuteAuthoritativeClearBugTrack();
 	case ERadarCommandType::DesignateCursor:
 		if (!bEnableTargetCursor) return false;
 		if (Geometry != DisplayView.ActiveGeometry) return false;
-		if (!DesignateTrackUnderCursorInDisplay(Geometry, CursorSelectionRadiusFraction)) return false;
+		if (!ExecuteAuthoritativeDesignateUnderCursor()) return false;
 		OutTrackID = SelectedLinkedTrackID < -1 ? SelectedLinkedTrackID :
 			(STTLockedTrackID >= 0 ? STTLockedTrackID : BuggedTrackID);
 		return true;
@@ -657,21 +664,21 @@ bool UAircraftRadarComponent::ExecuteOperatorCommand(ERadarCommandType Command, 
 	}
 	case ERadarCommandType::SetScanVolume:
 		if (ValueA < 5.0f || ValueA > 360.0f || ValueB < 2.0f || ValueB > 120.0f || IntValue < 1 || IntValue > 8) return false;
-		SetScanVolume(ValueA, ValueB, IntValue); return true;
+		return ExecuteAuthoritativeSetScanVolume(ValueA, ValueB, IntValue);
 	case ERadarCommandType::OffsetScanCenter:
 		if (FMath::Abs(ValueA) > 30.0f || FMath::Abs(ValueB) > 30.0f) return false;
-		OffsetScanCenter(ValueA, ValueB); return true;
+		return ExecuteAuthoritativeOffsetScanCenter(ValueA, ValueB);
 	case ERadarCommandType::DesignateSpotlight:
 		if (FVector::DistSquared(GetRadarLocation(), WorldValue) > FMath::Square(MaxDetectionRange)) return false;
-		DesignateSpotlightPoint(WorldValue); return true;
+		return ExecuteAuthoritativeDesignateSpotlightPoint(WorldValue);
 	case ERadarCommandType::ClearSpotlight:
-		ClearSpotlightTarget(); return true;
+		return ExecuteAuthoritativeClearSpotlightTarget();
 	case ERadarCommandType::HelmetCue:
 		if (WorldValue.SizeSquared() > 1.1f) return false;
-		SetHelmetLookDirection(WorldValue); return true;
+		return ExecuteAuthoritativeSetHelmetLookDirection(WorldValue);
 	case ERadarCommandType::ApplyScanPreset:
 		if (IntValue < 0 || IntValue > static_cast<int32>(ERadarScanSize::Custom)) return false;
-		ApplyScanSizePreset(static_cast<ERadarScanSize>(IntValue)); return true;
+		return ExecuteAuthoritativeApplyScanSizePreset(static_cast<ERadarScanSize>(IntValue));
 	default: return false;
 	}
 }

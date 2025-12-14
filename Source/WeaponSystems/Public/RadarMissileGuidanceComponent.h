@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -34,7 +33,6 @@ enum class EActiveSeekerActivation : uint8
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnActiveSeekerActivatedSignature);
-DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnRadarMissileLockLostSignature);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDataLinkTimeoutSignature, float, TimeSinceLastUpdate);
 
 /** Shared radar seeker, measured target, datalink, and illumination machinery. */
@@ -48,8 +46,6 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category="Missile|Radar|Events")
 	FOnActiveSeekerActivatedSignature OnActiveSeekerActivated;
-	UPROPERTY(BlueprintAssignable, Category="Missile|Radar|Events")
-	FOnRadarMissileLockLostSignature OnRadarLockLost;
 	UPROPERTY(BlueprintAssignable, Category="Missile|Radar|Events")
 	FOnDataLinkTimeoutSignature OnDataLinkTimeout;
 
@@ -114,9 +110,25 @@ public:
 	void FillLaunchedMissileStatus(FRadarLaunchedMissileStatus& OutStatus) const;
 
 	virtual bool PrepareLaunch(const FMissileLaunchConfiguration& Configuration) override;
-	virtual bool CanFireWeapon() const override;
+	using UMissileGuidanceComponent::CanFireWeapon;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const override;
 	virtual bool FireWeapon() override;
 	virtual void ActivateWeapon(bool bActivate = true) override;
+	virtual void LockMissile(AActor* InTargetActor) override;
+	virtual bool SlaveToDirection(const FVector& InWorldDirection) override;
+	virtual bool SlaveToLocation(const FVector& InWorldLocation) override;
+	virtual bool SlaveToTarget(AActor* InTarget) override;
+	virtual void SlaveToBoresight() override;
+	virtual void SetSeekerCaged(bool bCaged) override;
+	virtual bool IsSeekerCaged() const override { return bRadarSeekerCaged; }
+	virtual FVector GetSeekerLookDirection() const override;
+	virtual FVector2D GetSeekerGimbalAngles() const override;
+	virtual float GetSeekerGimbalLimitAngle() const override { return ActiveSeekerConeAngle; }
+	virtual EWeaponAudioTone GetSeekerAudioTone() const override;
+	virtual float GetSeekerSignalStrength() const override;
+	virtual bool GetDynamicLaunchZone(const AActor* Target, float& OutRmin, float& OutRne, float& OutRmax) const override;
+	virtual float GetEstimatedTimeToImpact(const AActor* Target) const override;
+	virtual float GetEstimatedTimeToActive(const AActor* Target) const override;
 
 protected:
 	virtual void BeginPlay() override;
@@ -169,6 +181,8 @@ protected:
 	bool bHasActiveSeeker = false;
 	bool bNeedsIllumination = false;
 	bool bSeaTargetsOnly = false;
+	bool bRadarSeekerCaged = true;
+	FVector RadarSlavedDirection = FVector::ZeroVector;
 	TSet<TWeakObjectPtr<AActor>> ObservedChaff;
 };
 

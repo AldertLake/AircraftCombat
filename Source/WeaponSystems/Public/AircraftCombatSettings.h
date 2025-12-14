@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -78,4 +77,20 @@ public:
 	/** Vehicle domain priority ranking (index 0 = highest danger) used as tie-breaker for RWR Diamond threat. */
 	UPROPERTY(EditAnywhere, config, Category = "RWR Priority", meta = (DisplayName = "Threat Vehicle Type Priority (Index 0 = Highest Danger)"))
 	TArray<ERadarTargetDomain> ThreatVehicleTypePriority;
+
+	// ========================================================================
+	// Tactical Data Link Settings
+	// ========================================================================
+
+	/** Default interval in seconds between scheduled data link transmission windows. */
+	UPROPERTY(EditAnywhere, config, Category = "Data Link", meta = (ClampMin = "0.05", DisplayName = "Default Transmission Interval (Seconds)"))
+	float DefaultTransmissionInterval = 0.5f;
+
+	/** Default maximum number of track reports transmitted per participant during a single window. */
+	UPROPERTY(EditAnywhere, config, Category = "Data Link", meta = (ClampMin = "1", DisplayName = "Default Reports Per Window"))
+	int32 DefaultReportsPerWindow = 16;
+
+	/** Default maximum number of relay hops permitted for routing reports to distant nodes. */
+	UPROPERTY(EditAnywhere, config, Category = "Data Link", meta = (ClampMin = "0", DisplayName = "Default Max Relay Hops"))
+	int32 DefaultMaxRelayHops = 4;
 };

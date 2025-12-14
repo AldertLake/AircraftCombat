@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "IRMissileGuidanceComponent.h"
@@ -17,29 +16,55 @@ UIRMissileGuidanceComponent::UIRMissileGuidanceComponent()
 {
 	// IR missiles default to the Engine socket for heat tracking
 	TargetTrackingSocket = FName(TEXT("Engine"));
+	FiringRequirement = EWeaponFiringRequirement::Bugging;
+	WeaponComponentType = EWeaponComponentType::IRMissile;
 }
 
 bool UIRMissileGuidanceComponent::PrepareLaunch(const FMissileLaunchConfiguration& Configuration)
 {
+	AActor* ExistingSeekerTarget = IsValid(GetLockedTarget()) ? GetLockedTarget() : nullptr;
 	FMissileLaunchConfiguration SeekerConfiguration = Configuration;
-	SeekerConfiguration.Target.TargetActor = nullptr;
+	if (ExistingSeekerTarget != Configuration.Target.TargetActor)
+		SeekerConfiguration.Target.TargetActor = nullptr;
 	if (!Super::PrepareLaunch(SeekerConfiguration)) return false;
 	if (IsValid(Configuration.Target.TargetActor))
 	{
+		if (ExistingSeekerTarget == Configuration.Target.TargetActor) return true;
 		// The radar or SMS only cues the IR head; it cannot grant a seeker lock.
 		LockMissile(nullptr);
-		return SlaveToDesignatedTarget(Configuration.Target.TargetActor);
+		if (SlaveToTarget(Configuration.Target.TargetActor)) return true;
+		SlaveToBoresight();
+		return true;
 	}
+	if (IsValid(ExistingSeekerTarget)) LockMissile(ExistingSeekerTarget);
+	else SlaveToBoresight();
 	return true;
 }
 
-bool UIRMissileGuidanceComponent::CanFireWeapon() const
+bool UIRMissileGuidanceComponent::CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const
 {
-	return bIsWeaponActivated && !bWeaponFired && (!bRequireLockToFire || IsValid(GetLockedTarget()));
+	if (!bIsWeaponActivated)
+	{
+		OutReason = EWeaponLaunchFailureReason::WeaponNotReady;
+		return false;
+	}
+	if (bWeaponFired)
+	{
+		OutReason = EWeaponLaunchFailureReason::AmmoDepleted;
+		return false;
+	}
+	if (FiringRequirement == EWeaponFiringRequirement::HardLock && !IsValid(GetLockedTarget()))
+	{
+		OutReason = EWeaponLaunchFailureReason::TargetLockRequired;
+		return false;
+	}
+	OutReason = EWeaponLaunchFailureReason::None;
+	return true;
 }
 
 void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 {
+	if (GetLockedTarget() && !IsValid(GetLockedTarget())) LockMissile(nullptr);
 	FVector SeekerLocation = FVector::ZeroVector;
 	FRotator SeekerRotation = FRotator::ZeroRotator;
 	GetSeekerTransform(SeekerLocation, SeekerRotation);
@@ -53,9 +78,7 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 		{
 			// Target exceeded maximum IR seeker sensor range — cannot maintain lock
 			PreviousNarrowConeTargets.Empty();
-			AActor* LostTarget = GetLockedTarget();
 			LockMissile(nullptr);
-			OnTargetLockLost.Broadcast(LostTarget);
 			return;
 		}
 
@@ -82,9 +105,7 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 		{
 			// Target lost: broke gimbal limits, left narrow tracking cone, or obstructed by terrain/geometry
 			PreviousNarrowConeTargets.Empty();
-			AActor* LostTarget = GetLockedTarget();
 			LockMissile(nullptr);
-			OnTargetLockLost.Broadcast(LostTarget);
 		}
 		else
 		{
@@ -107,7 +128,7 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 
 				if (bHasNewDistractor && FMath::FRand() < TargetDistractionChance)
 				{
-					// Seducing the seeker: Pick the closest distractor (not current target)
+					// Seeker seduction: target closest distractor or flare
 					AActor* ClosestDistractor = nullptr;
 					float MinDistanceSq = TNumericLimits<float>::Max();
 
@@ -132,8 +153,6 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 						OnHeatSeekerChangeTarget.Broadcast(ClosestDistractor, OldTarget);
 						if (!IsValid(this) || !IsWeaponActivated()) return;
 
-						OnTargetLocked.Broadcast(ClosestDistractor);
-						if (!IsValid(this) || !IsWeaponActivated()) return;
 					}
 				}
 			}
@@ -157,7 +176,16 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 		FVector2D SearchConeRotation = FVector2D::ZeroVector;
 		if (bIsSlavedToLocation)
 		{
-			const FVector ToSlavedPoint = bIsSlavedToDirection ? SlavedWorldDirection : (SlavedWorldLocation - SeekerLocation).GetSafeNormal();
+			if (AActor* Target = SlavedTarget.Get()) SlavedWorldLocation = GetTargetTrackingLocation(Target);
+			else if (SlavedTarget.IsStale())
+			{
+				SlavedTarget.Reset();
+				bIsSlavedToLocation = false;
+				bIsSlavedToDirection = false;
+				TransitionSeekerState(EWeaponSeekerState::Lost);
+			}
+			const FVector ToSlavedPoint = !bIsSlavedToLocation ? FVector::ZeroVector :
+				(bIsSlavedToDirection ? SlavedWorldDirection : (SlavedWorldLocation - SeekerLocation).GetSafeNormal());
 			if (!ToSlavedPoint.IsNearlyZero())
 			{
 				const FVector LocalDir = SeekerRotation.UnrotateVector(ToSlavedPoint);
@@ -183,12 +211,12 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 		if (bHasTargetInCone && DetectedTargets.Num() > 0)
 		{
 			// Find and acquire the target closest to the missile / slaved cone center
-			AActor* ClosestTarget = nullptr;
+			AActor* ClosestTarget = SlavedTarget.IsValid() && DetectedTargets.Contains(SlavedTarget.Get()) ? SlavedTarget.Get() : nullptr;
 			float MinDistanceSq = TNumericLimits<float>::Max();
 
 			for (AActor* Candidate : DetectedTargets)
 			{
-				if (IsValid(Candidate))
+				if (IsValid(Candidate) && !ClosestTarget)
 				{
 					const FVector CandidateLocation = GetTargetTrackingLocation(Candidate);
 					const float DistSq = FVector::DistSquared(SeekerLocation, CandidateLocation);
@@ -202,31 +230,16 @@ void UIRMissileGuidanceComponent::TickSeekerLogic(float DeltaTime)
 
 			if (ClosestTarget && GetLockedTarget() != ClosestTarget)
 			{
+				// Keep the external command so a later lock loss resumes cued acquisition.
 				LockMissile(ClosestTarget);
-				bIsSlavedToLocation = false;
-				bIsSlavedToDirection = false;
-				OnTargetLocked.Broadcast(GetLockedTarget());
-				if (!IsValid(this) || !IsWeaponActivated()) return;
 			}
 		}
 	}
 }
 
-bool UIRMissileGuidanceComponent::SlaveToDesignatedTarget(AActor* InTarget)
+bool UIRMissileGuidanceComponent::SlaveToTarget(AActor* InTarget)
 {
-	bIsSlavedToLocation = false;
-	bIsSlavedToDirection = false;
-
-	if (!IsValid(InTarget))
-	{
-		if (GetLockedTarget() != nullptr)
-		{
-			AActor* OldTarget = GetLockedTarget();
-			LockMissile(nullptr);
-			OnTargetLockLost.Broadcast(OldTarget);
-		}
-		return false;
-	}
+	if (!IsValid(InTarget)) return false;
 
 	if (!IsCandidateTargetEligible(InTarget))
 	{
@@ -241,15 +254,7 @@ bool UIRMissileGuidanceComponent::SlaveToDesignatedTarget(AActor* InTarget)
 	const float Distance = FVector::Dist(SeekerLocation, TargetLocation);
 
 	// If the selected target is beyond MaxSensorRange, the IR head cannot lock or be slaved to it
-	if (Distance > MaxSensorRange)
-	{
-		if (GetLockedTarget() == InTarget)
-		{
-			LockMissile(nullptr);
-			OnTargetLockLost.Broadcast(InTarget);
-		}
-		return false;
-	}
+	if (Distance > MaxSensorRange) return false;
 
 	// Check gimbal limits
 	const FVector ToTarget = (TargetLocation - SeekerLocation).GetSafeNormal();
@@ -287,28 +292,28 @@ bool UIRMissileGuidanceComponent::SlaveToDesignatedTarget(AActor* InTarget)
 		}
 	}
 
-	LockMissile(InTarget);
+	SlavedTarget = InTarget;
+	bIsSlavedToLocation = true;
+	bIsSlavedToDirection = false;
+	SlavedWorldLocation = TargetLocation;
+	bSeekerCaged = false;
+	if (GetLockedTarget() == InTarget)
+	{
+		TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Tracking : EWeaponSeekerState::Standby,
+			bIsWeaponActivated ? InTarget : nullptr);
+		return true;
+	}
+	LockMissile(nullptr);
 	CurrentConeRotation = FVector2D(
 		FMath::Clamp(TargetConeRotation.X, MinConeRotation.X, MaxConeRotation.X),
 		FMath::Clamp(TargetConeRotation.Y, MinConeRotation.Y, MaxConeRotation.Y)
 	);
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
 	return true;
 }
 
 bool UIRMissileGuidanceComponent::SlaveToLocation(const FVector& InWorldLocation)
 {
-	SlavedWorldLocation = InWorldLocation;
-	bIsSlavedToLocation = true;
-	bIsSlavedToDirection = false;
-
-	// If currently locked on an actor, clear lock to re-acquire at the newly slaved location
-	if (GetLockedTarget() != nullptr)
-	{
-		AActor* OldTarget = GetLockedTarget();
-		LockMissile(nullptr);
-		OnTargetLockLost.Broadcast(OldTarget);
-	}
-
 	FVector SeekerLocation = FVector::ZeroVector;
 	FRotator SeekerRotation = FRotator::ZeroRotator;
 	GetSeekerTransform(SeekerLocation, SeekerRotation);
@@ -316,8 +321,7 @@ bool UIRMissileGuidanceComponent::SlaveToLocation(const FVector& InWorldLocation
 	const FVector ToLocation = (InWorldLocation - SeekerLocation).GetSafeNormal();
 	if (ToLocation.IsNearlyZero())
 	{
-		CurrentConeRotation = FVector2D::ZeroVector;
-		return true;
+		return false;
 	}
 
 	const FVector LocalDir = SeekerRotation.UnrotateVector(ToLocation);
@@ -325,21 +329,28 @@ bool UIRMissileGuidanceComponent::SlaveToLocation(const FVector& InWorldLocation
 
 	const bool bWithinGimbalLimits = (RelativeRot.Pitch >= MinConeRotation.X && RelativeRot.Pitch <= MaxConeRotation.X &&
 	                                  RelativeRot.Yaw >= MinConeRotation.Y && RelativeRot.Yaw <= MaxConeRotation.Y);
+	if (!bWithinGimbalLimits) return false;
+	SlavedTarget.Reset();
+	SlavedWorldLocation = InWorldLocation;
+	bIsSlavedToLocation = true;
+	bIsSlavedToDirection = false;
+	bSeekerCaged = false;
+	LockMissile(nullptr);
 
 	CurrentConeRotation = FVector2D(
 		FMath::Clamp(RelativeRot.Pitch, MinConeRotation.X, MaxConeRotation.X),
 		FMath::Clamp(RelativeRot.Yaw, MinConeRotation.Y, MaxConeRotation.Y)
 	);
 
-	return bWithinGimbalLimits;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	return true;
 }
 
 bool UIRMissileGuidanceComponent::SlaveToDirection(const FVector& InWorldDirection)
 {
 	if (InWorldDirection.IsNearlyZero())
 	{
-		SlaveToBoresight();
-		return true;
+		return false;
 	}
 
 	FVector SeekerLocation = FVector::ZeroVector;
@@ -347,49 +358,102 @@ bool UIRMissileGuidanceComponent::SlaveToDirection(const FVector& InWorldDirecti
 	GetSeekerTransform(SeekerLocation, SeekerRotation);
 
 	const FVector NormalizedDir = InWorldDirection.GetSafeNormal();
-	SlavedWorldLocation = SeekerLocation + (NormalizedDir * MaxSensorRange);
-	bIsSlavedToLocation = true;
-	bIsSlavedToDirection = true;
-	SlavedWorldDirection = NormalizedDir;
-
-	// If currently locked on an actor, clear lock to re-acquire along the newly slaved direction
-	if (GetLockedTarget() != nullptr)
-	{
-		AActor* OldTarget = GetLockedTarget();
-		LockMissile(nullptr);
-		OnTargetLockLost.Broadcast(OldTarget);
-	}
-
 	const FVector LocalDir = SeekerRotation.UnrotateVector(NormalizedDir);
 	const FRotator RelativeRot = LocalDir.Rotation();
 
 	const bool bWithinGimbalLimits = (RelativeRot.Pitch >= MinConeRotation.X && RelativeRot.Pitch <= MaxConeRotation.X &&
 	                                  RelativeRot.Yaw >= MinConeRotation.Y && RelativeRot.Yaw <= MaxConeRotation.Y);
+	if (!bWithinGimbalLimits) return false;
+	SlavedTarget.Reset();
+	SlavedWorldLocation = SeekerLocation + (NormalizedDir * MaxSensorRange);
+	bIsSlavedToLocation = true;
+	bIsSlavedToDirection = true;
+	SlavedWorldDirection = NormalizedDir;
+	bSeekerCaged = false;
+	LockMissile(nullptr);
 
 	CurrentConeRotation = FVector2D(
 		FMath::Clamp(RelativeRot.Pitch, MinConeRotation.X, MaxConeRotation.X),
 		FMath::Clamp(RelativeRot.Yaw, MinConeRotation.Y, MaxConeRotation.Y)
 	);
 
-	return bWithinGimbalLimits;
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Standby);
+	return true;
 }
 
 void UIRMissileGuidanceComponent::SlaveToBoresight()
 {
+	SlavedTarget.Reset();
 	bIsSlavedToLocation = false;
 	bIsSlavedToDirection = false;
 	SlavedWorldLocation = FVector::ZeroVector;
 	SlavedWorldDirection = FVector::ForwardVector;
 	CurrentConeRotation = FVector2D::ZeroVector;
+	bSeekerCaged = true;
+	LockMissile(nullptr);
+	TransitionSeekerState(bIsWeaponActivated ? EWeaponSeekerState::Caged : EWeaponSeekerState::Standby);
 }
 
-FVector UIRMissileGuidanceComponent::GetCurrentSeekerLookDirection() const
+void UIRMissileGuidanceComponent::SetSeekerCaged(bool bCaged)
+{
+	if (bCaged) { SlaveToBoresight(); return; }
+	bSeekerCaged = false;
+	if (!bIsWeaponActivated) return;
+	if (IsValid(GetLockedTarget())) TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+	else TransitionSeekerState(bIsSlavedToLocation ? EWeaponSeekerState::Slaved : EWeaponSeekerState::Lost);
+}
+
+void UIRMissileGuidanceComponent::LockMissile(AActor* InTargetActor)
+{
+	Super::LockMissile(InTargetActor);
+	if (IsValid(InTargetActor))
+	{
+		bSeekerCaged = false;
+		if (bIsWeaponActivated) TransitionSeekerState(EWeaponSeekerState::Tracking, InTargetActor);
+	}
+	else if (bIsWeaponActivated)
+		TransitionSeekerState(bIsSlavedToLocation ? EWeaponSeekerState::Slaved :
+			(bSeekerCaged ? EWeaponSeekerState::Caged : EWeaponSeekerState::Lost));
+}
+
+void UIRMissileGuidanceComponent::ActivateWeapon(bool bActivate)
+{
+	Super::ActivateWeapon(bActivate);
+	if (bActivate)
+	{
+		if (IsValid(GetLockedTarget())) TransitionSeekerState(EWeaponSeekerState::Tracking, GetLockedTarget());
+		else TransitionSeekerState(bIsSlavedToLocation ? EWeaponSeekerState::Slaved :
+			(bSeekerCaged ? EWeaponSeekerState::Caged : EWeaponSeekerState::Lost));
+	}
+}
+
+FVector UIRMissileGuidanceComponent::GetSeekerLookDirection() const
 {
 	FVector SeekerLocation = FVector::ZeroVector;
 	FRotator SeekerRotation = FRotator::ZeroRotator;
 	GetSeekerTransform(SeekerLocation, SeekerRotation);
 
 	return ComputeRotatedSeekerForward(SeekerRotation, CurrentConeRotation);
+}
+
+float UIRMissileGuidanceComponent::GetSeekerGimbalLimitAngle() const
+{
+	return FMath::Max(FMath::Max(FMath::Abs(MinConeRotation.X), FMath::Abs(MaxConeRotation.X)),
+		FMath::Max(FMath::Abs(MinConeRotation.Y), FMath::Abs(MaxConeRotation.Y)));
+}
+
+EWeaponAudioTone UIRMissileGuidanceComponent::GetSeekerAudioTone() const
+{
+	if (!bIsWeaponActivated) return EWeaponAudioTone::Silent;
+	if (IsValid(GetLockedTarget())) return EWeaponAudioTone::Locked;
+	return bIsSlavedToLocation ? EWeaponAudioTone::Searching : EWeaponAudioTone::Silent;
+}
+
+float UIRMissileGuidanceComponent::GetSeekerSignalStrength() const
+{
+	if (!IsMissileLocked() || !IsValid(GetOwner()) || MaxSensorRange <= 0.0f) return 0.0f;
+	const float Range = FVector::Dist(GetOwner()->GetActorLocation(), GetTargetTrackingLocation(GetLockedTarget()));
+	return FMath::Clamp(1.0f - Range / MaxSensorRange, 0.0f, 1.0f);
 }
 
 bool UIRMissileGuidanceComponent::FindTargetsInSeekerCone(
@@ -463,7 +527,6 @@ bool UIRMissileGuidanceComponent::FindTargetsInSeekerCone(
 		}
 	}
 
-	if (Candidates.IsEmpty())
 	{
 		TArray<FOverlapResult> OverlapResults;
 		const FCollisionShape SphereShape = FCollisionShape::MakeSphere(MaxRange);
@@ -516,7 +579,7 @@ bool UIRMissileGuidanceComponent::FindTargetsInSeekerCone(
 			{
 				if (AActor* Candidate = Overlap.GetActor())
 				{
-					Candidates.Add(Candidate);
+					Candidates.AddUnique(Candidate);
 				}
 			}
 		}
@@ -539,13 +602,13 @@ bool UIRMissileGuidanceComponent::FindTargetsInSeekerCone(
 		}
 		ProcessedActors.Add(Candidate);
 
-		// Step 1: Base eligibility (null, friendly/self, target tags)
+		// Target eligibility filter
 		if (!IsCandidateTargetEligible(Candidate))
 		{
 			continue;
 		}
 
-		// Step 2: Distance & Narrow Cone Angle check
+		// Distance and cone angle check
 		const FVector TargetLocation = GetTargetTrackingLocation(Candidate);
 		const FVector ToTarget = TargetLocation - SeekerLocation;
 		const float DistanceSq = ToTarget.SizeSquared();
@@ -563,7 +626,7 @@ bool UIRMissileGuidanceComponent::FindTargetsInSeekerCone(
 			continue;
 		}
 
-		// Step 3: Line-of-Sight (LOS) Raycast
+		// Line-of-sight check
 		FHitResult HitResult;
 		const bool bHit = World->LineTraceSingleByChannel(
 			HitResult,

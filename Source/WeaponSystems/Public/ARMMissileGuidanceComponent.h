@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -89,7 +88,7 @@ public:
 
 	/** Fired when missile guidance phase transitions */
 	UPROPERTY(BlueprintAssignable, Category = "Missile|ARM|Events")
-	FOnARMPhaseChangedSignature OnPhaseChanged;
+	FOnARMPhaseChangedSignature OnARMPhaseChanged;
 
 	/** Fired when passive seeker confirms lock on an active RF emitter */
 	UPROPERTY(BlueprintAssignable, Category = "Missile|ARM|Events")
@@ -235,10 +234,21 @@ public:
 	FORCEINLINE UAircraftRadarComponent* GetTargetRadarComponent() const { return TargetRadarComponent.Get(); }
 
 	// --- Overrides ---
-	virtual bool CanFireWeapon() const override;
+	using UMissileGuidanceComponent::CanFireWeapon;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const override;
 	virtual bool FireWeapon() override;
 	virtual bool PrepareLaunch(const FMissileLaunchConfiguration& Configuration) override;
 	virtual void UpdateGuidanceVelocity(float DeltaTime) override;
+	virtual void ActivateWeapon(bool bActivate = true) override;
+	virtual bool SlaveToDirection(const FVector& InWorldDirection) override;
+	virtual void SlaveToBoresight() override;
+	virtual void SetSeekerCaged(bool bCaged) override;
+	virtual bool IsSeekerCaged() const override { return bPassiveSeekerCaged; }
+	virtual FVector GetSeekerLookDirection() const override;
+	virtual FVector2D GetSeekerGimbalAngles() const override;
+	virtual float GetSeekerGimbalLimitAngle() const override { return GimbalLimitAngle; }
+	virtual EWeaponAudioTone GetSeekerAudioTone() const override;
+	virtual float GetSeekerSignalStrength() const override;
 
 protected:
 	virtual void BeginPlay() override;
@@ -302,9 +312,11 @@ private:
 	/** Flag indicating whether the initial loft climb has finished */
 	UPROPERTY(Transient)
 	bool bLoftComplete = false;
+	FVector PassiveScanDirection = FVector::ZeroVector;
+	bool bPassiveSeekerCaged = true;
 };
 
-// Aliases for convenience and backward compatibility
+// Legacy aliases
 using EARMGuidanceMode_Aliases = EARMGuidanceMode;
 using EAntiRadiationGuidanceMode = EARMGuidanceMode;
 using EAntiRadiationFlightPhase = EARMFlightPhase;

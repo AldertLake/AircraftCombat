@@ -1,20 +1,35 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/ProjectileMovementComponent.h"
+#include "AircraftCombatCommonTypes.h"
 #include "MasterWeaponComponent.generated.h"
 class APawn;
 class AActor;
+class UMasterWeaponComponent;
+class UModularMissionManagement;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponFiredSignature, AActor*, TargetActor);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponDetachedSignature, AActor*, DetachedWeapon);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnWeaponFireResultSignature, bool, bSucceeded);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnWeaponSeekerStateChangedSignature, UMasterWeaponComponent*, Weapon, EWeaponSeekerState, OldState, EWeaponSeekerState, NewState);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponLockAcquiredSignature, UMasterWeaponComponent*, Weapon, AActor*, Target);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponLockLostSignature, UMasterWeaponComponent*, Weapon, AActor*, Target);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnWeaponCageStateChangedSignature, UMasterWeaponComponent*, Weapon, bool, bCaged);
+
+/** Sensor cue needed for a targeted launch. Seeker-equipped weapons may still launch without a cue. */
+UENUM(BlueprintType)
+enum class EWeaponFiringRequirement : uint8
+{
+	Nothing,
+	Bugging,
+	HardLock
+};
 
 /**
  * Abstract base class for weapon components handling common functionality
@@ -39,6 +54,50 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
 	FOnWeaponFireResultSignature OnWeaponFireResult;
 
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
+	FOnWeaponSeekerStateChangedSignature OnSeekerStateChanged;
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
+	FOnWeaponLockAcquiredSignature OnLockAcquired;
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
+	FOnWeaponLockLostSignature OnLockLost;
+	UPROPERTY(BlueprintAssignable, Category = "Weapon|Events")
+	FOnWeaponCageStateChangedSignature OnCageStateChanged;
+
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	EWeaponComponentType GetWeaponComponentType() const { return WeaponComponentType; }
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Guidance")
+	virtual bool SlaveToDirection(const FVector& InWorldDirection);
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Guidance")
+	virtual bool SlaveToLocation(const FVector& InWorldLocation);
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Guidance")
+	virtual bool SlaveToTarget(AActor* InTarget);
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Guidance")
+	virtual void SlaveToBoresight();
+	UFUNCTION(BlueprintCallable, Category = "Weapon|Guidance")
+	virtual void SetSeekerCaged(bool bCaged);
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual bool IsSeekerCaged() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual EWeaponSeekerState GetSeekerState() const { return SeekerState; }
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual FVector GetSeekerLookDirection() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual FVector2D GetSeekerGimbalAngles() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual float GetSeekerGimbalLimitAngle() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual EWeaponAudioTone GetSeekerAudioTone() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual float GetSeekerSignalStrength() const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual bool GetDynamicLaunchZone(const AActor* Target, float& OutRmin, float& OutRne, float& OutRmax) const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual bool IsTargetInLaunchEnvelope(const AActor* Target) const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual float GetEstimatedTimeToImpact(const AActor* Target) const;
+	UFUNCTION(BlueprintPure, Category = "Weapon|Guidance")
+	virtual float GetEstimatedTimeToActive(const AActor* Target) const;
+
 	/** Initializes the weapon component with the owning player aircraft */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
 	virtual void InitializeWeapon(APawn* InPlayerAircraft);
@@ -51,13 +110,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
 	virtual void ActivateWeapon(bool bActivate = true);
 
-	/** Returns true if the weapon can be fired/launched */
+	/**
+	 * Checks if the weapon is ready and permitted to fire/launch.
+	 *
+	 * @param OutReason Diagnostic launch failure reason if weapon cannot fire
+	 * @return True if weapon can fire
+	 */
 	UFUNCTION(BlueprintPure, Category = "Weapon|Core")
-	virtual bool CanFireWeapon() const;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const;
 
-	/** If true, the weapon must have a valid target lock before it can be fired. If false, it can be fired blindly (Maddog/Boresight). */
+	/** C++ convenience overload for checking weapon firing readiness without diagnostic output */
+	FORCEINLINE bool CanFireWeapon() const
+	{
+		EWeaponLaunchFailureReason UnusedReason = EWeaponLaunchFailureReason::None;
+		return CanFireWeapon(UnusedReason);
+	}
+
+	/** Minimum sensor state for a targeted launch. Autonomous seekers can search after an uncued launch. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon|Core")
-	bool bRequireLockToFire = true;
+	EWeaponFiringRequirement FiringRequirement = EWeaponFiringRequirement::Nothing;
 
 	/** Attempts to fire/launch the weapon */
 	UFUNCTION(BlueprintCallable, Category = "Weapon|Core")
@@ -104,6 +175,22 @@ public:
 	FORCEINLINE float GetTimeSinceFired() const { return TimeSinceFired; }
 
 protected:
+	/** Mounted weapons may only use FireWeapon while their station is executing a checked release. */
+	bool IsDirectFirePermitted() const;
+	UModularMissionManagement* GetMountedMission() const;
+	friend class UModularMissionManagement;
+	bool bMissionReleaseAuthorized = false;
+
+	EWeaponComponentType WeaponComponentType = EWeaponComponentType::Unknown;
+	UPROPERTY(Transient, BlueprintReadOnly, ReplicatedUsing = OnRep_SeekerState, Category = "Weapon|Guidance")
+	EWeaponSeekerState SeekerState = EWeaponSeekerState::Standby;
+	/** The single transition point for universal seeker and lock events. */
+	void TransitionSeekerState(EWeaponSeekerState NewState, AActor* TrackedTarget = nullptr);
+	UPROPERTY(Transient, ReplicatedUsing = OnRep_ReportedLockTarget)
+	TObjectPtr<AActor> ReportedLockTarget = nullptr;
+	TWeakObjectPtr<AActor> LastObservedLockTarget;
+	UFUNCTION() void OnRep_SeekerState(EWeaponSeekerState OldState);
+	UFUNCTION() void OnRep_ReportedLockTarget();
 	/** Recorded ejection impulse applied during release */
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Weapon|Launch")
 	FVector AppliedEjectionImpulse = FVector::ZeroVector;

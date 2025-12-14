@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "DroppableItemComponent.h"
@@ -28,7 +27,8 @@ UDroppableItemComponent::UDroppableItemComponent()
 	Velocity = FVector::ZeroVector;
 
 	// Droppable stores (tanks, unguided bombs) do not require target locks
-	bRequireLockToFire = false;
+	FiringRequirement = EWeaponFiringRequirement::Nothing;
+	WeaponComponentType = EWeaponComponentType::DroppableStore;
 
 	SetIsReplicatedByDefault(true);
 }
@@ -90,18 +90,20 @@ void UDroppableItemComponent::OnRep_IsDetached()
 	}
 }
 
-bool UDroppableItemComponent::CanFireWeapon() const
+bool UDroppableItemComponent::CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const
 {
 	if (bIsDetached || bWeaponFired)
 	{
+		OutReason = EWeaponLaunchFailureReason::AmmoDepleted;
 		return false;
 	}
 
-	return Super::CanFireWeapon();
+	return Super::CanFireWeapon(OutReason);
 }
 
 bool UDroppableItemComponent::FireWeapon()
 {
+	if (!IsDirectFirePermitted()) return false;
 	if (!CanFireWeapon())
 	{
 		return false;
@@ -171,7 +173,7 @@ void UDroppableItemComponent::DetachWeapon()
 		}
 	}
 
-	// Ensure UpdatedComponent is assigned so the root component moves with projectile simulation
+	// Assign UpdatedComponent for projectile simulation
 	if (!UpdatedComponent && GetOwner())
 	{
 		SetUpdatedComponent(GetOwner()->GetRootComponent());
@@ -206,7 +208,6 @@ void UDroppableItemComponent::DetachWeapon()
 	BounceVelocityStopSimulatingThreshold = BounceStopVelocityThreshold;
 	bBounceAngleAffectsFriction = bStoreBounceAngleAffectsFriction;
 
-	// Ensure gravity is at 100% (1.0)
 	ProjectileGravityScale = 1.0f;
 
 	// Activate projectile movement component to begin simulating ballistic flight

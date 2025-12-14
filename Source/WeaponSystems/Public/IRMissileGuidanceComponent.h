@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -29,7 +28,7 @@ class WEAPONSYSTEMS_API UIRMissileGuidanceComponent : public UMissileGuidanceCom
 public:
 	UIRMissileGuidanceComponent();
 	virtual bool PrepareLaunch(const FMissileLaunchConfiguration& Configuration) override;
-	virtual bool CanFireWeapon() const override;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const override;
 
 	/** Event dispatcher broadcast when the seeker is distracted/seduced by another heat source (flares or crossing jet) and switches targets */
 	UPROPERTY(BlueprintAssignable, Category = "Missile|Events")
@@ -82,13 +81,13 @@ public:
 	/**
 	 * Slaves the IR seeker head to a designated target (e.g. from radar / SMS target designation).
 	 * Enforces that the target must be within MaxSensorRange, line of sight must be clear, and within seeker gimbal limits.
-	 * If target is out of sensor range, slaving is rejected and any active lock on this target is cleared.
+	 * A valid cue aims the head for acquisition; it does not by itself grant a thermal lock.
+	 * Out-of-range or obstructed cues are rejected without changing the current seeker aim.
 	 *
 	 * @param InTarget Target actor to slave seeker head towards
-	 * @return True if target was within range and successfully slaved/locked
+	 * @return True if the target was within range and the seeker accepted the cue
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Missile|Infrared Homing Head")
-	bool SlaveToDesignatedTarget(AActor* InTarget);
+	virtual bool SlaveToTarget(AActor* InTarget) override;
 
 	/**
 	 * Slaves the IR seeker head to a specific world location (e.g. helmet look intersect, radar spotlight, or ground point).
@@ -97,8 +96,7 @@ public:
 	 * @param InWorldLocation World space coordinate to slave the seeker head towards
 	 * @return True if the target location is within the mechanical gimbal limits; false if clamped.
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Missile|Infrared Homing Head")
-	bool SlaveToLocation(const FVector& InWorldLocation);
+	virtual bool SlaveToLocation(const FVector& InWorldLocation) override;
 
 	/**
 	 * Slaves the IR seeker head along a specific world direction vector (e.g. pilot helmet look vector / HMD boresight).
@@ -106,14 +104,21 @@ public:
 	 * @param InWorldDirection Normalized world direction vector to aim the seeker towards
 	 * @return True if direction is within mechanical gimbal limits; false if clamped.
 	 */
-	UFUNCTION(BlueprintCallable, Category = "Missile|Infrared Homing Head")
-	bool SlaveToDirection(const FVector& InWorldDirection);
+	virtual bool SlaveToDirection(const FVector& InWorldDirection) override;
 
 	/** Returns the seeker head to missile boresight (caged forward search) */
-	UFUNCTION(BlueprintCallable, Category = "Missile|Infrared Homing Head")
-	void SlaveToBoresight();
+	virtual void SlaveToBoresight() override;
+	virtual void SetSeekerCaged(bool bCaged) override;
+	virtual bool IsSeekerCaged() const override { return bSeekerCaged; }
+	virtual FVector GetSeekerLookDirection() const override;
+	virtual FVector2D GetSeekerGimbalAngles() const override { return CurrentConeRotation; }
+	virtual float GetSeekerGimbalLimitAngle() const override;
+	virtual EWeaponAudioTone GetSeekerAudioTone() const override;
+	virtual float GetSeekerSignalStrength() const override;
+	virtual void LockMissile(AActor* InTargetActor) override;
+	virtual void ActivateWeapon(bool bActivate = true) override;
 
-	/** Returns true if the seeker is currently slaved to a world location or direction */
+	/** Returns true if an external acquisition cue is retained, including while tracking a thermal lock */
 	UFUNCTION(BlueprintPure, Category = "Missile|Infrared Homing Head")
 	FORCEINLINE bool IsSeekerSlavedToLocation() const { return bIsSlavedToLocation; }
 
@@ -121,13 +126,6 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Missile|Infrared Homing Head")
 	FORCEINLINE FVector GetSlavedLocation() const { return SlavedWorldLocation; }
 
-	/** Returns the current physical seeker gimbal orientation angles in degrees (X = Pitch, Y = Yaw relative to missile forward) */
-	UFUNCTION(BlueprintPure, Category = "Missile|Infrared Homing Head")
-	FORCEINLINE FVector2D GetCurrentSeekerGimbalAngles() const { return CurrentConeRotation; }
-
-	/** Returns the current forward look direction of the seeker head in world space (ideal for HUD / helmet reticle projection) */
-	UFUNCTION(BlueprintPure, Category = "Missile|Infrared Homing Head")
-	FVector GetCurrentSeekerLookDirection() const;
 
 	/** Returns the target distraction probability (0.0 to 1.0) */
 	UFUNCTION(BlueprintPure, Category = "Missile|Infrared Homing Head|Countermeasures")
@@ -154,7 +152,7 @@ private:
 	UPROPERTY(Transient)
 	TSet<TWeakObjectPtr<AActor>> PreviousNarrowConeTargets;
 
-	/** True if the seeker head is manually slaved to a world location or direction */
+	/** Retained acquisition command used again if thermal tracking loses its target */
 	UPROPERTY(Transient)
 	bool bIsSlavedToLocation = false;
 
@@ -173,4 +171,6 @@ private:
 	/** Current physical seeker gimbal angles in degrees (X = Pitch, Y = Yaw) */
 	UPROPERTY(Transient)
 	FVector2D CurrentConeRotation = FVector2D::ZeroVector;
+	TWeakObjectPtr<AActor> SlavedTarget;
+	bool bSeekerCaged = true;
 };

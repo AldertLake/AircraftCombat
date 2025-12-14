@@ -1,8 +1,8 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
+
 //
 // AircraftRadarComponent.cpp — Core radar logic, mode management, replication, and query helpers
 //
@@ -28,6 +28,8 @@ UAircraftRadarComponent::UAircraftRadarComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = true;
+	// Read the completed skeletal pose when an AnimBP steers the radar plate.
+	PrimaryComponentTick.TickGroup = TG_PostUpdateWork;
 
 	SetIsReplicatedByDefault(true);
 
@@ -40,29 +42,57 @@ UAircraftRadarComponent::UAircraftRadarComponent()
 	CurrentDisplayRange = 7408000.0f; // Default 40nm
 }
 
+void UAircraftRadarComponent::PostLoad()
+{
+	Super::PostLoad();
+
+	if (ScanSizePreset != ERadarScanSize::Custom)
+	{
+		switch (ScanSizePreset)
+		{
+			case ERadarScanSize::Narrow_20: AzimuthScanWidth = 20.0f; break;
+			case ERadarScanSize::Medium_40: AzimuthScanWidth = 40.0f; break;
+			case ERadarScanSize::Wide_60:   AzimuthScanWidth = 60.0f; break;
+			case ERadarScanSize::Full_120:  AzimuthScanWidth = 120.0f; break;
+			default: break;
+		}
+	}
+}
+
 void UAircraftRadarComponent::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// Ensure AzimuthScanWidth reflects the configured preset if not using Custom
+	if (ScanSizePreset != ERadarScanSize::Custom)
+	{
+		switch (ScanSizePreset)
+		{
+			case ERadarScanSize::Narrow_20: AzimuthScanWidth = 20.0f; break;
+			case ERadarScanSize::Medium_40: AzimuthScanWidth = 40.0f; break;
+			case ERadarScanSize::Wide_60:   AzimuthScanWidth = 60.0f; break;
+			case ERadarScanSize::Full_120:  AzimuthScanWidth = 120.0f; break;
+			default: break;
+		}
+	}
 
 	SetComponentTickEnabled(true);
 	Tracks.Reserve(32);
 	InvalidateSocketCaches();
 	CachedDiscoveryActors.Reset();
-	if (ScanDrive == ERadarScanDrive::SocketDriven && RadarSocketName == NAME_None)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("Radar %s uses SocketDriven scanning without RadarSocketName; detection follows the actor root forward axis."),
-			*GetNameSafe(GetOwner()));
-	}
+	RecalculateScanFrameTime();
+	CurrentScanAzimuth = ScanCenterAzimuth - AzimuthScanWidth * 0.5f;
+	CurrentScanElevation = ElevationBars > 1 ? ScanCenterElevation - ElevationScanHeight * 0.5f : ScanCenterElevation;
 
 	if (bEnableTargetCursor)
 	{
 		TDCCursorRange = FMath::Clamp(TDCCursorRange, 1.0f, CurrentDisplayRange);
-		TDCCursorAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + FMath::Clamp(
-			FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TDCCursorAzimuth),
+		const float DisplayCenter = MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)).ScanCenterAzimuth;
+		TDCCursorAzimuth = FRotator::NormalizeAxis(DisplayCenter + FMath::Clamp(
+			FMath::FindDeltaAngleDegrees(DisplayCenter, TDCCursorAzimuth),
 			-AzimuthScanWidth * 0.5f, AzimuthScanWidth * 0.5f));
 	}
-	DisplayView.BScope = FRadarDisplayGeometryMath::ClampWindow(DisplayView.BScope);
-	DisplayView.PPI = FRadarDisplayGeometryMath::ClampWindow(DisplayView.PPI);
+
 	if (DisplayView.ActiveGeometry != ERadarDisplayGeometry::BScope &&
 		DisplayView.ActiveGeometry != ERadarDisplayGeometry::PPI)
 		DisplayView.ActiveGeometry = ERadarDisplayGeometry::BScope;
@@ -128,6 +158,23 @@ void UAircraftRadarComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void UAircraftRadarComponent::RecalculateScanFrameTime()
+{
+	float FrameTime = 5.0f;
+	if (ScanDrive == ERadarScanDrive::MSA && ScanRateDegreesPerSecond > 0.0f)
+	{
+		FrameTime = AzimuthScanWidth * FMath::Max(1, ElevationBars) / ScanRateDegreesPerSecond;
+	}
+	else if (ScanDrive == ERadarScanDrive::PESA || ScanDrive == ERadarScanDrive::AESA)
+	{
+		const int32 AzCells = FMath::Max(1, FMath::CeilToInt(AzimuthScanWidth / FMath::Max(BeamAzimuthWidth, 1.0f)));
+		const int32 Visits = ScanDrive == ERadarScanDrive::AESA ? FMath::Clamp(AESABeamsPerSample, 1, 32) : 1;
+		FrameTime = FMath::CeilToFloat(static_cast<float>(AzCells * FMath::Max(1, ElevationBars)) / Visits) *
+			FMath::Clamp(ScanSampleInterval, 0.016f, 1.0f);
+	}
+	CachedScanFrameTime = FMath::Max(0.1f, FrameTime);
+}
+
 void UAircraftRadarComponent::GetScanProgress(int32& OutBar, float& OutBarLevel,
 	float& OutSweepLevel, bool& bOutScanningRight) const
 {
@@ -146,72 +193,51 @@ void UAircraftRadarComponent::EmitScanProgress(int32 Bar, float BarLevel, float 
 	OnScanProgressUpdated.Broadcast(Bar, ScanBarLevel, ScanSweepLevel, bScanningRight);
 }
 
-void UAircraftRadarComponent::AdvanceAntennaSweep(float DeltaTime, bool bBroadcastEvents)
+void UAircraftRadarComponent::AdvanceAntennaSweep(float DeltaTime)
 {
-	if (ScanDrive == ERadarScanDrive::SocketDriven)
+	const float Width = FMath::Max(1.0f, AzimuthScanWidth);
+	const float Left = ScanCenterAzimuth - Width * 0.5f;
+	const float Right = ScanCenterAzimuth + Width * 0.5f;
+	const int32 Bars = FMath::Clamp(ElevationBars, 1, 8);
+	CurrentScanBar = FMath::Clamp(CurrentScanBar, 0, Bars - 1);
+	CurrentScanAzimuth = FMath::Clamp(CurrentScanAzimuth, Left, Right);
+	auto BarElevation = [&]()
 	{
-		FVector SourceLocation, ReferenceLocation;
-		FRotator SourceRotation, ReferenceRotation;
-		GetRadarSourceTransform(SourceLocation, SourceRotation);
-		GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
-		const FVector LocalForward = ReferenceRotation.UnrotateVector(SourceRotation.Vector());
-		CurrentScanAzimuth = LocalForward.Rotation().Yaw;
-		CurrentScanBar = 0;
-		if (bBroadcastEvents)
+		return Bars > 1 ? ScanCenterElevation - ElevationScanHeight * 0.5f +
+			ElevationScanHeight * CurrentScanBar / (Bars - 1) : ScanCenterElevation;
+	};
+
+	float Remaining = FMath::Max(0.0f, ScanRateDegreesPerSecond * DeltaTime);
+	// Split at reversals/bar changes so samples never invent a diagonal beam across bars.
+	int32 Segments = 0;
+	do
+	{
+		const float OldAzimuth = CurrentScanAzimuth;
+		const float Boundary = bScanningRight ? Right : Left;
+		const float Travel = FMath::Min(Remaining, FMath::Abs(Boundary - OldAzimuth));
+		CurrentScanAzimuth += bScanningRight ? Travel : -Travel;
+		if (!UsesPhysicalPlateBeam())
 		{
-			EmitScanProgress(0, 0.5f, 0.5f, true);
+			ActiveSampleBeams.Add(MakeBeamSample((OldAzimuth + CurrentScanAzimuth) * 0.5f,
+				BarElevation(), Travel * 0.5f));
 		}
-		return;
-	}
-	if (ScanDrive == ERadarScanDrive::PESA || ScanDrive == ERadarScanDrive::AESA)
-	{
-		return; // Electronic beam scheduling happens at each detection sample.
-	}
-
-	const float SweepDelta = FMath::Max(0.0f, ScanRateDegreesPerSecond * DeltaTime);
-	const float ScanLeft = ScanCenterAzimuth - (AzimuthScanWidth * 0.5f);
-	const float ScanRight = ScanCenterAzimuth + (AzimuthScanWidth * 0.5f);
-
-	if (bScanningRight)
-	{
-		CurrentScanAzimuth += SweepDelta;
-		if (CurrentScanAzimuth >= ScanRight)
+		Remaining -= Travel;
+		if (FMath::IsNearlyEqual(CurrentScanAzimuth, Boundary))
 		{
-			CurrentScanAzimuth = ScanRight;
-			bScanningRight = false;
-			CurrentScanBar = (CurrentScanBar + 1) % FMath::Max(1, ElevationBars);
-			if (CurrentScanBar == 0 && bBroadcastEvents)
+			bScanningRight = !bScanningRight;
+			CurrentScanBar = (CurrentScanBar + 1) % Bars;
+			if (CurrentScanBar == 0)
 			{
 				++ScanSweepCounter;
 				OnScanSweepComplete.Broadcast();
 			}
 		}
-	}
-	else
-	{
-		CurrentScanAzimuth -= SweepDelta;
-		if (CurrentScanAzimuth <= ScanLeft)
-		{
-			CurrentScanAzimuth = ScanLeft;
-			bScanningRight = true;
-			CurrentScanBar = (CurrentScanBar + 1) % FMath::Max(1, ElevationBars);
-			if (CurrentScanBar == 0 && bBroadcastEvents)
-			{
-				++ScanSweepCounter;
-				OnScanSweepComplete.Broadcast();
-			}
-		}
-	}
+	} while (Remaining > KINDA_SMALL_NUMBER && ++Segments < 128);
 
-	if (bBroadcastEvents)
-	{
-		const float AzWidth = FMath::Max(1.0f, AzimuthScanWidth);
-		const float BarLevel = FMath::Clamp((CurrentScanAzimuth - ScanLeft) / AzWidth, 0.0f, 1.0f);
-		const float BarTravelProgress = bScanningRight ? BarLevel : (1.0f - BarLevel);
-		const int32 SafeBars = FMath::Max(1, ElevationBars);
-		const float SweepLevel = FMath::Clamp((static_cast<float>(CurrentScanBar) + BarTravelProgress) / static_cast<float>(SafeBars), 0.0f, 1.0f);
-		EmitScanProgress(CurrentScanBar, BarLevel, SweepLevel, bScanningRight);
-	}
+	CurrentScanElevation = BarElevation();
+	const float BarLevel = FMath::Clamp((CurrentScanAzimuth - Left) / Width, 0.0f, 1.0f);
+	const float TravelProgress = bScanningRight ? BarLevel : 1.0f - BarLevel;
+	EmitScanProgress(CurrentScanBar, BarLevel, (CurrentScanBar + TravelProgress) / Bars, bScanningRight);
 }
 
 void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -224,17 +250,23 @@ void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType
 
 	if (bHasAuthority)
 	{
-		PruneLinkedTracks(GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f);
+		PruneLinkedTracks(DeltaTime);
 		RefreshAutomaticOperator();
 		if (bEnableTargetCursor) for (ARadarOperatorLink* ActiveLink : OperatorLinks)
 		{
 			if (!IsValid(ActiveLink) || ActiveLink->GetOwner() != ActiveRadarOperator.Get()) continue;
 			const FVector2D Input = ActiveLink->GetActiveCursorInput(GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f);
-			if (!Input.IsNearlyZero()) MoveTDCCursor(Input.X, Input.Y);
+			if (!Input.IsNearlyZero()) ExecuteAuthoritativeMoveTDCCursor(Input);
 			break;
 		}
 		if (bIsEmitting)
 		{
+			if (UsesPhysicalPlateBeam() && RadarMode != ERadarOperatingMode::SingleTargetTrack &&
+				RadarMode != ERadarOperatingMode::AirCombatManeuver && RadarMode != ERadarOperatingMode::Spotlight)
+			{
+				// Smooth commands for the next animation pose; detection below reads the completed current pose.
+				AdvanceAntennaSweep(DeltaTime);
+			}
 			ScanSampleAccumulator += DeltaTime;
 			const float Period = FMath::Clamp(ScanSampleInterval, 0.016f, 1.0f);
 			int32 Samples = 0;
@@ -254,21 +286,27 @@ void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType
 				ScanSampleAccumulator = FMath::Fmod(ScanSampleAccumulator, Period);
 			}
 
-			// Update track files (aging, pruning, velocity smoothing)
+			// Update track files (aging, pruning, velocity smoothing) batched to TrackUpdateInterval
 			TrackUpdateAccumulator += DeltaTime;
 			if (TrackUpdateAccumulator >= TrackUpdateInterval)
 			{
 				UpdateTrackFiles(TrackUpdateAccumulator);
+				PruneStaleTracks(TrackUpdateAccumulator);
 				TrackUpdateAccumulator = 0.0f;
 			}
-
-			// Prune stale tracks every tick (lightweight)
-			PruneStaleTracks(DeltaTime);
 		}
-		else PruneStaleTracks(DeltaTime);
+		else
+		{
+			TrackUpdateAccumulator += DeltaTime;
+			if (TrackUpdateAccumulator >= TrackUpdateInterval)
+			{
+				PruneStaleTracks(TrackUpdateAccumulator);
+				TrackUpdateAccumulator = 0.0f;
+			}
+		}
 		RefreshCorrelatedSelection();
 		OperatorSnapshotAccumulator += DeltaTime;
-		if (OperatorSnapshotAccumulator >= FMath::Max(0.05f, OperatorSnapshotIntervalSeconds))
+		if (OperatorSnapshotAccumulator >= FMath::Max(0.01f, OperatorSnapshotIntervalSeconds))
 		{
 			OperatorSnapshotAccumulator = 0.0f;
 			PruneLaunchedRadarMissiles();
@@ -304,7 +342,7 @@ void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType
 				FVector SourceLocation, ReferenceLocation;
 				FRotator SourceRotation, ReferenceRotation;
 				GetRadarSourceTransform(SourceLocation, SourceRotation);
-				GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
+				GetRadarDisplayReferenceTransform(ReferenceLocation, ReferenceRotation);
 				DrawDebugCoordinateSystem(GetWorld(), SourceLocation, SourceRotation, 10000.0f,
 					false, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, 0, 1.5f);
 				DrawDebugCoordinateSystem(GetWorld(), ReferenceLocation, ReferenceRotation, 6000.0f,
@@ -313,7 +351,7 @@ void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType
 					FString::Printf(TEXT("%s SOURCE"), *GetNameSafe(GetOwner())), nullptr,
 					FColor::Cyan, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, false);
 				DrawDebugString(GetWorld(), ReferenceLocation + FVector(0, 0, 1000.0f),
-					FString::Printf(TEXT("%s REFERENCE"), *GetNameSafe(GetOwner())), nullptr,
+					FString::Printf(TEXT("%s DISPLAY FRAME"), *GetNameSafe(GetOwner())), nullptr,
 					FColor::Yellow, FAircraftCombatDebug::RadarDebugDrawLifetimeSeconds, false);
 			}
 			if ((bDrawScanVolume || bDrawAntennaBeam) && bIsEmitting)
@@ -411,22 +449,18 @@ void UAircraftRadarComponent::TickComponent(float DeltaTime, ELevelTick TickType
 						FString::Printf(TEXT("PESA: one beam/sample | Az %+.1f° | Bar %d/%d"),
 							CurrentScanAzimuth, CurrentScanBar + 1, ElevationBars), FColor::Green);
 				}
-				else if (ScanDrive == ERadarScanDrive::SocketDriven)
-				{
-					FAircraftCombatDebug::PrintRadarTelemetry(this, 1,
-						FString::Printf(TEXT("SOCKET: Actual source azimuth %+.1f° | Sweep %.0f%%"),
-							CurrentScanAzimuth, FMath::Abs(SocketSweepDegrees) / 3.6f), FColor::Yellow);
-				}
+
 				else
 				{
 					const float ElevationStep = (ElevationBars > 1) ? ElevationScanHeight / static_cast<float>(ElevationBars - 1) : 0.0f;
 					const float BarElevation = ScanCenterElevation - (ElevationScanHeight * 0.5f) + (ElevationStep * CurrentScanBar);
 
 					FAircraftCombatDebug::PrintRadarTelemetry(this, 1,
-						FString::Printf(TEXT("Antenna: Az %+.1f° (±%.0f°) | Bar %d/%d (El %+.1f°) | %s"),
+						FString::Printf(TEXT("MSA: Az %+.1f° (±%.0f°) | Bar %d/%d (El %+.1f°) | %s | %s"),
 							CurrentScanAzimuth, AzimuthScanWidth * 0.5f,
 							CurrentScanBar + 1, ElevationBars, BarElevation,
-							bScanningRight ? TEXT("RIGHT ->") : TEXT("<- LEFT")),
+							bScanningRight ? TEXT("RIGHT ->") : TEXT("<- LEFT"),
+							UsesPhysicalPlateBeam() ? TEXT("ANIMATED PLATE") : TEXT("VIRTUAL SWEEP")),
 						FColor::Yellow);
 				}
 
@@ -462,6 +496,7 @@ void UAircraftRadarComponent::GetLifetimeReplicatedProps(TArray<FLifetimePropert
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(UAircraftRadarComponent, RadarMode);
+	DOREPLIFETIME(UAircraftRadarComponent, CurrentDisplayRange);
 	DOREPLIFETIME(UAircraftRadarComponent, TeamID);
 	DOREPLIFETIME(UAircraftRadarComponent, SquawkCode);
 }
@@ -542,19 +577,11 @@ void UAircraftRadarComponent::OnRep_RadarMode()
 	// The owner-only coherent snapshot dispatches this event after related track state is applied.
 }
 
-void UAircraftRadarComponent::SetRadarMode(ERadarOperatingMode NewMode)
+bool UAircraftRadarComponent::ExecuteAuthoritativeSetRadarMode(ERadarOperatingMode NewMode)
 {
 	if (RadarMode == NewMode)
 	{
-		return;
-	}
-
-	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::SetMode, static_cast<int32>(NewMode));
-		return;
+		return true;
 	}
 
 	const ERadarOperatingMode OldMode = RadarMode;
@@ -636,14 +663,14 @@ void UAircraftRadarComponent::SetRadarMode(ERadarOperatingMode NewMode)
 		{
 			if (IsValid(PreviousLockedActor))
 			{
-				DesignateSpotlightActor(PreviousLockedActor);
+				ExecuteAuthoritativeDesignateSpotlightActor(PreviousLockedActor);
 			}
 			else if (bSpotlightAutoGroundIntersect)
 			{
 				FVector AutoPoint;
 				if (ResolveAutoGroundIntersect(AutoPoint))
 				{
-					DesignateSpotlightPoint(AutoPoint);
+					ExecuteAuthoritativeDesignateSpotlightPoint(AutoPoint);
 				}
 			}
 		}
@@ -657,9 +684,9 @@ void UAircraftRadarComponent::SetRadarMode(ERadarOperatingMode NewMode)
 	RadarMode = NewMode;
 	ScanSampleAccumulator = 0.0f;
 	ActiveSampleBeams.Reset();
-	PreviousSocketLocalForward = FVector::ZeroVector;
+	bHasPreviousPlateSample = false;
 	ElectronicBeamIndex = 0;
-	SocketSweepDegrees = 0.0f;
+
 	ScanBarLevel = 0.0f;
 	ScanSweepLevel = 0.0f;
 
@@ -670,11 +697,13 @@ void UAircraftRadarComponent::SetRadarMode(ERadarOperatingMode NewMode)
 	if (NewMode != ERadarOperatingMode::SingleTargetTrack && NewMode != ERadarOperatingMode::Spotlight)
 	{
 		CurrentScanAzimuth = ScanCenterAzimuth - (AzimuthScanWidth * 0.5f);
+		CurrentScanElevation = ElevationBars > 1 ? ScanCenterElevation - ElevationScanHeight * 0.5f : ScanCenterElevation;
 		bScanningRight = true;
 		CurrentScanBar = 0;
 	}
 
 	OnRadarModeChanged.Broadcast(RadarMode);
+	return true;
 }
 
 void UAircraftRadarComponent::InvalidateSocketCaches()
@@ -687,12 +716,13 @@ void UAircraftRadarComponent::InvalidateSocketCaches()
 
 void UAircraftRadarComponent::SetRadarSocketName(FName InSocketName)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority()) return;
+	if (UWorld* World = GetWorld(); World && World->IsGameWorld())
+		if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority()) return;
 	RadarSocketName = InSocketName;
 	CachedRadarSocketComponent = nullptr;
 	bRadarSocketResolved = false;
-	PreviousSocketLocalForward = FVector::ZeroVector;
-	SocketSweepDegrees = 0.0f;
+	bHasPreviousPlateSample = false;
+	ActiveSampleBeams.Reset();
 }
 
 void UAircraftRadarComponent::SetRadarAltimeterSocketName(FName InSocketName)
@@ -715,7 +745,7 @@ void UAircraftRadarComponent::GetRadarSourceTransform(FVector& OutLocation, FRot
 
 	bool bResolvedTransform = false;
 
-	// 1. If RadarSocketName is specified, attempt to resolve via socket with caching
+	// Resolve and cache radar socket transform
 	if (RadarSocketName != NAME_None)
 	{
 		if (bRadarSocketResolved && CachedRadarSocketComponent.IsValid() &&
@@ -783,11 +813,7 @@ void UAircraftRadarComponent::GetRadarSourceTransform(FVector& OutLocation, FRot
 					}
 				}
 			}
-			if (!bResolvedTransform && ScanDrive == ERadarScanDrive::SocketDriven)
-			{
-				UE_LOG(LogTemp, Warning, TEXT("Radar %s cannot find source socket '%s'; detection uses the actor root forward axis."),
-					*GetNameSafe(OwnerActor), *RadarSocketName.ToString());
-			}
+
 		}
 	}
 
@@ -829,7 +855,7 @@ FRotator UAircraftRadarComponent::GetRadarRotation() const
 	return Rot;
 }
 
-void UAircraftRadarComponent::GetRadarReferenceTransform(FVector& OutLocation, FRotator& OutRotation) const
+void UAircraftRadarComponent::GetRadarDisplayReferenceTransform(FVector& OutLocation, FRotator& OutRotation) const
 {
 	const AActor* OwnerActor = GetOwner();
 	if (!OwnerActor)
@@ -840,12 +866,12 @@ void UAircraftRadarComponent::GetRadarReferenceTransform(FVector& OutLocation, F
 	}
 
 	const USceneComponent* Reference = OwnerActor->GetRootComponent();
-	if (RadarReferenceComponentName != NAME_None)
+	if (RadarDisplayReferenceComponentName != NAME_None)
 	{
 		TInlineComponentArray<USceneComponent*> Components(OwnerActor);
 		for (const USceneComponent* Component : Components)
 		{
-			if (Component && Component->GetFName() == RadarReferenceComponentName)
+			if (Component && Component->GetFName() == RadarDisplayReferenceComponentName)
 			{
 				Reference = Component;
 				break;
@@ -863,16 +889,16 @@ FRadarDisplayProjection UAircraftRadarComponent::MakeDisplayProjection(const FVe
 	Projection.Geometry = Geometry;
 	Projection.RadarOrigin = GetRadarLocation();
 	FVector ReferenceLocation;
-	GetRadarReferenceTransform(ReferenceLocation, Projection.ReferenceRotation);
+	GetRadarDisplayReferenceTransform(ReferenceLocation, Projection.ReferenceRotation);
 	Projection.WidgetTopLeft = WidgetTopLeft;
 	Projection.WidgetSize = WidgetSize;
 	Projection.DisplayRangeCm = CurrentDisplayRange;
-	Projection.ScanCenterAzimuth = ScanCenterAzimuth;
+	const FVector ScanCenterDirection = GetRadarRotation().RotateVector(
+		FRotator(ScanCenterElevation, ScanCenterAzimuth, 0.0f).Vector());
+	Projection.ScanCenterAzimuth = Projection.ReferenceRotation.UnrotateVector(ScanCenterDirection).Rotation().Yaw;
 	Projection.AzimuthWidth = AzimuthScanWidth;
 	Projection.CursorElevation = bEnableTargetCursor ? TDCCursorElevation : 0.0f;
 	Projection.bHeadingUp = bHeadingUp;
-	Projection.Window = FRadarDisplayGeometryMath::ClampWindow(
-		Geometry == ERadarDisplayGeometry::PPI ? DisplayView.PPI : DisplayView.BScope);
 	return Projection;
 }
 
@@ -1108,32 +1134,20 @@ bool UAircraftRadarComponent::IsRadarEmitting() const
 	return RadarMode != ERadarOperatingMode::Off && RadarMode != ERadarOperatingMode::Standby;
 }
 
-void UAircraftRadarComponent::SetACMSubMode(ERadarACMSubMode NewSubMode)
+bool UAircraftRadarComponent::ExecuteAuthoritativeSetACMSubMode(ERadarACMSubMode NewSubMode)
 {
-	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::SetACMMode, static_cast<int32>(NewSubMode));
-		return;
-	}
-
 	ACMSubMode = NewSubMode;
 	if (RadarMode != ERadarOperatingMode::AirCombatManeuver)
 	{
-		SetRadarMode(ERadarOperatingMode::AirCombatManeuver);
+		ExecuteAuthoritativeSetRadarMode(ERadarOperatingMode::AirCombatManeuver);
 	}
+	return true;
 }
 
-void UAircraftRadarComponent::SetHelmetLookDirection(const FVector& InWorldDirection)
+bool UAircraftRadarComponent::ExecuteAuthoritativeSetHelmetLookDirection(const FVector& InWorldDirection)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::HelmetCue, 0, 0.0f, 0.0f, InWorldDirection.GetSafeNormal());
-		return;
-	}
 	HelmetLookDirection = InWorldDirection.GetSafeNormal();
+	return true;
 }
 
 ERadarTargetDomain UAircraftRadarComponent::ResolveCandidateDomain(const AActor* Candidate) const
@@ -1235,148 +1249,151 @@ bool UAircraftRadarComponent::IsDirectionInACMVolume(const FVector& LocalDirecti
 	}
 }
 
-void UAircraftRadarComponent::SetScanVolume(float Azimuth, float Elevation, int32 Bars)
+bool UAircraftRadarComponent::ExecuteAuthoritativeSetScanVolume(float InAzimuthWidth, float InElevationHeight, int32 InBars)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::SetScanVolume, Bars, Azimuth, Elevation);
-		return;
-	}
-	AzimuthScanWidth = FMath::Clamp(Azimuth, 5.0f, 360.0f);
-	ElevationScanHeight = FMath::Clamp(Elevation, 2.0f, 120.0f);
-	ElevationBars = FMath::Clamp(Bars, 1, 8);
+	AzimuthScanWidth = FMath::Clamp(InAzimuthWidth, 5.0f, 360.0f);
+	ElevationScanHeight = FMath::Clamp(InElevationHeight, 2.0f, 120.0f);
+	ElevationBars = FMath::Clamp(InBars, 1, 8);
 	ScanSizePreset = ERadarScanSize::Custom;
+
+	RecalculateScanFrameTime();
 
 	// Reset scan position
 	CurrentScanAzimuth = ScanCenterAzimuth - (AzimuthScanWidth * 0.5f);
+	CurrentScanElevation = ElevationBars > 1 ? ScanCenterElevation - ElevationScanHeight * 0.5f : ScanCenterElevation;
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
+	ElectronicBeamIndex = 0;
 	bScanningRight = true;
 	CurrentScanBar = 0;
 	++DisplayViewRevision;
 	if (bEnableTargetCursor && DisplayView.ActiveGeometry == ERadarDisplayGeometry::BScope)
 	{
 		const float PreviousAzimuth = TDCCursorAzimuth;
-		TDCCursorAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + FMath::Clamp(
-			FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TDCCursorAzimuth),
+		const float DisplayCenter = MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)).ScanCenterAzimuth;
+		TDCCursorAzimuth = FRotator::NormalizeAxis(DisplayCenter + FMath::Clamp(
+			FMath::FindDeltaAngleDegrees(DisplayCenter, TDCCursorAzimuth),
 			-AzimuthScanWidth * 0.5f, AzimuthScanWidth * 0.5f));
 		if (!FMath::IsNearlyEqual(PreviousAzimuth, TDCCursorAzimuth))
 			OnRadarCursorMoved.Broadcast(GetTDCCursorState());
 	}
+	return true;
 }
 
-void UAircraftRadarComponent::ApplyScanSizePreset(ERadarScanSize Preset)
+bool UAircraftRadarComponent::ExecuteAuthoritativeApplyScanSizePreset(ERadarScanSize Preset)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::ApplyScanPreset, static_cast<int32>(Preset));
-		return;
-	}
 	ScanSizePreset = Preset;
 	switch (Preset)
 	{
 		case ERadarScanSize::Narrow_20: AzimuthScanWidth = 20.0f; break;
 		case ERadarScanSize::Medium_40: AzimuthScanWidth = 40.0f; break;
-		case ERadarScanSize::Wide_60: AzimuthScanWidth = 60.0f; break;
-		case ERadarScanSize::Full_120: AzimuthScanWidth = 120.0f; break;
+		case ERadarScanSize::Wide_60:   AzimuthScanWidth = 60.0f; break;
+		case ERadarScanSize::Full_120:  AzimuthScanWidth = 120.0f; break;
 		default: break;
 	}
 
+	RecalculateScanFrameTime();
+
 	CurrentScanAzimuth = ScanCenterAzimuth - (AzimuthScanWidth * 0.5f);
+	CurrentScanElevation = ElevationBars > 1 ? ScanCenterElevation - ElevationScanHeight * 0.5f : ScanCenterElevation;
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
+	ElectronicBeamIndex = 0;
 	bScanningRight = true;
 	CurrentScanBar = 0;
 	++DisplayViewRevision;
 	if (bEnableTargetCursor && DisplayView.ActiveGeometry == ERadarDisplayGeometry::BScope)
 	{
 		const float PreviousAzimuth = TDCCursorAzimuth;
-		TDCCursorAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + FMath::Clamp(
-			FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TDCCursorAzimuth),
+		const float DisplayCenter = MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)).ScanCenterAzimuth;
+		TDCCursorAzimuth = FRotator::NormalizeAxis(DisplayCenter + FMath::Clamp(
+			FMath::FindDeltaAngleDegrees(DisplayCenter, TDCCursorAzimuth),
 			-AzimuthScanWidth * 0.5f, AzimuthScanWidth * 0.5f));
 		if (!FMath::IsNearlyEqual(PreviousAzimuth, TDCCursorAzimuth))
 			OnRadarCursorMoved.Broadcast(GetTDCCursorState());
 	}
+	return true;
 }
 
-void UAircraftRadarComponent::OffsetScanCenter(float AzDelta, float ElDelta)
+bool UAircraftRadarComponent::ExecuteAuthoritativeOffsetScanCenter(float AzimuthDelta, float ElevationDelta)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::OffsetScanCenter, 0, AzDelta, ElDelta);
-		return;
-	}
-	ScanCenterAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + AzDelta);
-	ScanCenterElevation = FMath::Clamp(ScanCenterElevation + ElDelta, -89.0f, 89.0f);
+	ScanCenterAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + AzimuthDelta);
+	ScanCenterElevation = FMath::Clamp(ScanCenterElevation + ElevationDelta, -89.0f, 89.0f);
+	CurrentScanAzimuth += AzimuthDelta;
+	CurrentScanElevation += ElevationDelta;
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
 	++DisplayViewRevision;
 	if (bEnableTargetCursor && DisplayView.ActiveGeometry == ERadarDisplayGeometry::BScope)
 	{
 		const float PreviousAzimuth = TDCCursorAzimuth;
-		TDCCursorAzimuth = FRotator::NormalizeAxis(ScanCenterAzimuth + FMath::Clamp(
-			FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, TDCCursorAzimuth),
+		const float DisplayCenter = MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)).ScanCenterAzimuth;
+		TDCCursorAzimuth = FRotator::NormalizeAxis(DisplayCenter + FMath::Clamp(
+			FMath::FindDeltaAngleDegrees(DisplayCenter, TDCCursorAzimuth),
 			-AzimuthScanWidth * 0.5f, AzimuthScanWidth * 0.5f));
 		if (!FMath::IsNearlyEqual(PreviousAzimuth, TDCCursorAzimuth))
 			OnRadarCursorMoved.Broadcast(GetTDCCursorState());
 	}
+	return true;
 }
 
-void UAircraftRadarComponent::CycleRangeScale(bool bIncrease)
+bool UAircraftRadarComponent::ExecuteAuthoritativeCycleRangeScale(bool bIncrease)
 {
-	if (RangeScalePresets.Num() == 0)
-	{
-		return;
-	}
-
-	int32 CurrentIdx = INDEX_NONE;
-	float MinDiff = TNumericLimits<float>::Max();
+	if (RangeScalePresets.IsEmpty()) return false;
+	int32 CurrentIdx = 0;
+	float BestDiff = TNumericLimits<float>::Max();
 	for (int32 i = 0; i < RangeScalePresets.Num(); ++i)
 	{
 		const float Diff = FMath::Abs(RangeScalePresets[i] - CurrentDisplayRange);
-		if (Diff < MinDiff)
+		if (Diff < BestDiff)
 		{
-			MinDiff = Diff;
+			BestDiff = Diff;
 			CurrentIdx = i;
 		}
 	}
-
-	if (CurrentIdx == INDEX_NONE)
-	{
-		CurrentIdx = 0;
-	}
-
-	if (bIncrease)
-	{
-		CurrentIdx = FMath::Min(CurrentIdx + 1, RangeScalePresets.Num() - 1);
-	}
-	else
-	{
-		CurrentIdx = FMath::Max(CurrentIdx - 1, 0);
-	}
-
-	SetRangeScale(RangeScalePresets[CurrentIdx]);
+	const int32 Count = RangeScalePresets.Num();
+	const int32 NextIdx = bIncrease ? (CurrentIdx + 1) % Count : (CurrentIdx - 1 + Count) % Count;
+	return ExecuteAuthoritativeSetDisplayRange(RangeScalePresets[NextIdx]);
 }
 
-void UAircraftRadarComponent::SetRangeScale(float NewRange)
+bool UAircraftRadarComponent::ExecuteAuthoritativeSetDisplayRange(float NewRangeCm)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
+	if (!FMath::IsFinite(NewRangeCm)) return false;
+	NewRangeCm = FMath::Clamp(NewRangeCm, 1000.0f, 100000000.0f);
+	if (FMath::IsNearlyEqual(CurrentDisplayRange, NewRangeCm))
 	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::SetRange, 0, NewRange);
-		return;
-	}
-	if (!FMath::IsFinite(NewRange)) return;
-	NewRange = FMath::Clamp(NewRange, 1000.0f, 100000000.0f);
-	if (FMath::IsNearlyEqual(CurrentDisplayRange, NewRange))
-	{
-		return;
+		return true;
 	}
 
-	CurrentDisplayRange = NewRange;
+	const float PreviousDisplayRange = CurrentDisplayRange;
+	CurrentDisplayRange = NewRangeCm;
 	++DisplayViewRevision;
-	if (bEnableTargetCursor) TDCCursorRange = FMath::Clamp(TDCCursorRange, 1.0f, CurrentDisplayRange);
+	if (bEnableTargetCursor)
+	{
+		if (bPreserveCursorDisplayPositionOnRangeChange &&
+			FMath::IsFinite(PreviousDisplayRange) && PreviousDisplayRange > 0.0f)
+		{
+			double MaxCursorRange = CurrentDisplayRange;
+			if (DisplayView.ActiveGeometry == ERadarDisplayGeometry::PPI)
+			{
+				// PPI limits horizontal range. A tilted display reference can require a
+				// slant range larger than the scale to retain the same map position.
+				FVector DisplayOrigin;
+				FRotator ReferenceRotation;
+				GetRadarDisplayReferenceTransform(DisplayOrigin, ReferenceRotation);
+				const FVector Direction = ReferenceRotation.RotateVector(
+					FRotator(TDCCursorElevation, TDCCursorAzimuth, 0.0f).Vector());
+				MaxCursorRange /= FMath::Max(Direction.Size2D(), static_cast<double>(SMALL_NUMBER));
+			}
+			const double ScaledRange = static_cast<double>(TDCCursorRange) * NewRangeCm / PreviousDisplayRange;
+			TDCCursorRange = static_cast<float>(FMath::Clamp(ScaledRange, 1.0, MaxCursorRange));
+		}
+		else TDCCursorRange = FMath::Clamp(TDCCursorRange, 1.0f, CurrentDisplayRange);
+	}
 
 	OnRadarDisplayRangeChanged.Broadcast(CurrentDisplayRange);
 	if (bEnableTargetCursor) OnRadarCursorMoved.Broadcast(GetTDCCursorState());
-
+	return true;
 }
 
 void UAircraftRadarComponent::OnRep_CurrentDisplayRange()
@@ -1421,7 +1438,8 @@ bool UAircraftRadarComponent::IsTargetInScanVolume(AActor* Target) const
 		}
 
 		const FVector LocalDir = RadarRotation.UnrotateVector(ToTarget.GetSafeNormal());
-		return IsDirectionInACMVolume(LocalDir, ACMSubMode);
+		return IsDirectionInACMVolume(LocalDir, ACMSubMode) &&
+			(!UsesPhysicalPlateBeam() || MakeBeamSample(0.0f, 0.0f).Contains(Target->GetActorLocation()));
 	}
 
 	// 2. Single Target Track: target is in beam if it is the actively illuminated STT lock
@@ -1437,7 +1455,10 @@ bool UAircraftRadarComponent::IsTargetInScanVolume(AActor* Target) const
 			const int32 TrackIndex = FindTrackIndex(STTLockedTrackID);
 			if (TrackIndex != INDEX_NONE && Tracks[TrackIndex].TrackedActor.Get() == Target)
 			{
-				return true;
+				float Bearing, Elevation;
+				ComputeBearingElevation(Target->GetActorLocation(), Bearing, Elevation);
+				return IsWithinAntennaGimbal(Bearing, Elevation, 1.1f) &&
+					CalculateAntennaBeamGain(Target->GetActorLocation()) > KINDA_SMALL_NUMBER;
 			}
 		}
 		return false;
@@ -1446,22 +1467,23 @@ bool UAircraftRadarComponent::IsTargetInScanVolume(AActor* Target) const
 	// 3. Spotlight SAR mode: target is in volume if within SpotlightPatchRadius of ground coordinate
 	if (RadarMode == ERadarOperatingMode::Spotlight)
 	{
-		if (!bHasSpotlightPoint || bSpotlightGimbalExceeded)
+		float Bearing, Elevation;
+		ComputeBearingElevation(SpotlightTargetLocation, Bearing, Elevation);
+		if (!bHasSpotlightPoint || !IsWithinAntennaGimbal(Bearing, Elevation))
 		{
 			return false;
 		}
 
 		const float DistToPatchSq = FVector::DistSquared(Target->GetActorLocation(), SpotlightTargetLocation);
-		return (DistToPatchSq <= FMath::Square(SpotlightPatchRadius));
+		return DistToPatchSq <= FMath::Square(SpotlightPatchRadius) &&
+			(!UsesPhysicalPlateBeam() || MakeBeamSample(0.0f, 0.0f).Contains(Target->GetActorLocation()));
 	}
 
 	// 4. Search / TWS / GM / SS modes: evaluate scan volume azimuth and elevation bounds
-	if (ScanDrive == ERadarScanDrive::SocketDriven)
+	if (DistSq > FMath::Square(MaxDetectionRange) || DistSq < FMath::Square(MinDetectionRange)) return false;
+	if (UsesPhysicalPlateBeam())
 	{
-		const FVector LocalDirection = RadarRotation.UnrotateVector(ToTarget.GetSafeNormal());
-		const FRotator LocalAngles = LocalDirection.Rotation();
-		return FMath::Abs(LocalAngles.Yaw) <= BeamAzimuthWidth * 0.5f &&
-			FMath::Abs(LocalAngles.Pitch) <= BeamElevationWidth * 0.5f;
+		return MakeBeamSample(0.0f, 0.0f).Contains(Target->GetActorLocation());
 	}
 	float Bearing, Elevation;
 	ComputeBearingElevation(Target->GetActorLocation(), Bearing, Elevation);
@@ -1472,7 +1494,16 @@ bool UAircraftRadarComponent::IsTargetInScanVolume(AActor* Target) const
 	const float AzDiff = FMath::Abs(FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, Bearing));
 	const float ElDiff = FMath::Abs(Elevation - ScanCenterElevation);
 
-	return (AzDiff <= HalfAz && ElDiff <= HalfEl);
+	return (AzimuthScanWidth >= 360.0f || AzDiff <= HalfAz) && ElDiff <= HalfEl;
+}
+
+FVector UAircraftRadarComponent::GetCommandedBeamDirection() const
+{
+	if (RadarMode == ERadarOperatingMode::SingleTargetTrack && IsValid(GetSTTLockedActor()))
+		return (GetSTTLockedActor()->GetActorLocation() - GetRadarLocation()).GetSafeNormal();
+	if (RadarMode == ERadarOperatingMode::Spotlight && bHasSpotlightPoint)
+		return (SpotlightTargetLocation - GetRadarLocation()).GetSafeNormal();
+	return GetRadarRotation().RotateVector(FRotator(CurrentScanElevation, CurrentScanAzimuth, 0.0f).Vector());
 }
 
 float UAircraftRadarComponent::CalculateDetectionRange(float TargetRCS) const
@@ -1599,67 +1630,42 @@ float UAircraftRadarComponent::CalculateEffectiveRCS(float BaseRCS, const AActor
 	return BaseRCS * AspectMultiplier;
 }
 
-float UAircraftRadarComponent::CalculateAntennaBeamGain(float TargetBearing, float TargetElevation, const FVector& LocalTargetDir) const
+bool UAircraftRadarComponent::IsWithinAntennaGimbal(float Bearing, float Elevation, float Margin) const
 {
-	if (ScanDrive == ERadarScanDrive::SocketDriven &&
-		(RadarMode == ERadarOperatingMode::SingleTargetTrack ||
-		 RadarMode == ERadarOperatingMode::AirCombatManeuver))
-	{
-		const FRotator SocketRelativeLook = LocalTargetDir.Rotation();
-		const float AzHalf = FMath::Max(0.5f, BeamAzimuthWidth * 0.5f);
-		const float ElHalf = FMath::Max(0.5f, BeamElevationWidth * 0.5f);
-		const float Az = FMath::Abs(SocketRelativeLook.Yaw) / AzHalf;
-		const float El = FMath::Abs(SocketRelativeLook.Pitch) / ElHalf;
-		if (Az > 1.0f || El > 1.0f) return 0.0f;
-		return FMath::Exp(-0.69314718f * (Az * Az + El * El));
-	}
-	// STT Mode: Antenna is locked and slaved directly to the target boresight
-	if (RadarMode == ERadarOperatingMode::SingleTargetTrack)
-	{
-		return 1.0f;
-	}
+	return bOmnidirectionalTracking ||
+		((MaxAntennaGimbalAzimuth >= 180.0f || FMath::Abs(Bearing) <= MaxAntennaGimbalAzimuth * Margin) &&
+		 (MaxAntennaGimbalElevation >= 90.0f || FMath::Abs(Elevation) <= MaxAntennaGimbalElevation * Margin));
+}
 
-	// ACM Mode: High-power wide aperture auto-acquisition
-	if (RadarMode == ERadarOperatingMode::AirCombatManeuver)
+float UAircraftRadarComponent::CalculatePlateGain(const FVector& LocalTargetDir) const
+{
+	if ((ScanDrive == ERadarScanDrive::PESA || ScanDrive == ERadarScanDrive::AESA) &&
+		!(bOmnidirectionalTracking && AzimuthScanWidth >= 360.0f))
 	{
-		return 1.0f;
+		const float CosAngle = FMath::Clamp(LocalTargetDir.X, 0.0f, 1.0f);
+		return CosAngle * FMath::Sqrt(CosAngle);
 	}
+	return 1.0f;
+}
 
-	const float AzHalf = FMath::Max(BeamAzimuthWidth * 0.5f, 0.5f);
-	const float ElHalf = FMath::Max(BeamElevationWidth * 0.5f, 0.5f);
-	float RadiusSq = TNumericLimits<float>::Max();
+float UAircraftRadarComponent::CalculateAntennaBeamGain(const FVector& TargetPosition) const
+{
+	FVector Origin;
+	FRotator PlateRotation;
+	GetRadarSourceTransform(Origin, PlateRotation);
+	const FVector LocalDirection = PlateRotation.UnrotateVector((TargetPosition - Origin).GetSafeNormal());
+	// Tracking/acquisition may steer virtually; animated MSA must receive through the real plate beam.
+	if (RadarMode == ERadarOperatingMode::SingleTargetTrack || RadarMode == ERadarOperatingMode::AirCombatManeuver)
+	{
+		return UsesPhysicalPlateBeam() ? MakeBeamSample(0.0f, 0.0f).GetGain(TargetPosition) : CalculatePlateGain(LocalDirection);
+	}
+	float Gain = 0.0f;
+	for (const FRadarBeamSample& Beam : ActiveSampleBeams)
+		Gain = FMath::Max(Gain, Beam.GetGain(TargetPosition));
 	if (ActiveSampleBeams.IsEmpty())
-	{
-		const float Az = FMath::FindDeltaAngleDegrees(CurrentScanAzimuth, TargetBearing) / AzHalf;
-		const float El = (TargetElevation - ScanCenterElevation) / ElHalf;
-		RadiusSq = Az * Az + El * El;
-	}
-	else
-	{
-		for (const FVector2D& Beam : ActiveSampleBeams)
-		{
-			const float Az = FMath::Max(0.0f,
-				FMath::Abs(FMath::FindDeltaAngleDegrees(Beam.X, TargetBearing)) - SampleSweepAzHalf) / AzHalf;
-			const float El = FMath::Max(0.0f, FMath::Abs(TargetElevation - Beam.Y) - SampleSweepElHalf) / ElHalf;
-			RadiusSq = FMath::Min(RadiusSq, Az * Az + El * El);
-		}
-	}
-
-	// Gaussian 3dB half-power beam pattern: G = 2^(-u^2) = exp(-ln(2) * u^2)
-	// When u = 1.0 (at 3dB beam edge), G = 0.5 (-3 dB one-way)
-	// Clamped to side-lobe floor of 0.01 (-20 dB)
-	float BeamGain = FMath::Exp(-0.69314718f * RadiusSq);
-	if (ScanDrive == ERadarScanDrive::AESA || ScanDrive == ERadarScanDrive::PESA)
-	{
-		// A fixed forward array loses gain at high off-boresight angles. A 360-degree
-		// station configured with distributed faces has no single forward blind side.
-		if (!(bOmnidirectionalTracking && AzimuthScanWidth >= 360.0f))
-		{
-			const float CosScanAngle = FMath::Clamp(LocalTargetDir.X, 0.0f, 1.0f);
-			BeamGain *= CosScanAngle * FMath::Sqrt(CosScanAngle);
-		}
-	}
-	return FMath::Clamp(BeamGain, 0.0f, 1.0f);
+		Gain = MakeBeamSample(UsesPhysicalPlateBeam() ? 0.0f : CurrentScanAzimuth,
+			UsesPhysicalPlateBeam() ? 0.0f : CurrentScanElevation).GetGain(TargetPosition);
+	return Gain * CalculatePlateGain(LocalDirection);
 }
 
 float UAircraftRadarComponent::CalculateSignalStrength(float Range, float EffectiveRCS, float BeamGain) const
@@ -1695,13 +1701,8 @@ float UAircraftRadarComponent::CalculateSignalStrength(float Range, float Effect
 	return FMath::Clamp(SNR_dB / DynamicRange, 0.0f, 1.0f);
 }
 
-bool UAircraftRadarComponent::CommandLock(int32 TrackID)
+bool UAircraftRadarComponent::ExecuteAuthoritativeLockTrack(int32 TrackID)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCommand(ERadarCommandType::LockTrack, TrackID);
-		return false; // Result arrives through OnRadarCommandResult.
-	}
 	const int32 TrackIndex = FindTrackIndex(TrackID);
 	if (TrackIndex == INDEX_NONE || !Tracks[TrackIndex].TrackedActor.IsValid() ||
 		Tracks[TrackIndex].Status == ERadarTrackStatus::Lost)
@@ -1732,7 +1733,7 @@ bool UAircraftRadarComponent::CommandLock(int32 TrackID)
 	}
 
 	// Transition to STT mode
-	SetRadarMode(ERadarOperatingMode::SingleTargetTrack);
+	ExecuteAuthoritativeSetRadarMode(ERadarOperatingMode::SingleTargetTrack);
 	STTLockedTrackID = TrackID;
 	STTLockedActor = Tracks[TrackIndex].TrackedActor.Get();
 
@@ -1744,11 +1745,6 @@ bool UAircraftRadarComponent::CommandLock(int32 TrackID)
 	OnRadarLockAcquired.Broadcast(Tracks[TrackIndex]);
 	OnRadarTrackSelected.Broadcast(Tracks[TrackIndex]);
 	return true;
-}
-
-bool UAircraftRadarComponent::CommandLockActor(AActor* TargetActor)
-{
-	return AcquireOrLockActor(TargetActor, true);
 }
 
 bool UAircraftRadarComponent::AcquireOrLockActor(AActor* TargetActor, bool bForceSTT)
@@ -1764,11 +1760,11 @@ bool UAircraftRadarComponent::AcquireOrLockActor(AActor* TargetActor, bool bForc
 	{
 		if (bForceSTT || RadarMode == ERadarOperatingMode::SingleTargetTrack || RadarMode == ERadarOperatingMode::AirCombatManeuver)
 		{
-			return CommandLock(Tracks[TrackIndex].TrackID);
+			return ExecuteAuthoritativeLockTrack(Tracks[TrackIndex].TrackID);
 		}
 		else
 		{
-			return CommandBugTrack(Tracks[TrackIndex].TrackID);
+			return ExecuteAuthoritativeBugTrack(Tracks[TrackIndex].TrackID);
 		}
 	}
 
@@ -1779,26 +1775,19 @@ bool UAircraftRadarComponent::AcquireOrLockActor(AActor* TargetActor, bool bForc
 		const int32 NewTrackID = CreateTrack(TargetActor, RawTrack);
 		if (bForceSTT || RadarMode == ERadarOperatingMode::SingleTargetTrack || RadarMode == ERadarOperatingMode::AirCombatManeuver)
 		{
-			return CommandLock(NewTrackID);
+			return ExecuteAuthoritativeLockTrack(NewTrackID);
 		}
 		else
 		{
-			return CommandBugTrack(NewTrackID);
+			return ExecuteAuthoritativeBugTrack(NewTrackID);
 		}
 	}
 
 	return false;
 }
 
-void UAircraftRadarComponent::BreakLock()
+bool UAircraftRadarComponent::ExecuteAuthoritativeBreakLock()
 {
-	AActor* OwnerActor = GetOwner();
-	if (OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCommand(ERadarCommandType::BreakLock);
-		return;
-	}
-
 	STTLockedActor = nullptr;
 
 	if (STTLockedTrackID >= 0)
@@ -1811,7 +1800,7 @@ void UAircraftRadarComponent::BreakLock()
 		{
 			if (bWasBugged)
 			{
-				// Return cleanly to bugged state
+				// Revert to bugged state
 				Tracks[TrackIndex].Status = ERadarTrackStatus::Bugged;
 				Tracks[TrackIndex].bIsBeamTarget = true;
 				Tracks[TrackIndex].bIsBugged = true;
@@ -1834,7 +1823,7 @@ void UAircraftRadarComponent::BreakLock()
 		RecordOperatorEvent(ERadarOperatorEventType::LockLost, OldLockID);
 		OnRadarLockLost.Broadcast(OldLockID);
 
-		// If target remains bugged, it is still selected! Only broadcast deselection if truly unselected.
+		// Broadcast selection update if still bugged, otherwise deselect
 		if (!bWasBugged)
 		{
 			OnRadarTrackDeselected.Broadcast(OldLockID);
@@ -1850,16 +1839,12 @@ void UAircraftRadarComponent::BreakLock()
 	{
 		PreSTTMode = ERadarOperatingMode::Search;
 	}
-	SetRadarMode(PreSTTMode);
+	ExecuteAuthoritativeSetRadarMode(PreSTTMode);
+	return true;
 }
 
-bool UAircraftRadarComponent::CommandBugTrack(int32 TrackID)
+bool UAircraftRadarComponent::ExecuteAuthoritativeBugTrack(int32 TrackID)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCommand(ERadarCommandType::BugTrack, TrackID);
-		return false;
-	}
 	const int32 TrackIndex = FindTrackIndex(TrackID);
 	if (TrackIndex == INDEX_NONE || !Tracks[TrackIndex].TrackedActor.IsValid() ||
 		Tracks[TrackIndex].Status == ERadarTrackStatus::Lost)
@@ -1870,7 +1855,7 @@ bool UAircraftRadarComponent::CommandBugTrack(int32 TrackID)
 	SelectedContactID = Tracks[TrackIndex].ContactID;
 	if (BuggedTrackID == TrackID) return true;
 
-	// Clear previous bug
+	// Clear previous bugged track
 	if (BuggedTrackID >= 0)
 	{
 		const int32 OldBugID = BuggedTrackID;
@@ -1895,13 +1880,8 @@ bool UAircraftRadarComponent::CommandBugTrack(int32 TrackID)
 	return true;
 }
 
-void UAircraftRadarComponent::ClearBugTrack()
+bool UAircraftRadarComponent::ExecuteAuthoritativeClearBugTrack()
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCommand(ERadarCommandType::ClearBug);
-		return;
-	}
 	if (BuggedTrackID >= 0)
 	{
 		const int32 OldBugID = BuggedTrackID;
@@ -1917,6 +1897,7 @@ void UAircraftRadarComponent::ClearBugTrack()
 		BuggedTrackID = -1;
 		if (OldBugID != STTLockedTrackID) OnRadarTrackDeselected.Broadcast(OldBugID);
 	}
+	return true;
 }
 
 bool UAircraftRadarComponent::IsSTTLocked() const
@@ -2127,8 +2108,8 @@ void UAircraftRadarComponent::GatherCandidateActors(const FVector& Origin, float
 	const float Now = World ? World->GetTimeSeconds() : 0.0f;
 	const bool bRefreshDiscovery = bEnablePhysicsCandidateDiscovery && World &&
 		(Now - LastCandidateDiscoveryTime >= FMath::Max(0.1f, CandidateDiscoveryInterval) ||
-		FVector::DistSquared(Origin, LastCandidateDiscoveryOrigin) > FMath::Square(50000.0f) ||
-		!FMath::IsNearlyEqual(Range, LastCandidateDiscoveryRange, 100.0f));
+		FVector::DistSquared(Origin, LastCandidateDiscoveryOrigin) > FMath::Square(DiscoveryDisplacementThresholdCm) ||
+		!FMath::IsNearlyEqual(Range, LastCandidateDiscoveryRange, DiscoveryRangeDeltaThresholdCm));
 	if (bRefreshDiscovery)
 	{
 		CachedDiscoveryActors.Reset();
@@ -2150,7 +2131,7 @@ void UAircraftRadarComponent::GatherCandidateActors(const FVector& Origin, float
 			}
 		}
 
-		const FCollisionShape SphereShape = FCollisionShape::MakeSphere(Range + 100000.0f);
+		const FCollisionShape SphereShape = FCollisionShape::MakeSphere(Range + CandidateDiscoveryExpandedRadiusCm);
 
 		if (bQueryAllDynamicObjects)
 		{
@@ -2227,18 +2208,13 @@ void UAircraftRadarComponent::GatherCandidateActors(const FVector& Origin, float
 	}
 }
 
-void UAircraftRadarComponent::MoveTDCCursor(float XAxis, float YAxis)
+bool UAircraftRadarComponent::ExecuteAuthoritativeMoveTDCCursor(FVector2D DeltaAxis)
 {
-	if (!bEnableTargetCursor) return;
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCursorInput(XAxis, YAxis);
-		return;
-	}
+	if (!bEnableTargetCursor) return false;
 	const float DeltaTime = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.0f;
-	if (DeltaTime <= 0.0f || (FMath::IsNearlyZero(XAxis) && FMath::IsNearlyZero(YAxis)))
+	if (DeltaTime <= 0.0f || (FMath::IsNearlyZero(DeltaAxis.X) && FMath::IsNearlyZero(DeltaAxis.Y)))
 	{
-		return;
+		return false;
 	}
 
 	const FRadarDisplayProjection Projection = MakeDisplayProjection(FVector2D::ZeroVector,
@@ -2250,9 +2226,9 @@ void UAircraftRadarComponent::MoveTDCCursor(float XAxis, float YAxis)
 	const float VerticalSpeed = DisplayView.ActiveGeometry == ERadarDisplayGeometry::BScope
 		? CursorRangeSpeedFraction : CursorDisplaySpeedFraction;
 	const FVector2D NewPixel(
-		FMath::Clamp(Pixel.X + FMath::Clamp(XAxis, -1.0f, 1.0f) * HorizontalSpeed * DeltaTime, 0.0f, 1.0f),
-		FMath::Clamp(Pixel.Y - FMath::Clamp(YAxis, -1.0f, 1.0f) * VerticalSpeed * DeltaTime, 0.0f, 1.0f));
-	SetCursorFromDisplayPoint(NewPixel, FVector2D(1.0f, 1.0f));
+		FMath::Clamp(Pixel.X + FMath::Clamp(DeltaAxis.X, -1.0f, 1.0f) * HorizontalSpeed * DeltaTime, 0.0f, 1.0f),
+		FMath::Clamp(Pixel.Y - FMath::Clamp(DeltaAxis.Y, -1.0f, 1.0f) * VerticalSpeed * DeltaTime, 0.0f, 1.0f));
+	return SetCursorFromDisplayPoint(NewPixel, FVector2D(1.0f, 1.0f));
 }
 
 bool UAircraftRadarComponent::ResolveDisplayPointToCursor(const FVector2D& WidgetPosition,
@@ -2345,10 +2321,11 @@ bool UAircraftRadarComponent::IsCursorWithinLimits(const FRadarCursorState& Curs
 	if (!bEnableTargetCursor) return false;
 	if (!FMath::IsFinite(Cursor.AzimuthDegrees) || !FMath::IsFinite(Cursor.ElevationDegrees) ||
 		!FMath::IsFinite(Cursor.SlantRangeCm)) return false;
-	const float AzDelta = FMath::FindDeltaAngleDegrees(ScanCenterAzimuth, Cursor.AzimuthDegrees);
+	const float DisplayCenter = MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)).ScanCenterAzimuth;
+	const float AzDelta = FMath::FindDeltaAngleDegrees(DisplayCenter, Cursor.AzimuthDegrees);
 	FVector ReferenceLocation;
 	FRotator ReferenceRotation;
-	GetRadarReferenceTransform(ReferenceLocation, ReferenceRotation);
+	GetRadarDisplayReferenceTransform(ReferenceLocation, ReferenceRotation);
 	const FVector Direction = ReferenceRotation.RotateVector(FRotator(Cursor.ElevationDegrees,
 		Cursor.AzimuthDegrees, 0.0f).Vector());
 	const float EffectiveRange = DisplayView.ActiveGeometry == ERadarDisplayGeometry::PPI
@@ -2370,105 +2347,6 @@ bool UAircraftRadarComponent::TryGetTDCCursorWorldLocation(FVector& OutWorldLoca
 	return bEnableTargetCursor;
 }
 
-bool UAircraftRadarComponent::SetTDCCursorFromWidgetPosition(const FVector2D& WidgetPosition,
-	const FRadarDisplayProjection& Projection)
-{
-	if (!bEnableTargetCursor) return false;
-	FRadarCursorState Cursor;
-	if (!ResolveDisplayPointToCursor(WidgetPosition, Projection, Cursor)) return false;
-	if (!IsCursorWithinLimits(Cursor)) return false;
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-		{
-			Link->SubmitCommand(ERadarCommandType::SetCursor, 0, 0.0f, 0.0f,
-				FVector::ZeroVector, Cursor, Projection.Geometry, DisplayViewRevision);
-			return true;
-		}
-		return false;
-	}
-	TDCCursorAzimuth = FRotator::NormalizeAxis(Cursor.AzimuthDegrees);
-	TDCCursorElevation = Cursor.ElevationDegrees;
-	TDCCursorRange = Cursor.SlantRangeCm;
-	OnRadarCursorMoved.Broadcast(GetTDCCursorState());
-	return true;
-}
-
-FVector2D UAircraftRadarComponent::GetTDCCursorScreenPosition() const
-{
-	if (!bEnableTargetCursor) return FVector2D::ZeroVector;
-	FVector2D Pixel;
-	FRadarDisplayGeometryMath::Project(GetTDCCursorWorldLocation(),
-		MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f), ERadarDisplayGeometry::BScope), Pixel);
-	return FVector2D(FMath::Clamp(Pixel.X, 0.0f, 1.0f), FMath::Clamp(Pixel.Y, 0.0f, 1.0f));
-}
-
-bool UAircraftRadarComponent::DesignateTrackUnderCursor(float AzimuthGateDegrees, float RangeGatePercent)
-{
-	if (!bEnableTargetCursor) return false;
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::DesignateCursor, 0, 0.0f, 0.0f, FVector::ZeroVector,
-				FRadarCursorState(), DisplayView.ActiveGeometry, DisplayViewRevision);
-		return false;
-	}
-	if (Tracks.Num() == 0)
-	{
-		RecordOperatorEvent(ERadarOperatorEventType::CursorDesignated, -1, false);
-		OnRadarCursorDesignated.Broadcast(false, -1);
-		return false;
-	}
-
-	const float RangeGateCm = CurrentDisplayRange * FMath::Clamp(RangeGatePercent, 0.0f, 1.0f);
-	int32 ClosestTrackID = -1;
-	float ClosestDistSq = TNumericLimits<float>::Max();
-
-	for (const FRadarTrack& Track : Tracks)
-	{
-		if (!Track.TrackedActor.IsValid())
-		{
-			continue;
-		}
-
-		const float AzDiff = FMath::Abs(FMath::FindDeltaAngleDegrees(Track.Bearing, TDCCursorAzimuth));
-		const float RangeDiff = FMath::Abs(Track.Range - TDCCursorRange);
-
-		if (AzDiff <= AzimuthGateDegrees && RangeDiff <= RangeGateCm)
-		{
-			const float DistSq = (AzDiff * AzDiff) + FMath::Square(RangeDiff / FMath::Max(CurrentDisplayRange, 1.0f) * 100.0f);
-			if (DistSq < ClosestDistSq)
-			{
-				ClosestDistSq = DistSq;
-				ClosestTrackID = Track.TrackID;
-			}
-		}
-	}
-
-	if (ClosestTrackID != -1)
-	{
-		bool bResult = false;
-		// If already bugged, promote to STT lock!
-		if (BuggedTrackID == ClosestTrackID)
-		{
-			bResult = CommandLock(ClosestTrackID);
-		}
-		else
-		{
-			// Bug this track
-			bResult = CommandBugTrack(ClosestTrackID);
-		}
-
-		RecordOperatorEvent(ERadarOperatorEventType::CursorDesignated, bResult ? ClosestTrackID : -1, bResult);
-		OnRadarCursorDesignated.Broadcast(bResult, ClosestTrackID);
-		return bResult;
-	}
-
-	RecordOperatorEvent(ERadarOperatorEventType::CursorDesignated, -1, false);
-	OnRadarCursorDesignated.Broadcast(false, -1);
-	return false;
-}
-
 bool UAircraftRadarComponent::GetTrackDisplayWorldPosition(int32 TrackID, FVector& OutWorldPosition) const
 {
 	const int32 Index = FindTrackIndex(TrackID);
@@ -2483,19 +2361,11 @@ bool UAircraftRadarComponent::GetTrackDisplayWorldPosition(int32 TrackID, FVecto
 	return true;
 }
 
-bool UAircraftRadarComponent::DesignateTrackUnderCursorInDisplay(ERadarDisplayGeometry Geometry, float NormalizedGate)
+bool UAircraftRadarComponent::ExecuteAuthoritativeDesignateUnderCursor()
 {
 	if (!bEnableTargetCursor) return false;
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::DesignateCursor, 0, 0.0f, 0.0f, FVector::ZeroVector,
-				FRadarCursorState(), Geometry, DisplayViewRevision);
-		return false;
-	}
-	if (Geometry != DisplayView.ActiveGeometry) return false;
 	const FRadarDisplayProjection Projection = MakeDisplayProjection(FVector2D::ZeroVector,
-		FVector2D(1.0f, 1.0f), Geometry, DisplayView.bHeadingUp);
+		FVector2D(1.0f, 1.0f), DisplayView.ActiveGeometry, DisplayView.bHeadingUp);
 	FVector2D CursorPixel;
 	if (!FRadarDisplayGeometryMath::Project(GetTDCCursorWorldLocation(), Projection, CursorPixel))
 	{
@@ -2503,7 +2373,7 @@ bool UAircraftRadarComponent::DesignateTrackUnderCursorInDisplay(ERadarDisplayGe
 		OnRadarCursorDesignated.Broadcast(false, -1);
 		return false;
 	}
-	const float GateSq = FMath::Square(FMath::Clamp(NormalizedGate, 0.005f, 0.08f));
+	const float GateSq = FMath::Square(FMath::Clamp(CursorSelectionRadiusFraction, 0.005f, 0.2f));
 	int32 ClosestID = -1;
 	float ClosestSq = GateSq;
 	TArray<FRadarTrack> DisplayTracks;
@@ -2527,8 +2397,8 @@ bool UAircraftRadarComponent::DesignateTrackUnderCursorInDisplay(ERadarDisplayGe
 		}
 	}
 	const bool bLinked = ClosestID < -1;
-	const bool bResult = ClosestID != -1 && (bLinked ? DesignateLinkedTrack(ClosestID) :
-		(BuggedTrackID == ClosestID ? CommandLock(ClosestID) : CommandBugTrack(ClosestID)));
+	const bool bResult = ClosestID != -1 && (bLinked ? ExecuteAuthoritativeDesignateLinkedTrack(ClosestID) :
+		(BuggedTrackID == ClosestID ? ExecuteAuthoritativeLockTrack(ClosestID) : ExecuteAuthoritativeBugTrack(ClosestID)));
 	if (bEnableDebugTraces && bDebugCursor && GetWorld())
 	{
 		const FVector Origin = GetRadarLocation();
@@ -2541,7 +2411,7 @@ bool UAircraftRadarComponent::DesignateTrackUnderCursorInDisplay(ERadarDisplayGe
 		}
 		DrawDebugString(GetWorld(), Origin + FVector(0, 0, 500),
 			FString::Printf(TEXT("TDC %s: %s track %d (gate %.3f)"),
-				Geometry == ERadarDisplayGeometry::BScope ? TEXT("B-SCOPE") : TEXT("PPI"),
+				DisplayView.ActiveGeometry == ERadarDisplayGeometry::BScope ? TEXT("B-SCOPE") : TEXT("PPI"),
 				bResult ? TEXT("SELECTED") : TEXT("NO VALID CONTACT"), ClosestID, FMath::Sqrt(GateSq)),
 			nullptr, bResult ? FColor::Green : FColor::Red, 1.0f, false);
 	}
@@ -2554,11 +2424,11 @@ void UAircraftRadarComponent::UndesignateTarget()
 {
 	if (IsSTTLocked())
 	{
-		BreakLock();
+		ExecuteAuthoritativeBreakLock();
 	}
 	else if (BuggedTrackID != -1)
 	{
-		ClearBugTrack();
+		ExecuteAuthoritativeClearBugTrack();
 	}
 }
 
@@ -2572,44 +2442,29 @@ bool UAircraftRadarComponent::CycleTargetDesignation(bool bForward)
 	int32 CurrentIdx = FindTrackIndex(BuggedTrackID);
 	if (CurrentIdx == INDEX_NONE)
 	{
-		// No track currently bugged -> bug the first valid track
+		// Bug first valid track if none selected
 		for (const FRadarTrack& Track : Tracks)
 		{
 			if (Track.TrackedActor.IsValid())
 			{
-				return CommandBugTrack(Track.TrackID);
+				return ExecuteAuthoritativeBugTrack(Track.TrackID);
 			}
 		}
 		return false;
 	}
 
-	// Step to next track
+	// Step to next track in cycle
 	const int32 NumTracks = Tracks.Num();
 	for (int32 Step = 1; Step <= NumTracks; ++Step)
 	{
 		const int32 NextIdx = bForward ? ((CurrentIdx + Step) % NumTracks) : ((CurrentIdx - Step + NumTracks) % NumTracks);
 		if (Tracks[NextIdx].TrackedActor.IsValid())
 		{
-			return CommandBugTrack(Tracks[NextIdx].TrackID);
+			return ExecuteAuthoritativeBugTrack(Tracks[NextIdx].TrackID);
 		}
 	}
 
 	return false;
-}
-
-bool UAircraftRadarComponent::GetTrackBScopePosition(int32 TrackID, FVector2D& OutScreenPos) const
-{
-	FVector WorldPosition;
-	if (!GetTrackDisplayWorldPosition(TrackID, WorldPosition))
-	{
-		OutScreenPos = FVector2D::ZeroVector;
-		return false;
-	}
-	FVector2D Pixel;
-	const bool bVisible = FRadarDisplayGeometryMath::Project(WorldPosition,
-		MakeDisplayProjection(FVector2D::ZeroVector, FVector2D(1.0f, 1.0f)), Pixel);
-	OutScreenPos = FVector2D(Pixel.X * 2.0f - 1.0f, 1.0f - Pixel.Y);
-	return bVisible;
 }
 
 float UAircraftRadarComponent::GetTrackAspectAngle(int32 TrackID) const
@@ -2664,48 +2519,35 @@ float UAircraftRadarComponent::CalculateHeadingFromVelocity(const FVector& InVel
 	return FRotator::ClampAxis(FallbackHeading);
 }
 
-void UAircraftRadarComponent::DesignateSpotlightPoint(const FVector& WorldLocation)
+bool UAircraftRadarComponent::ExecuteAuthoritativeDesignateSpotlightPoint(const FVector& WorldLocation)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get())
-			Link->SubmitCommand(ERadarCommandType::DesignateSpotlight, 0, 0.0f, 0.0f, WorldLocation);
-		return;
-	}
 	SpotlightTargetLocation = WorldLocation;
 	bHasSpotlightPoint = true;
 	SpotlightTrackedActor = nullptr;
 	SpotlightDwellAccumulator = 0.0f;
 	SpotlightDwellProgress = 0.0f;
-
+	return true;
 }
 
-void UAircraftRadarComponent::DesignateSpotlightActor(AActor* TargetActor)
+bool UAircraftRadarComponent::ExecuteAuthoritativeDesignateSpotlightActor(AActor* TargetActor)
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority()) return;
-	if (IsValid(TargetActor))
-	{
-		SpotlightTrackedActor = TargetActor;
-		SpotlightTargetLocation = TargetActor->GetActorLocation();
-		bHasSpotlightPoint = true;
-		SpotlightDwellAccumulator = 0.0f;
-		SpotlightDwellProgress = 0.0f;
-	}
+	if (!IsValid(TargetActor)) return false;
+	SpotlightTrackedActor = TargetActor;
+	SpotlightTargetLocation = TargetActor->GetActorLocation();
+	bHasSpotlightPoint = true;
+	SpotlightDwellAccumulator = 0.0f;
+	SpotlightDwellProgress = 0.0f;
+	return true;
 }
 
-void UAircraftRadarComponent::ClearSpotlightTarget()
+bool UAircraftRadarComponent::ExecuteAuthoritativeClearSpotlightTarget()
 {
-	if (AActor* OwnerActor = GetOwner(); OwnerActor && !OwnerActor->HasAuthority())
-	{
-		if (ARadarOperatorLink* Link = LocalOperatorLink.Get()) Link->SubmitCommand(ERadarCommandType::ClearSpotlight);
-		return;
-	}
 	SpotlightTargetLocation = FVector::ZeroVector;
 	bHasSpotlightPoint = false;
 	SpotlightTrackedActor = nullptr;
 	SpotlightDwellAccumulator = 0.0f;
 	SpotlightDwellProgress = 0.0f;
-
+	return true;
 }
 
 bool UAircraftRadarComponent::ResolveAutoGroundIntersect(FVector& OutGroundLocation) const
@@ -2756,6 +2598,8 @@ bool UAircraftRadarComponent::ResolveAutoGroundIntersect(FVector& OutGroundLocat
 
 void UAircraftRadarComponent::PerformSpotlightTracking(float DeltaTime)
 {
+	ActiveSampleBeams.Reset();
+	bHasPreviousPlateSample = false;
 	UWorld* World = GetWorld();
 	AActor* OwnerActor = GetOwner();
 	if (!World || !OwnerActor)
@@ -2796,18 +2640,15 @@ void UAircraftRadarComponent::PerformSpotlightTracking(float DeltaTime)
 	float TargetElevation = 0.0f;
 	ComputeBearingElevation(SpotlightTargetLocation, TargetBearing, TargetElevation);
 
-	// 3. Antenna Gimbal Limits Check (constrained by scan volume or ±70° physical gimbal)
-	const float MaxGimbalAz = FMath::Clamp(AzimuthScanWidth * 0.5f, 20.0f, 70.0f);
-	const float MaxGimbalEl = FMath::Clamp(ElevationScanHeight * 0.5f, 15.0f, 60.0f);
-
-	bSpotlightGimbalExceeded = (FMath::Abs(TargetBearing) > MaxGimbalAz || FMath::Abs(TargetElevation) > MaxGimbalEl);
-
-	if (!bSpotlightGimbalExceeded)
-	{
-		// Slave antenna directly to ground target
-		CurrentScanAzimuth = TargetBearing;
-		CurrentScanBar = 0;
-	}
+	// The plate is the common steering frame in every drive.
+	bSpotlightGimbalExceeded = !IsWithinAntennaGimbal(TargetBearing, TargetElevation);
+	CurrentScanAzimuth = TargetBearing;
+	CurrentScanElevation = TargetElevation;
+	CurrentScanBar = 0;
+	if (UsesPhysicalPlateBeam() || !bSpotlightGimbalExceeded)
+		ActiveSampleBeams.Add(MakeBeamSample(UsesPhysicalPlateBeam() ? 0.0f : TargetBearing,
+			UsesPhysicalPlateBeam() ? 0.0f : TargetElevation));
+	const bool bBeamAligned = CalculateAntennaBeamGain(SpotlightTargetLocation) > KINDA_SMALL_NUMBER;
 
 	// 4. Line-of-sight terrain masking check
 	bool bIsMasked = false;
@@ -2843,7 +2684,7 @@ void UAircraftRadarComponent::PerformSpotlightTracking(float DeltaTime)
 	bSpotlightInBlindCone = (SquintDeg < SpotlightMinSquintAngle);
 
 	// 6. SAR Dwell Integration Accumulator
-	if (!bSpotlightGimbalExceeded && !bIsMasked && !bSpotlightInBlindCone && HorizontalSpeed > 500.0f)
+	if (!bSpotlightGimbalExceeded && !bIsMasked && bBeamAligned && !bSpotlightInBlindCone && HorizontalSpeed > 500.0f)
 	{
 		// Cross-track velocity scales with sin(squint): maximum at 90°, zero at 0°
 		const float SinSquint = FMath::Sin(FMath::DegreesToRadians(FMath::Clamp(SquintDeg, 0.0f, 90.0f)));
@@ -2870,6 +2711,7 @@ void UAircraftRadarComponent::PerformSpotlightTracking(float DeltaTime)
 	}
 
 	// 7. Ground Object Detection & GMTI in Patch Footprint
+	if (bSpotlightGimbalExceeded || bIsMasked || !bBeamAligned) return;
 	TArray<AActor*> PatchCandidates;
 	GatherCandidateActors(SpotlightTargetLocation, SpotlightPatchRadius, PatchCandidates);
 
@@ -2909,16 +2751,38 @@ void UAircraftRadarComponent::PerformSpotlightTracking(float DeltaTime)
 }
 
 #if WITH_EDITOR
+void UAircraftRadarComponent::PreEditChange(FProperty* PropertyAboutToChange)
+{
+	DisplayRangeBeforeEdit = CurrentDisplayRange;
+	Super::PreEditChange(PropertyAboutToChange);
+}
+
 void UAircraftRadarComponent::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
+	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, CurrentDisplayRange) &&
+		DisplayRangeBeforeEdit.IsSet())
+	{
+		const float EditedRange = CurrentDisplayRange;
+		CurrentDisplayRange = DisplayRangeBeforeEdit.GetValue();
+		ExecuteAuthoritativeSetDisplayRange(EditedRange);
+	}
+	DisplayRangeBeforeEdit.Reset();
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
-	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
+	const FName PropertyName = PropertyChangedEvent.Property ? PropertyChangedEvent.Property->GetFName() : PropertyChangedEvent.GetPropertyName();
+	const FName MemberPropertyName = PropertyChangedEvent.MemberProperty ? PropertyChangedEvent.MemberProperty->GetFName() : NAME_None;
 
-	if (PropertyName == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, ScanSizePreset))
+	if (PropertyName == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, ScanSizePreset) ||
+		MemberPropertyName == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, ScanSizePreset))
 	{
 		ApplyScanSizePreset(ScanSizePreset);
 	}
+	else if (PropertyName == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, AzimuthScanWidth) ||
+			 MemberPropertyName == GET_MEMBER_NAME_CHECKED(UAircraftRadarComponent, AzimuthScanWidth))
+	{
+		ScanSizePreset = ERadarScanSize::Custom;
+	}
+	RecalculateScanFrameTime();
 }
 #endif
 
@@ -2963,9 +2827,11 @@ bool UAircraftRadarComponent::IsContinuousWaveIlluminating(const AActor* TargetA
 	// 1. Single Target Track (STT) mode actively illuminates the tracked target with dedicated continuous beam
 	if (IsSTTLocked())
 	{
-		if (!TargetActor || (IsValid(STTLockedActor) && STTLockedActor == TargetActor))
+		AActor* LockedActor = GetSTTLockedActor();
+		if (IsValid(LockedActor) && (!TargetActor || LockedActor == TargetActor))
 		{
-			return true;
+			return IsTargetInScanVolume(LockedActor) &&
+				(!bEnableTerrainMasking || !IsTerrainMasked(GetRadarLocation(), LockedActor->GetActorLocation(), LockedActor));
 		}
 	}
 
@@ -2974,7 +2840,16 @@ bool UAircraftRadarComponent::IsContinuousWaveIlluminating(const AActor* TargetA
 	{
 		if (!TargetActor || (ManualCWTargetActor.IsValid() && ManualCWTargetActor.Get() == TargetActor))
 		{
-			return true;
+			const AActor* IlluminatedActor = TargetActor ? TargetActor : ManualCWTargetActor.Get();
+			if (!IsValid(IlluminatedActor)) return !TargetActor;
+			const FVector Position = IlluminatedActor->GetActorLocation();
+			float Bearing, Elevation;
+			ComputeBearingElevation(Position, Bearing, Elevation);
+			const FVector LocalDirection = GetRadarRotation().UnrotateVector((Position - GetRadarLocation()).GetSafeNormal());
+			return FVector::DistSquared(GetRadarLocation(), Position) <= FMath::Square(MaxDetectionRange) &&
+				IsWithinAntennaGimbal(Bearing, Elevation) && CalculatePlateGain(LocalDirection) > KINDA_SMALL_NUMBER &&
+				(!UsesPhysicalPlateBeam() || MakeBeamSample(0.0f, 0.0f).Contains(Position)) &&
+				(!bEnableTerrainMasking || !IsTerrainMasked(GetRadarLocation(), Position, IlluminatedActor));
 		}
 	}
 

@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "RadarWarningReceiverComponent.h"
@@ -366,7 +365,7 @@ ERWRThreatType URadarWarningReceiverComponent::ClassifyRadarThreat(const UAircra
 	if (RadarComp->IsSTTLocked())
 	{
 		const AActor* LockedActor = RadarComp->GetSTTLockedActor();
-		if (LockedActor == OwnerActor)
+		if (LockedActor == OwnerActor && RadarComp->IsContinuousWaveIlluminating(OwnerActor))
 		{
 			return ERWRThreatType::LockOnRadar;
 		}
@@ -527,8 +526,8 @@ void URadarWarningReceiverComponent::ScanForMissileSeekers()
 		}
 		else
 		{
-			// RULE 1B: Instantiate a BRAND-NEW entry for the Pitbull missile directly in Launch state
-			// Crucial: The attacking host aircraft's original entry remains on the display alongside this new entry!
+			// Create a separate launch threat entry for active radar missiles (Pitbull)
+			// The launching aircraft's track remains on display alongside the missile
 			FRWRThreatEntry NewThreat;
 			NewThreat.ThreatID = NextThreatID++;
 			NewThreat.SourceActor = MissileActor;
@@ -623,13 +622,12 @@ void URadarWarningReceiverComponent::PruneStaleThreats()
 		// 3. Radar platforms (Search, TWS, STT, Launch)
 		else
 		{
-			// Check Lock / Launch continuous RF decay (Rule 4: drop from Launch/Lock to Search within 1-2s if RF drops)
+			// Drop from Launch/Lock to Search if continuous RF illumination is lost
 			if (Threat.ThreatType == ERWRThreatType::LockOnRadar || Threat.ThreatType == ERWRThreatType::MissileLaunch)
 			{
 				if ((CurrentTime - Threat.LastLockTime) >= LockLossGracePeriod)
 				{
-					// RF lock/launch illumination dropped (notched, terrain-masked, or broke lock)!
-					// De-escalate back to SearchRadar
+					// RF illumination lost; de-escalate back to search
 					Threat.ThreatType = ERWRThreatType::SearchRadar;
 					Threat.bIsDeescalated = true;
 					Threat.bIsEscalated = false;
@@ -638,7 +636,7 @@ void URadarWarningReceiverComponent::PruneStaleThreats()
 				}
 			}
 
-			// Check Search decay threshold (Rule 4: do not remove Search entry until 6-8s without sweeps)
+			// Prune search tracks after sweep timeout
 			const float MaxSearchTimeout = FMath::Max(SearchThreatTimeoutSeconds, ThreatTimeoutSeconds);
 			if ((CurrentTime - Threat.LastSignalTime) > MaxSearchTimeout)
 			{
@@ -694,7 +692,7 @@ bool URadarWarningReceiverComponent::ShouldIgnoreSource(const AActor* SourceActo
 		return true;
 	}
 
-	// IFF-based friendly filtering: completely hide friendly emitters from the RWR scope
+	// Filter friendly emitters from the RWR display
 	if (bEnableIFF && bHideFriendlyEmitters)
 	{
 		if (FCombatTeamUtility::IsFriendly(GetOwner(), SourceActor))
@@ -703,7 +701,7 @@ bool URadarWarningReceiverComponent::ShouldIgnoreSource(const AActor* SourceActo
 		}
 	}
 
-	// Tag-based filtering (independent of IFF — used for filtering by actor type, e.g. weather radars)
+	// Filter emitters matching ignore tags
 	for (const FName& IgnoreTag : RWRIgnoreTags)
 	{
 		if (SourceActor->ActorHasTag(IgnoreTag))
@@ -734,7 +732,7 @@ bool URadarWarningReceiverComponent::GetHighestThreat(FRWRThreatEntry& OutThreat
 		return false;
 	}
 
-	// 1. If a Diamond Threat is actively designated, return it
+	// Check for designated diamond threat first
 	for (const FRWRThreatEntry& Threat : ThreatEntries)
 	{
 		if (Threat.bHighestThreatAvailable)
@@ -744,7 +742,7 @@ bool URadarWarningReceiverComponent::GetHighestThreat(FRWRThreatEntry& OutThreat
 		}
 	}
 
-	// 2. Fallback to highest raw threat type level
+	// Fallback to highest threat level
 	int32 HighestIdx = 0;
 	uint8 HighestLevel = static_cast<uint8>(ThreatEntries[0].ThreatType);
 

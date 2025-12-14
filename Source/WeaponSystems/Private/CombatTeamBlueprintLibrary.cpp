@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "CombatTeamBlueprintLibrary.h"
@@ -380,7 +379,7 @@ bool UCombatTeamBlueprintLibrary::IsTransponderActive(const AActor* TargetActor)
 }
 
 // =========================================================================
-// 5. BACKWARD-COMPATIBLE ALIASES
+// 5. Legacy aliases
 // =========================================================================
 
 void UCombatTeamBlueprintLibrary::SyncPawnTeamFromController(APawn* Pawn, AController* Controller, uint8 FallbackTeamID)

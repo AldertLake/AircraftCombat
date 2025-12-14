@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #pragma once
@@ -74,7 +73,8 @@ public:
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	/** Returns true if the droppable store can be released/fired */
-	virtual bool CanFireWeapon() const override;
+	using UMasterWeaponComponent::CanFireWeapon;
+	virtual bool CanFireWeapon(EWeaponLaunchFailureReason& OutReason) const override;
 
 	/** Drops/releases the store from the aircraft */
 	virtual bool FireWeapon() override;

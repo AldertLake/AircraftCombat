@@ -1,7 +1,6 @@
 // -----------------------------------------------------
 // Copyright   (c) 2024 AldertLake. All Rights Reserved.
 // GitHub:     https://github.com/AldertLake/
-// Discord:    https://discord.gg/QpPPfh6WVn
 // -----------------------------------------------------
 
 #include "Weapon.h"
@@ -30,7 +29,7 @@ void AWeapon::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Check if this weapon is already attached or owned by a carrier aircraft
+	// Check if attached or owned by carrier
 	AActor* ParentOrCarrier = GetAttachParentActor();
 	if (!ParentOrCarrier && CarrierAircraft.IsValid())
 	{
@@ -47,7 +46,7 @@ void AWeapon::BeginPlay()
 	}
 	else if (!bIsMounted)
 	{
-		// Standalone in world: enable released collision so it behaves as an active actor
+		// Standalone weapon in world: enable released collision
 		ApplyReleasedCollisionState();
 	}
 }
@@ -55,6 +54,15 @@ void AWeapon::BeginPlay()
 void AWeapon::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+}
+
+void AWeapon::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeparationSafetyTimerHandle);
+	}
+	Super::EndPlay(EndPlayReason);
 }
 
 void AWeapon::SetCarrierAircraft(AActor* InCarrier)
@@ -112,41 +120,38 @@ void AWeapon::ApplyMountedCollisionState()
 
 void AWeapon::ApplyReleasedCollisionState()
 {
-	// Firmly reinforce carrier mutual ignore before altering collision profiles
+	// Ignore carrier collision before altering profile
 	if (CarrierAircraft.IsValid())
 	{
 		SetupMutualCollisionIgnore(CarrierAircraft.Get(), true);
 	}
 
-	auto EnableCollisionLambda = [this]()
+	UWorld* World = GetWorld();
+	if (World) World->GetTimerManager().ClearTimer(SeparationSafetyTimerHandle);
+	if (SeparationSafetyDelay > 0.0f && World)
 	{
-		if (WeaponMesh)
-		{
-			if (ReleasedCollisionProfile != NAME_None)
-			{
-				WeaponMesh->SetCollisionProfileName(ReleasedCollisionProfile);
-			}
-			WeaponMesh->SetCollisionEnabled(ReleasedCollision);
-			if (bSimulatePhysicsOnRelease)
-			{
-				WeaponMesh->SetSimulatePhysics(true);
-			}
-		}
-	};
-
-	if (SeparationSafetyDelay > 0.0f && GetWorld())
-	{
-		GetWorld()->GetTimerManager().SetTimer(
+		World->GetTimerManager().SetTimer(
 			SeparationSafetyTimerHandle,
-			FTimerDelegate::CreateLambda(EnableCollisionLambda),
+			this, &AWeapon::EnableReleasedCollision,
 			SeparationSafetyDelay,
 			false
 		);
 	}
 	else
 	{
-		EnableCollisionLambda();
+		EnableReleasedCollision();
 	}
+}
+
+void AWeapon::EnableReleasedCollision()
+{
+	if (!IsValid(this) || bIsMounted || !IsValid(WeaponMesh)) return;
+	if (ReleasedCollisionProfile != NAME_None)
+	{
+		WeaponMesh->SetCollisionProfileName(ReleasedCollisionProfile);
+	}
+	WeaponMesh->SetCollisionEnabled(ReleasedCollision);
+	if (bSimulatePhysicsOnRelease) WeaponMesh->SetSimulatePhysics(true);
 }
 
 void AWeapon::SetupMutualCollisionIgnore(AActor* OtherActor, bool bShouldIgnore)
@@ -180,7 +185,6 @@ void AWeapon::ClearMutualCollisionIgnore(AActor* OtherActor)
 
 void AWeapon::OnMountedStateChanged_Implementation(bool bNewMounted, AActor* Carrier)
 {
-	// Base implementation hook for Blueprint overrides
 }
 
 void AWeapon::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -213,4 +217,3 @@ void AWeapon::OnRep_CarrierAircraft()
 		SetupMutualCollisionIgnore(CarrierAircraft.Get(), true);
 	}
 }
-
